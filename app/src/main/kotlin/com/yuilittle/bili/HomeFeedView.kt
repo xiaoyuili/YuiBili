@@ -10,7 +10,6 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
-import android.view.animation.PathInterpolator
 import android.widget.AbsListView
 import android.widget.BaseAdapter
 import android.widget.FrameLayout
@@ -25,7 +24,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
-class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bundle?) : LinearLayout(context) {
+class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bundle?, private val onSearch: (() -> Unit)? = null) : LinearLayout(context) {
     private val tabs = arrayOfNulls<TextView>(2)
     private val panels = arrayOfNulls<FeedPanel>(2)
     private lateinit var headerRow: View
@@ -38,7 +37,8 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
     private var entrancePlayed = false
 
     private val isTabletLayout = LayoutMode.isTablet
-    private var tabletFeedPager: RootPager? = null
+    private lateinit var feedPager: RootPager
+    private var tabProgress = selectedTab.toFloat()
     private var tabletTopButton: ScrollToTopButton? = null
     private val feedAvailableWidthPx: Int
         get() = if (isTabletLayout) {
@@ -57,9 +57,17 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
         clipChildren = false
         clipToPadding = false
         if (isTabletLayout) {
-            // 平板极简顶栏：只保留「推荐 / 热门」居中胶囊标签（搜索已归位左侧独立标签），腾出更多垂向视野确保一屏展示 3 行 × 4 列
-            headerRow = createTabs()
-            addView(headerRow, LayoutParams(LayoutParams.MATCH_PARENT, dp(38)).apply {
+            headerRow = FrameLayout(context).apply {
+                addView(createTabs(), FrameLayout.LayoutParams(-1, -1).apply { marginEnd = dp(48) })
+                addView(FrameLayout(context).apply {
+                    isFocusable = true
+                    contentDescription = "搜索"
+                    addView(Ds.searchIcon(context, COLOR_INK, 1.8f), FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
+                    Ds.bindPressFeedback(this, 0.92f)
+                    setOnClickListener { onSearch?.invoke() }
+                }, FrameLayout.LayoutParams(dp(48), dp(48), Gravity.END or Gravity.CENTER_VERTICAL))
+            }
+            addView(headerRow, LayoutParams(LayoutParams.MATCH_PARENT, dp(48)).apply {
                 bottomMargin = dp(4)
             })
         } else {
@@ -75,48 +83,34 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
         }
 
         val host = FrameLayout(context)
+        feedPager = RootPager(context).apply {
+            prioritizeHorizontalGestures = true
+            setOnPageSelectedListener { idx ->
+                if (selectedTab != idx) selectTab(idx, fromPager = true)
+                syncTabletTopButton()
+            }
+            setOnPageRevealListener { idx ->
+                panels[idx]?.loadSnapshot()
+                panels[idx]?.prepareVisible()
+            }
+            setOnPageScrollListener(::syncTabIndicatorProgress)
+        }
+        for (tab in 0..1) {
+            val panel = FeedPanel(context, tab, refreshOnEntry).apply {
+                restoredState?.let { restoreAnchor(it, tab) }
+            }
+            panels[tab] = panel
+            feedPager.addPage(panel)
+        }
+        feedPager.showPage(selectedTab, animate = false)
+        host.addView(feedPager, FrameLayout.LayoutParams(-1, -1))
         if (isTabletLayout) {
-            // 平板首页：左右手势平滑切换「推荐 ↔ 热门」（不再误切到「我的」），并在右下角常驻优雅的悬浮回顶按钮
-            val pager = RootPager(context).apply {
-                setOnPageSelectedListener { idx ->
-                    if (selectedTab != idx) selectTab(idx, fromPager = true)
-                    syncTabletTopButton()
-                }
-                setOnPageScrollListener { progress ->
-                    syncTabletTabIndicatorProgress(progress)
-                }
-            }
-            tabletFeedPager = pager
-            for (tab in 0..1) {
-                val panel = FeedPanel(context, tab, refreshOnEntry).apply {
-                    restoredState?.let { restoreAnchor(it, tab) }
-                }
-                panels[tab] = panel
-                pager.addPage(panel)
-            }
-            pager.showPage(selectedTab, animate = false)
-            host.addView(pager, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            ))
             val topBtn = ScrollToTopButton(context) { scrollToTop() }
             tabletTopButton = topBtn
             host.addView(topBtn, FrameLayout.LayoutParams(dp(44), dp(44), Gravity.BOTTOM or Gravity.END).apply {
                 rightMargin = dp(12)
                 bottomMargin = dp(20)
             })
-        } else {
-            for (tab in 0..1) {
-                val panel = FeedPanel(context, tab, refreshOnEntry).apply {
-                    visibility = if (tab == selectedTab) View.VISIBLE else View.GONE
-                    restoredState?.let { restoreAnchor(it, tab) }
-                }
-                panels[tab] = panel
-                host.addView(panel, FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT
-                ))
-            }
         }
         addView(host, LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
         selectTab(selectedTab)
@@ -128,14 +122,14 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
         }
     }
 
-    private fun syncTabletTabIndicatorProgress(progress: Float) {
+    private fun syncTabIndicatorProgress(progress: Float) {
+        tabProgress = progress.coerceIn(0f, 1f)
         val t0 = tabs[0] ?: return
         val t1 = tabs[1] ?: return
         val stripLeft = (t0.parent as? View)?.left ?: 0
         val x0 = (stripLeft + t0.left + (t0.width - tabIndicator.width) / 2f).coerceAtLeast(0f)
         val x1 = (stripLeft + t1.left + (t1.width - tabIndicator.width) / 2f).coerceAtLeast(0f)
-        (tabIndicator.getTag(R.id.ds_spring_tx) as? androidx.dynamicanimation.animation.SpringAnimation)?.cancel()
-        tabIndicator.translationX = x0 + (x1 - x0) * progress.coerceIn(0f, 1f)
+        tabIndicator.translationX = homeTabIndicatorOffset(x0, x1, tabProgress)
     }
 
     private fun syncTabletTopButton() {
@@ -199,10 +193,12 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(Ds.Space.xs), 0, dp(Ds.Space.xs), 0)
         }
-        tabIndicator = PillIndicatorView(context).apply {
-            fillColor = Ds.colors.accentSoft
+        tabIndicator = View(context).apply {
+            background = rounded(COLOR_ROSE, dp(2))
         }
-        addView(tabIndicator, FrameLayout.LayoutParams(dp(74), dp(30), Gravity.CENTER_VERTICAL or Gravity.START))
+        addView(tabIndicator, FrameLayout.LayoutParams(dp(TAB_INDICATOR_WIDTH), dp(3), Gravity.BOTTOM or Gravity.START).apply {
+            bottomMargin = dp(2)
+        })
         listOf("推荐", "热门").forEachIndexed { index, label ->
             val tab = TextView(context).apply {
                 text = label
@@ -221,10 +217,10 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
         addView(strip, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.MATCH_PARENT,
-            Gravity.CENTER_HORIZONTAL
+            if (isTabletLayout) Gravity.START else Gravity.CENTER_HORIZONTAL
         ))
         addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-            moveTabIndicator(selectedTab, animate = false)
+            syncTabIndicatorProgress(tabProgress)
         }
     }
 
@@ -318,6 +314,7 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
                 label.setTextColor(if (selected) COLOR_ROSE else COLOR_MUTED)
                 label.typeface = Ds.body(selected)
                 label.background = null
+                label.isSelected = selected
                 label.animate().cancel()
                 label.animate()
                     .alpha(if (selected) 1f else 0.78f)
@@ -326,82 +323,10 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
                     .start()
             }
         }
-        if (isTabletLayout) {
-            if (!fromPager) {
-                tabletFeedPager?.showPage(tab, animate = changed && !MotionTokens.isReduced(context))
-            }
-            moveTabIndicator(tab, animate = changed)
-            if (changed) panels[previous]?.pauseRequests()
-            if (active) panels[tab]?.activate()
-            syncTabletTopButton()
-            return
-        }
-        moveTabIndicator(tab, animate = changed)
-        if (changed) {
-            panels[previous]?.pauseRequests()
-            animatePanelTransition(previous, tab)
-        } else panels[tab]?.visibility = View.VISIBLE
+        if (!fromPager) feedPager.showPage(tab, animate = changed && !MotionTokens.isReduced(context))
+        if (changed) panels[previous]?.pauseRequests()
         if (active) panels[tab]?.activate()
-    }
-
-    private fun moveTabIndicator(tab: Int, animate: Boolean) {
-        val target = tabs[tab] ?: return
-        target.post {
-            val stripLeft = (target.parent as? View)?.left ?: 0
-            val targetX = (stripLeft + target.left + (target.width - tabIndicator.width) / 2f).coerceAtLeast(0f)
-            if (animate && !MotionTokens.isReduced(context)) {
-                DsSpring.animate(
-                    tabIndicator,
-                    androidx.dynamicanimation.animation.DynamicAnimation.TRANSLATION_X,
-                    targetX,
-                    DsSpring.SETTLE_STIFFNESS,
-                    DsSpring.SETTLE_DAMPING
-                )
-            } else {
-                (tabIndicator.getTag(R.id.ds_spring_tx) as? androidx.dynamicanimation.animation.SpringAnimation)?.cancel()
-                tabIndicator.translationX = targetX
-            }
-        }
-    }
-
-    private fun animatePanelTransition(from: Int, to: Int) {
-        val outgoing = panels[from] ?: return
-        val incoming = panels[to] ?: return
-        val direction = if (to > from) 1 else -1
-        outgoing.animate().cancel()
-        incoming.animate().cancel()
-        // Slide both panels simultaneously in the same direction so the new grid
-        // enters from the right/left while the old one exits the opposite edge.
-        // Both remain fully opaque and opaque-background, preventing the flash
-        // that a sequential fade causes.
-        incoming.visibility = View.VISIBLE
-        incoming.alpha = 1f
-        val pageWidth = width.toFloat().coerceAtLeast(1f)
-        val interactive = kotlin.math.abs(outgoing.translationX) > 0.5f ||
-            kotlin.math.abs(incoming.translationX) > 0.5f
-        // A tap starts the incoming panel at its natural side. A swipe already
-        // positioned both panels, so continue from those exact coordinates.
-        if (!interactive) {
-            outgoing.translationX = 0f
-            incoming.translationX = direction * pageWidth
-        }
-        outgoing.alpha = 1f
-        outgoing.animate()
-            .translationX(-direction * width.toFloat())
-            .setDuration(TAB_SWITCH_DURATION_MS)
-            .setInterpolator(PathInterpolator(0.2f, 0f, 0f, 1f))
-            .withEndAction {
-                if (selectedTab == to) {
-                    outgoing.visibility = View.GONE
-                    outgoing.translationX = 0f
-                }
-            }
-            .start()
-        incoming.animate()
-            .translationX(0f)
-            .setDuration(TAB_SWITCH_DURATION_MS)
-            .setInterpolator(PathInterpolator(0.2f, 0f, 0f, 1f))
-            .start()
+        syncTabletTopButton()
     }
 
     private data class ScrollAnchor(val bvid: String?, val position: Int, val offset: Int)
@@ -1297,6 +1222,9 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
     }
 }
 
+internal fun homeTabIndicatorOffset(start: Float, end: Float, progress: Float): Float =
+    start + (end - start) * progress.coerceIn(0f, 1f)
+
 /**
  * Global UI theme. Switchable at runtime; all COLOR_* constants follow it.
  */
@@ -1350,6 +1278,17 @@ object Theme {
         pendingTransitionCy = cy
         pendingTransitionExpand = expand
     }
+
+    internal data class TabletFade(val bitmap: android.graphics.Bitmap, val fromDark: Boolean)
+    private var pendingTabletFade: TabletFade? = null
+
+    internal fun prepareTabletFade(bitmap: android.graphics.Bitmap, fromDark: Boolean) {
+        pendingTabletFade?.bitmap?.recycle()
+        pendingTabletFade = TabletFade(bitmap, fromDark)
+    }
+
+    internal fun consumeTabletFade(): TabletFade? = pendingTabletFade.also { pendingTabletFade = null }
+    internal fun hasTabletFade(): Boolean = pendingTabletFade != null
 
     fun peekCircularTransition(): Boolean =
         pendingTransitionBitmap != null

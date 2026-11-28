@@ -84,9 +84,13 @@ class DownloadPickerActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Ds.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        LayoutMode.applyScreenOrientation(this)
         window.setBackgroundDrawable(ColorDrawable(Ds.colors.bg))
-        DownloadManager.init(this)
+        if (!DownloadManager.init(this)) {
+            Toast.makeText(this, "暂时无法读取下载记录，原文件已保留，请稍后重试", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
 
         val raw = intent.getStringExtra(EXTRA_ITEM_JSON).orEmpty()
         item = parseVideoItem(raw)

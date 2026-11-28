@@ -118,7 +118,7 @@ class ProfileSubActivity : Activity() {
         Theme.init(this)
         mode = intent.getStringExtra(EXTRA_MODE) ?: MODE_HISTORY
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        LayoutMode.applyScreenOrientation(this)
         window.setBackgroundDrawable(ColorDrawable(COLOR_BACKGROUND))
 
         val root = FrameLayout(this).apply { setBackgroundColor(COLOR_BACKGROUND) }
@@ -316,6 +316,7 @@ class ProfileSubActivity : Activity() {
         clearBtnRef?.visibility = View.GONE
         scroll.scrollTo(0, 0)
 
+        BiliSessionStore.init(this)
         if (!BiliSessionStore.isLoggedIn()) {
             renderLocalHistory(bannerText = null)
             return
@@ -387,8 +388,8 @@ class ProfileSubActivity : Activity() {
             }
 
             var added = 0
-            videos.forEach { item ->
-                if (!historySeen.add(item.bvid)) return@forEach
+            HistoryStore.withLocalProgress(this, videos).forEach { item ->
+                if (!historySeen.add(item.historyMedia.rowKey)) return@forEach
                 val group = historyTimeGroup(item.publishedAt)
                 if (group != historyLastGroup) {
                     historyLastGroup = group
@@ -396,6 +397,7 @@ class ProfileSubActivity : Activity() {
                 }
                 val timeText = formatHistoryTime(item.publishedAt)
                 val metaText = if (timeText.isBlank()) item.owner else "${item.owner} · $timeText"
+                val play = { VideoDetailActivity.openHistory(this, item) }
 
                 lateinit var rowRef: View
                 rowRef = buildVideoCardRow(
@@ -405,11 +407,12 @@ class ProfileSubActivity : Activity() {
                     cover = item.cover,
                     durationSec = item.duration,
                     progressSec = item.watchProgressSec,
+                    onPlay = play,
                     onLongClick = {
                         showActionSheet(
                             title = item.title,
                             actions = listOf(
-                                "立即播放" to { openVideo(item.bvid) },
+                                "立即播放" to play,
                                 "删除此条记录" to {
                                     deleteRemoteHistoryItem(item, rowRef)
                                 }
@@ -505,25 +508,27 @@ class ProfileSubActivity : Activity() {
         }
 
         clearBtnRef?.visibility = View.VISIBLE
-        history.forEachIndexed { index, item ->
-            val meta = if (item.date.isBlank()) item.owner else "${item.owner} · ${item.date}"
+        history.forEachIndexed { index, entry ->
+            val item = entry.video
+            val meta = if (entry.date.isBlank()) item.owner else "${item.owner} · ${entry.date}"
+            val play = { VideoDetailActivity.openHistory(this, item) }
             lateinit var rowRef: View
             rowRef = buildVideoCardRow(
                 bvid = item.bvid,
                 title = item.title,
                 meta = meta,
                 cover = item.cover,
-                durationSec = 0,
-                progressSec = null,
+                durationSec = item.duration,
+                progressSec = item.watchProgressSec.takeIf { it != 0L },
+                onPlay = play,
                 onLongClick = {
                     showActionSheet(
                         title = item.title,
                         actions = listOf(
-                            "立即播放" to { openVideo(item.bvid) },
+                            "立即播放" to play,
                             "删除此条记录" to {
-                                HistoryStore.remove(this, item.bvid)
+                                HistoryStore.remove(this, item.historyMedia, wholeArchive = false)
                                 listBox.removeView(rowRef)
-                                historySeen.remove(item.bvid)
                                 if (HistoryStore.load(this).isEmpty()) {
                                     renderLocalHistory(bannerText = null)
                                 }
@@ -550,11 +555,13 @@ class ProfileSubActivity : Activity() {
                 Toast.makeText(this, err ?: "删除失败", Toast.LENGTH_SHORT).show()
                 return@deleteHistoryItem
             }
-            HistoryStore.remove(this, item.bvid)
-            listBox.removeView(rowView)
-            historySeen.remove(item.bvid)
+            HistoryStore.remove(this, item.historyMedia, wholeArchive = true)
             Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
-            if (historySeen.isEmpty()) renderHistory()
+            // 云端删除键按稿件，不是按 CID。若同一稿件有多条分 P，重新加载以移除整组。
+            val archiveKey = item.historyMedia.rowKey.substringBeforeLast(':')
+            listBox.removeView(rowView)
+            historySeen.remove(item.historyMedia.rowKey)
+            if (historySeen.isEmpty() || historySeen.any { it.substringBeforeLast(':') == archiveKey }) renderHistory()
         }
     }
 
@@ -2305,6 +2312,7 @@ class ProfileSubActivity : Activity() {
         cover: String,
         durationSec: Int,
         progressSec: Long?,
+        onPlay: () -> Unit = { openVideo(bvid) },
         onLongClick: () -> Unit
     ): View {
         val card = LinearLayout(this).apply {
@@ -2315,7 +2323,7 @@ class ProfileSubActivity : Activity() {
             isClickable = true
             isFocusable = true
             isLongClickable = true
-            setOnClickListener { openVideo(bvid) }
+            setOnClickListener { onPlay() }
             setOnLongClickListener {
                 onLongClick()
                 true
@@ -2654,78 +2662,237 @@ class ProfileSubActivity : Activity() {
     }
 }
 
-/** 本机最近打开的视频历史（仅作未登录/离线兜底，最多 100 条）。 */
-object HistoryStore {
+internal data class HistoryMediaId(val bvid: String, val aid: Long, val cid: Long) {
+    val rowKey: String get() = "${bvid.ifBlank { "av$aid" }}:$cid"
+
+    fun sameArchive(other: HistoryMediaId): Boolean {
+        if (bvid.isNotBlank() && other.bvid.isNotBlank() && bvid != other.bvid) return false
+        if (aid > 0L && other.aid > 0L && aid != other.aid) return false
+        return bvid.isNotBlank() && bvid == other.bvid || aid > 0L && aid == other.aid
+    }
+
+    fun samePart(other: HistoryMediaId): Boolean = cid > 0L && cid == other.cid && sameArchive(other)
+}
+
+internal val VideoItem.historyMedia get() = HistoryMediaId(bvid, aid, cid)
+
+internal fun archiveHistoryMedia(business: String, epId: Long, nested: HistoryMediaId, flat: HistoryMediaId): HistoryMediaId? {
+    // 两个入口都请求 archive；PGC 的 oid/epid 不能替代普通稿件入口。
+    if (business.isNotBlank() && business != "archive" || epId > 0L) return null
+    val bvid = nested.bvid.takeUnless { it.isBlank() || it == "null" } ?: flat.bvid.takeUnless { it == "null" }.orEmpty()
+    val aid = nested.aid.takeIf { it > 0L } ?: flat.aid.coerceAtLeast(0L)
+    val cid = nested.cid.takeIf { it > 0L } ?: flat.cid.coerceAtLeast(0L)
+    return if (bvid.isNotBlank() || aid > 0L) HistoryMediaId(bvid, aid, cid) else null
+}
+
+internal fun historyResumeMs(cid: Long, progressSec: Long, durationSec: Int): Long {
+    if (cid <= 0L || progressSec !in 1L..Int.MAX_VALUE.toLong()) return 0L
+    if (durationSec > 0 && progressSec >= durationSec) return 0L
+    return progressSec * 1000L
+}
+
+/** 本机最近观看的分 P，每个账号和游客分别保留 100 条。 */
+internal object HistoryStore {
     private const val PREFS = "yuibili_history"
     private const val KEY = "items"
     private const val MAX = 100
 
-    data class Entry(val bvid: String, val title: String, val owner: String, val cover: String, val date: String)
+    data class Entry(val video: VideoItem, val date: String, val progressAtSec: Long, val viewerUid: Long)
 
-    fun add(context: Context, bvid: String, title: String, owner: String, cover: String) {
-        if (bvid.isBlank()) return
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val array = try { JSONArray(prefs.getString(KEY, "[]").orEmpty()) } catch (_: Exception) { JSONArray() }
-        val filtered = JSONArray()
-        for (i in 0 until array.length()) {
-            val obj = array.optJSONObject(i) ?: continue
-            if (obj.optString("bvid") != bvid) filtered.put(obj)
-        }
-        val head = JSONArray().put(JSONObject().apply {
-            put("bvid", bvid)
-            put("title", title)
-            put("owner", owner)
-            put("cover", cover)
-            put("date", SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date()))
-        })
-        for (i in 0 until Math.min(filtered.length(), MAX - 1)) head.put(filtered.get(i))
-        prefs.edit().putString(KEY, head.toString()).apply()
+    private fun viewerUid(): Long {
+        val cookie = BiliSessionStore.cookie()
+        if (!BiliSessionStore.isLoggedIn(cookie)) return 0L
+        // 登录但尚未获取 UID 的会话不能借用游客或其他未识别会话的记录。
+        return cookie.substringAfter("DedeUserID=", "").substringBefore(';').trim().toLongOrNull()?.takeIf { it > 0L }
+            ?: BiliSessionStore.cachedProfile()?.uid?.takeIf { it > 0L } ?: -1L
     }
 
-    fun remove(context: Context, bvid: String) {
-        if (bvid.isBlank()) return
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val array = try { JSONArray(prefs.getString(KEY, "[]").orEmpty()) } catch (_: Exception) { JSONArray() }
-        val filtered = JSONArray()
-        for (i in 0 until array.length()) {
-            val obj = array.optJSONObject(i) ?: continue
-            if (obj.optString("bvid") != bvid) filtered.put(obj)
+    private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    fun load(context: Context): List<Entry> = visibleEntries(loadAll(context), viewerUid())
+
+    internal fun visibleEntries(all: List<Entry>, uid: Long): List<Entry> =
+        if (uid < 0L) emptyList() else all.filter { it.viewerUid == uid }
+
+    private fun loadAll(context: Context): List<Entry> {
+        val array = try { JSONArray(prefs(context).getString(KEY, "[]").orEmpty()) } catch (_: Exception) { return emptyList() }
+        return buildList {
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                val bvid = obj.optString("bvid")
+                val aid = obj.optLong("aid")
+                if (bvid.isBlank() && aid <= 0L) continue
+                add(Entry(VideoItem(
+                    bvid = bvid, title = obj.optString("title").ifBlank { "（无标题）" },
+                    owner = obj.optString("owner").ifBlank { "未知UP主" }, cover = obj.optString("cover"),
+                    views = 0L, duration = obj.optInt("duration"), description = "",
+                    aid = aid, cid = obj.optLong("cid"), publishedAt = obj.optLong("view_at"),
+                    watchProgressSec = obj.optLong("progress")
+                ), obj.optString("date"), obj.optLong("progress_at"),
+                    if (obj.has("viewer_uid")) obj.optLong("viewer_uid", -1L) else 0L))
+            }
         }
-        prefs.edit().putString(KEY, filtered.toString()).apply()
     }
 
-    fun load(context: Context): List<Entry> {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val array = try { JSONArray(prefs.getString(KEY, "[]").orEmpty()) } catch (_: Exception) { JSONArray() }
-        val result = ArrayList<Entry>(array.length())
-        for (i in 0 until array.length()) {
-            val obj = array.optJSONObject(i) ?: continue
-            result += Entry(
-                bvid = obj.optString("bvid"),
-                title = obj.optString("title").ifBlank { "（无标题）" },
-                owner = obj.optString("owner").ifBlank { "未知UP主" },
-                cover = obj.optString("cover"),
-                date = obj.optString("date")
-            )
+    private fun save(context: Context, entries: List<Entry>) {
+        val array = JSONArray()
+        for ((v, date, progressAt, uid) in entries) {
+            array.put(JSONObject().apply {
+                put("bvid", v.bvid); put("aid", v.aid); put("cid", v.cid)
+                put("title", v.title); put("owner", v.owner); put("cover", v.cover)
+                put("duration", v.duration); put("progress", v.watchProgressSec)
+                put("view_at", v.publishedAt); put("date", date)
+                put("progress_at", progressAt); put("viewer_uid", uid)
+            })
         }
-        return result
+        prefs(context).edit().putString(KEY, array.toString()).apply()
     }
 
+    @Synchronized
+    fun record(context: Context, video: VideoItem, progressSec: Long? = null) {
+        val media = video.historyMedia
+        if (media.cid <= 0L || media.bvid.isBlank() && media.aid <= 0L) return
+        val uid = viewerUid()
+        if (uid < 0L) return
+        val all = loadAll(context)
+        val prior = all.firstOrNull { it.viewerUid == uid && media.samePart(it.video.historyMedia) }
+        val next = recordedEntry(video, progressSec, prior, System.currentTimeMillis() / 1000L, uid)
+        save(context, upsertEntry(all, next))
+    }
+
+    internal fun upsertEntry(all: List<Entry>, next: Entry): List<Entry> {
+        val uid = next.viewerUid
+        if (uid < 0L) return all
+        val (own, otherViewers) = all.partition { it.viewerUid == uid }
+        val media = next.video.historyMedia
+        val remaining = own.filterNot {
+            val old = it.video.historyMedia
+            media.sameArchive(old) && (old.cid == media.cid || old.cid == 0L)
+        }
+        return listOf(next) + remaining.take(MAX - 1) + otherViewers
+    }
+
+    internal fun recordedEntry(video: VideoItem, progressSec: Long?, prior: Entry?, now: Long, uid: Long): Entry {
+        val old = prior?.takeIf { it.viewerUid == uid && it.video.historyMedia.samePart(video.historyMedia) }
+        // 详情回调可能晚于播放报告。更新标题/封面不能把旧进度重新标记为刚观看。
+        val checkpoint = progressSec?.takeIf { it == -1L || historyResumeMs(video.cid, it, video.duration) > 0L }
+        val duration = if (checkpoint == null && old != null && old.video.duration > 0) old.video.duration
+            else video.duration.takeIf { it > 0 } ?: old?.video?.duration ?: 0
+        val stored = video.copy(
+            bvid = video.bvid.ifBlank { old?.video?.bvid.orEmpty() }, aid = video.aid.takeIf { it > 0 } ?: old?.video?.aid ?: 0L,
+            title = video.title.ifBlank { old?.video?.title ?: video.bvid }, owner = video.owner.ifBlank { old?.video?.owner.orEmpty() },
+            cover = video.cover.ifBlank { old?.video?.cover.orEmpty() }, duration = duration,
+            publishedAt = now, watchProgressSec = checkpoint ?: old?.video?.watchProgressSec ?: 0L
+        )
+        val date = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(now * 1000L))
+        return Entry(stored, date, if (checkpoint != null) now else old?.progressAtSec ?: 0L, uid)
+    }
+
+    fun withLocalProgress(context: Context, rows: List<VideoItem>): List<VideoItem> {
+        val uid = viewerUid()
+        val local = visibleEntries(loadAll(context), uid)
+        return rows.map { resolveRow(it, local, uid) }
+    }
+
+    data class ViewedRow(val video: VideoItem, val viewedAtSec: Long)
+
+    fun mergeRows(context: Context, cloud: List<VideoItem>): List<ViewedRow> {
+        val uid = viewerUid()
+        return mergeRows(cloud, loadAll(context), uid)
+    }
+
+    internal fun mergeRows(cloud: List<VideoItem>, local: List<Entry>, uid: Long): List<ViewedRow> {
+        val own = visibleEntries(local, uid)
+        val parts = own.filter { it.video.cid > 0L }.groupBy { it.video.cid }
+        val matched = HashSet<HistoryMediaId>()
+        val identities = (cloud.map { it.historyMedia } + own.map { it.video.historyMedia })
+            .filter { it.cid > 0L }.groupBy { it.cid }
+        val distinctCloud = ArrayList<VideoItem>()
+        val positions = HashMap<Long, MutableList<Int>>()
+        for (raw in cloud) {
+            val candidates = identities[raw.cid].orEmpty().filter { raw.historyMedia.samePart(it) }
+            val row = raw.copy(
+                bvid = raw.bvid.ifBlank { candidates.map { it.bvid }.filter { it.isNotBlank() }.distinct().singleOrNull().orEmpty() },
+                aid = raw.aid.takeIf { it > 0L } ?: candidates.map { it.aid }.filter { it > 0L }.distinct().singleOrNull() ?: 0L)
+            val group = positions.getOrPut(row.cid) { ArrayList() }
+            val index = group.firstOrNull { row.historyMedia == distinctCloud[it].historyMedia }
+            if (index == null) {
+                group.add(distinctCloud.size)
+                distinctCloud.add(row)
+            } else {
+                val prior = distinctCloud[index]
+                val newest = if (row.publishedAt > prior.publishedAt) row else prior
+                val other = if (newest === row) prior else row
+                distinctCloud[index] = newest.copy(
+                    bvid = newest.bvid.ifBlank { other.bvid }, aid = newest.aid.takeIf { it > 0L } ?: other.aid,
+                    rcmdReason = newest.rcmdReason.ifBlank { other.rcmdReason })
+            }
+        }
+        val rows = ArrayList<ViewedRow>()
+        for (row in distinctCloud) {
+            val entry = parts[row.cid]?.firstOrNull { row.historyMedia.samePart(it.video.historyMedia) }
+            if (entry != null) matched.add(entry.video.historyMedia)
+            // 展示日期单独保存，不能改变续播时用于比较进度的原始云时间。
+            rows.add(ViewedRow(withLocalProgress(row, entry, uid), maxOf(row.publishedAt, entry?.video?.publishedAt ?: 0L)))
+        }
+        for (entry in own) {
+            if (entry.video.historyMedia !in matched && distinctCloud.none { it.historyMedia == entry.video.historyMedia }) {
+                rows.add(ViewedRow(entry.video, entry.video.publishedAt))
+            }
+        }
+        return rows.sortedByDescending { it.viewedAtSec }
+    }
+
+    fun forPlayback(context: Context, row: VideoItem): VideoItem {
+        val uid = viewerUid()
+        return resolveRow(row, visibleEntries(loadAll(context), uid), uid)
+    }
+
+    private fun resolveRow(row: VideoItem, entries: List<Entry>, uid: Long): VideoItem {
+        val media = row.historyMedia
+        val match = entries.firstOrNull { it.viewerUid == uid && media.samePart(it.video.historyMedia) }
+        return withLocalProgress(row, match, uid)
+    }
+
+    internal fun withLocalProgress(row: VideoItem, local: Entry?, uid: Long): VideoItem {
+        if (local == null || uid < 0L || local.viewerUid != uid || !row.historyMedia.samePart(local.video.historyMedia)) return row
+        if (row.publishedAt <= 0L || local.progressAtSec <= row.publishedAt) return row
+        val v = local.video
+        val duration = v.duration.takeIf { it > 0 } ?: row.duration
+        if (v.watchProgressSec != -1L && historyResumeMs(v.cid, v.watchProgressSec, duration) == 0L) return row
+        return row.copy(bvid = row.bvid.ifBlank { v.bvid }, aid = row.aid.takeIf { it > 0L } ?: v.aid,
+            duration = duration, watchProgressSec = v.watchProgressSec)
+    }
+
+    internal fun withoutEntries(all: List<Entry>, uid: Long, media: HistoryMediaId? = null, wholeArchive: Boolean = false): List<Entry> {
+        if (uid < 0L) return all
+        return all.filterNot { it.viewerUid == uid && (media == null ||
+            media.sameArchive(it.video.historyMedia) && (wholeArchive || media.cid == it.video.cid)) }
+    }
+
+    @Synchronized
+    fun remove(context: Context, media: HistoryMediaId, wholeArchive: Boolean) {
+        val uid = viewerUid()
+        if (uid >= 0L) save(context, withoutEntries(loadAll(context), uid, media, wholeArchive))
+    }
+
+    @Synchronized
     fun clear(context: Context) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY).apply()
+        val uid = viewerUid()
+        if (uid >= 0L) save(context, withoutEntries(loadAll(context), uid))
     }
 }
 
 /** 格式化历史封面右下角「已播放时长 / 总时长」（如 `00:07 / 07:31`），无进度时退化为总时长。 */
 internal fun formatHistoryCoverBadge(progressSec: Long?, durationSec: Int): String {
     if (durationSec <= 0) {
-        return if (progressSec != null && progressSec > 0L) formatWatchTime(progressSec.toInt()) else ""
+        return if (progressSec != null && progressSec in 1L..Int.MAX_VALUE.toLong()) formatWatchTime(progressSec.toInt()) else ""
     }
     val total = formatWatchTime(durationSec)
     if (progressSec == null) return total
     val playedSec = when {
         progressSec == -1L -> durationSec
-        progressSec > 0L -> progressSec.toInt().coerceAtMost(durationSec)
+        progressSec > 0L -> progressSec.coerceAtMost(durationSec.toLong()).toInt()
         else -> 0
     }
     return "${formatWatchTime(playedSec)} / $total"

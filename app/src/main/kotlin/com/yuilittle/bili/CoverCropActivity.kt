@@ -36,11 +36,7 @@ class CoverCropActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Theme.init(this)
-        if (LayoutMode.isTablet) {
-            LayoutMode.applyTabletOrientationIfEnabled(this)
-        } else {
-            requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
+        LayoutMode.applyScreenOrientation(this)
         // 裁剪页整体黑底，状态栏用黑底白图标，避免刺眼
         Ds.applySystemBars(this, lightContent = true)
         window.navigationBarColor = Color.BLACK

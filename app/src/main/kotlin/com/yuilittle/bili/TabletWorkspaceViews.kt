@@ -27,10 +27,18 @@ import java.util.Locale
  * - [TabletHistoryPageView]：顶部搜索/清空栏 + 3~4 列观看历史视频网格（带观看进度胶囊与长按删除）+ 右下角悬浮回顶按钮。
  */
 internal class TabletFavoritesPageView(
-    private val activity: Activity
+    private val activity: Activity,
+    restored: Snapshot? = null,
+    private val onSearch: () -> Unit
 ) : FrameLayout(activity) {
 
+    data class Snapshot(val session: String, val folders: List<FavoriteFolder>, val folderId: Long,
+        val videos: List<VideoItem>, val page: Int, val ended: Boolean, val loaded: Boolean,
+        val pendingPage: Boolean, val pageFailed: Boolean, val firstVisible: Int, val offset: Int, val foldersY: Int)
+
     private val folderListContainer = LinearLayout(activity)
+    private lateinit var folderScroll: ScrollView
+    private var session = BiliSessionStore.cookie()
     private lateinit var rightTitle: TextView
     private lateinit var rightMeta: TextView
     private lateinit var playAllBtn: TextView
@@ -48,6 +56,8 @@ internal class TabletFavoritesPageView(
     private var favPage = 1
     private var favEnded = false
     private var favLoading = false
+    private var favPageError = false
+    private var resumeFavPage = false
     private var loadedFoldersOnce = false
     private var sessionGen = 0
 
@@ -59,9 +69,57 @@ internal class TabletFavoritesPageView(
     init {
         setBackgroundColor(COLOR_BACKGROUND)
         buildUi()
+        restored?.takeIf { it.session == session && it.loaded }?.let { state ->
+            favLoading = true
+            folders.addAll(state.folders)
+            loadedFoldersOnce = state.loaded
+            renderFolders()
+            selectedFolder = folders.firstOrNull { it.id == state.folderId }
+            selectedFolder?.let(::bindFolderSelection)
+            folderVideos.addAll(state.videos)
+            seenBvids.addAll(state.videos.map { it.bvid })
+            favPage = state.page
+            favEnded = state.ended
+            favPageError = state.pageFailed
+            resumeFavPage = state.pendingPage
+            videoAdapter.notifyDataSetChanged()
+            rightStateView.text = when {
+                favPageError -> "加载失败，点这里重试"
+                resumeFavPage -> "正在加载收藏内容…"
+                folders.isEmpty() -> "暂无收藏夹"
+                else -> "这个收藏夹还没有视频"
+            }
+            rightStateView.setOnClickListener(if (favPageError) View.OnClickListener { favPageError = false; loadMoreFolderVideos() } else null)
+            rightStateView.visibility = if (folderVideos.isEmpty() || favPageError) View.VISIBLE else View.GONE
+            playAllBtn.visibility = if (folderVideos.isEmpty()) View.GONE else View.VISIBLE
+            videoListView.post {
+                videoListView.setSelectionFromTop(state.firstVisible, state.offset)
+                favLoading = false
+                if (resumeFavPage) { resumeFavPage = false; loadMoreFolderVideos() }
+            }
+            folderScroll.post { folderScroll.scrollTo(0, state.foldersY) }
+        }
     }
 
+    fun snapshot(): Snapshot = Snapshot(session, folders.toList(), selectedFolder?.id ?: 0L,
+        folderVideos.toList(), favPage, favEnded, loadedFoldersOnce, resumeFavPage || favLoading, favPageError, videoListView.firstVisiblePosition,
+        (videoListView.getChildAt(0)?.top ?: videoListView.paddingTop) - videoListView.paddingTop, folderScroll.scrollY)
+
     fun onPageActivated() {
+        if (session != BiliSessionStore.cookie()) {
+            session = BiliSessionStore.cookie()
+            sessionGen++
+            folders.clear()
+            selectedFolder = null
+            folderVideos.clear()
+            seenBvids.clear()
+            favLoading = false
+            favPageError = false
+            resumeFavPage = false
+            loadedFoldersOnce = false
+            rightStateView.setOnClickListener(null)
+            videoAdapter.notifyDataSetChanged()
+        }
         if (!loadedFoldersOnce || folders.isEmpty()) {
             loadFolders()
         }
@@ -101,9 +159,7 @@ internal class TabletFavoritesPageView(
             contentDescription = "搜索收藏"
             Ds.bindPressFeedback(this, 0.92f)
             addView(Ds.searchIcon(activity, c.muted, 1.7f), FrameLayout.LayoutParams(dp(15), dp(15), Gravity.CENTER))
-            setOnClickListener {
-                activity.startActivity(Intent(activity, FavoriteSearchActivity::class.java))
-            }
+            setOnClickListener { onSearch() }
         }, LinearLayout.LayoutParams(dp(32), dp(32)).apply { rightMargin = dp(6) })
 
         leftHeader.addView(FrameLayout(activity).apply {
@@ -129,12 +185,12 @@ internal class TabletFavoritesPageView(
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), dp(10), dp(10), dp(24))
         }
-        val leftScroll = ScrollView(activity).apply {
+        folderScroll = ScrollView(activity).apply {
             isVerticalScrollBarEnabled = false
             overScrollMode = View.OVER_SCROLL_NEVER
             addView(folderListContainer)
         }
-        leftCol.addView(leftScroll, LinearLayout.LayoutParams(
+        leftCol.addView(folderScroll, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
         ))
 
@@ -236,7 +292,8 @@ internal class TabletFavoritesPageView(
     }
 
     private fun loadFolders() {
-        val c = Ds.colors
+        session = BiliSessionStore.cookie()
+        val expectedSession = session
         folderListContainer.removeAllViews()
         folderRows.clear()
         if (!BiliSessionStore.isLoggedIn()) {
@@ -251,7 +308,7 @@ internal class TabletFavoritesPageView(
         rightStateView.visibility = View.VISIBLE
         val gen = ++sessionGen
         BiliApi.fetchFavoriteFolders { list, error ->
-            if (gen != sessionGen) return@fetchFavoriteFolders
+            if (activity.isDestroyed || gen != sessionGen || expectedSession != BiliSessionStore.cookie()) return@fetchFavoriteFolders
             if (error != null) {
                 rightStateView.text = "加载收藏夹失败：$error\n\n点这里重试"
                 rightStateView.setOnClickListener { loadFolders() }
@@ -269,43 +326,47 @@ internal class TabletFavoritesPageView(
                 rightStateView.visibility = View.VISIBLE
                 return@fetchFavoriteFolders
             }
-            list.forEach { folder ->
-                val row = LinearLayout(activity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(12), dp(11), dp(12), dp(11))
-                    isClickable = true
-                    Ds.bindPressFeedback(this, 0.97f)
-                    setOnClickListener { selectFolder(folder) }
-                    addView(TextView(activity).apply {
-                        text = folder.name
-                        textSize = 14f
-                        typeface = Ds.body(true)
-                        setTextColor(c.text)
-                        maxLines = 1
-                        ellipsize = TextUtils.TruncateAt.END
-                        tag = "name"
-                    })
-                    addView(TextView(activity).apply {
-                        text = "${folder.count} 个视频 · ${if (folder.isPublic) "公开" else "私密"}"
-                        textSize = 11.5f
-                        fontFeatureSettings = "tnum"
-                        setTextColor(c.muted)
-                        setPadding(0, dp(3), 0, 0)
-                        tag = "meta"
-                    })
-                }
-                folderRows[folder.id] = row
-                folderListContainer.addView(row, LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(4) })
-            }
+            renderFolders()
             val initial = selectedFolder?.let { prev -> list.firstOrNull { it.id == prev.id } } ?: list.first()
             selectFolder(initial)
         }
     }
 
-    private fun selectFolder(folder: FavoriteFolder) {
-        selectedFolder = folder
+    private fun renderFolders() {
+        val c = Ds.colors
+        folderListContainer.removeAllViews()
+        folderRows.clear()
+        folders.forEach { folder ->
+            val row = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), dp(11), dp(12), dp(11))
+                isClickable = true
+                Ds.bindPressFeedback(this, 0.97f)
+                setOnClickListener { selectFolder(folder) }
+                addView(TextView(activity).apply {
+                    text = folder.name
+                    textSize = 14f
+                    typeface = Ds.body(true)
+                    setTextColor(c.text)
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                    tag = "name"
+                })
+                addView(TextView(activity).apply {
+                    text = "${folder.count} 个视频 · ${if (folder.isPublic) "公开" else "私密"}"
+                    textSize = 11.5f
+                    fontFeatureSettings = "tnum"
+                    setTextColor(c.muted)
+                    setPadding(0, dp(3), 0, 0)
+                    tag = "meta"
+                })
+            }
+            folderRows[folder.id] = row
+            folderListContainer.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(4) })
+        }
+    }
+
+    private fun bindFolderSelection(folder: FavoriteFolder) {
         val c = Ds.colors
         folderRows.forEach { (id, row) ->
             val active = id == folder.id
@@ -314,11 +375,19 @@ internal class TabletFavoritesPageView(
         }
         rightTitle.text = folder.name
         rightMeta.text = "${folder.count} 个视频 · ${if (folder.isPublic) "公开" else "私密"}"
+    }
+
+    private fun selectFolder(folder: FavoriteFolder) {
+        selectedFolder = folder
+        bindFolderSelection(folder)
         folderVideos.clear()
         seenBvids.clear()
         favPage = 1
         favEnded = false
         favLoading = false
+        favPageError = false
+        resumeFavPage = false
+        rightStateView.setOnClickListener(null)
         playAllBtn.visibility = View.GONE
         topButton.setShown(false, animate = false)
         videoAdapter.notifyDataSetChanged()
@@ -329,21 +398,23 @@ internal class TabletFavoritesPageView(
 
     private fun loadMoreFolderVideos() {
         val folder = selectedFolder ?: return
-        if (favLoading || favEnded) return
+        if (favLoading || favEnded || favPageError) return
         favLoading = true
         val gen = sessionGen
+        val expectedSession = session
         val page = favPage
         BiliApi.fetchFavoriteVideos(folder.id, page = page, pageSize = 20) { list, error, ended ->
-            if (gen != sessionGen || selectedFolder?.id != folder.id) return@fetchFavoriteVideos
+            if (activity.isDestroyed || gen != sessionGen || selectedFolder?.id != folder.id || expectedSession != BiliSessionStore.cookie()) return@fetchFavoriteVideos
             favLoading = false
             if (error != null) {
-                if (folderVideos.isEmpty()) {
-                    rightStateView.text = "加载失败：$error\n\n点这里重试"
-                    rightStateView.visibility = View.VISIBLE
-                    rightStateView.setOnClickListener { loadMoreFolderVideos() }
-                }
+                favPageError = true
+                rightStateView.text = "加载失败：$error\n\n点这里重试"
+                rightStateView.visibility = View.VISIBLE
+                rightStateView.setOnClickListener { favPageError = false; loadMoreFolderVideos() }
                 return@fetchFavoriteVideos
             }
+            favPageError = false
+            rightStateView.setOnClickListener(null)
             list.forEach { if (seenBvids.add(it.bvid)) folderVideos.add(it) }
             favPage = page + 1
             favEnded = ended || list.isEmpty()
@@ -483,8 +554,14 @@ internal class TabletFavoritesPageView(
 
 /** 平板端内嵌「历史记录」4 列卡片墙，支持搜索历史、清空、自动分页与悬浮回顶。 */
 internal class TabletHistoryPageView(
-    private val activity: Activity
+    private val activity: Activity,
+    restored: Snapshot? = null,
+    private val onSearch: () -> Unit
 ) : FrameLayout(activity) {
+
+    data class Snapshot(val session: String, val cloud: List<VideoItem>, val max: Long, val viewAt: Long,
+        val business: String, val ended: Boolean, val firstVisible: Int, val offset: Int,
+        val pendingPage: Boolean, val failed: Boolean)
 
     private lateinit var listView: ListView
     private lateinit var stateView: TextView
@@ -492,15 +569,20 @@ internal class TabletHistoryPageView(
     private var topScroller: AbsListSmoothTopScroller? = null
     private lateinit var adapter: HistoryGridAdapter
 
-    private val items = ArrayList<VideoItem>()
-    private val seen = HashSet<String>()
+    private val items = ArrayList<HistoryStore.ViewedRow>()
+    private lateinit var retryPage: TextView
     private var cursorMax = 0L
     private var cursorViewAt = 0L
     private var cursorBusiness = "archive"
+    private val cloudRows = ArrayList<VideoItem>()
     private var ended = false
     private var loading = false
-    private var loadedOnce = false
+    private var active = false
+    private var pageError = false
+    private var session = ""
     private var gen = 0
+    private var restoredReady = false
+    private var resumeHistoryPage = false
 
     private val availableWidthPx: Int
         get() = (resources.displayMetrics.widthPixels - dp(TabletRailNav.RAIL_WIDTH_DP + 36)).coerceAtLeast(dp(480))
@@ -510,41 +592,67 @@ internal class TabletHistoryPageView(
     init {
         setBackgroundColor(COLOR_BACKGROUND)
         buildUi()
+        restored?.takeIf { it.session == BiliSessionStore.cookie() }?.let { state ->
+            session = state.session
+            cloudRows.addAll(state.cloud)
+            cursorMax = state.max
+            cursorViewAt = state.viewAt
+            cursorBusiness = state.business
+            ended = state.ended
+            pageError = state.failed
+            resumeHistoryPage = state.pendingPage
+            items.addAll(HistoryStore.mergeRows(activity, cloudRows))
+            restoredReady = true
+            adapter.notifyDataSetChanged()
+            stateView.text = if (resumeHistoryPage) "正在加载观看历史…" else "暂无观看历史"
+            stateView.visibility = if (items.isEmpty() && !pageError) View.VISIBLE else View.GONE
+            if (pageError) { retryPage.text = "云端历史暂未同步，点此重试"; retryPage.visibility = View.VISIBLE }
+            listView.post { listView.setSelectionFromTop(state.firstVisible, state.offset) }
+        }
     }
 
-    fun onPageActivated() {
-        if (!loadedOnce) refresh()
+    fun snapshot(): Snapshot = Snapshot(session, cloudRows.toList(), cursorMax, cursorViewAt, cursorBusiness,
+        ended, listView.firstVisiblePosition, (listView.getChildAt(0)?.top ?: listView.paddingTop) - listView.paddingTop, resumeHistoryPage || loading, pageError)
+
+    fun setActive(value: Boolean) {
+        if (active == value && (!value || session == BiliSessionStore.cookie())) return
+        active = value
+        if (value) {
+            if (restoredReady && session == BiliSessionStore.cookie()) {
+                restoredReady = false
+                if (resumeHistoryPage) { resumeHistoryPage = false; loadMore() }
+            } else refresh()
+        } else {
+            gen++
+            loading = false
+            session = ""
+            restoredReady = false
+        }
     }
 
     fun refresh() {
+        if (!active) return
         gen++
-        items.clear()
-        seen.clear()
+        session = BiliSessionStore.cookie()
+        cloudRows.clear()
+        retryPage.visibility = View.GONE
         cursorMax = 0L
         cursorViewAt = 0L
         cursorBusiness = "archive"
-        ended = false
+        ended = !BiliSessionStore.isLoggedIn(session)
+        pageError = false
         loading = false
-        loadedOnce = true
-        adapter.notifyDataSetChanged()
+        items.clear()
+        items.addAll(HistoryStore.mergeRows(activity, cloudRows))
+        stateView.setOnClickListener(null)
+        stateView.text = if (ended) "暂无本地观看记录" else "正在加载观看历史…"
+        stateView.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
         topButton.setShown(false, animate = false)
-
-        if (!BiliSessionStore.isLoggedIn()) {
-            val local = HistoryStore.load(activity)
-            local.forEach { h ->
-                if (seen.add(h.bvid)) {
-                    items.add(VideoItem(h.bvid, h.title, h.owner, h.cover, 0L, 0, ""))
-                }
-            }
-            ended = true
-            adapter.notifyDataSetChanged()
-            stateView.text = if (items.isEmpty()) "暂无本地观看记录" else ""
-            stateView.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
-            return
-        }
-        stateView.text = "正在加载观看历史…"
-        stateView.visibility = View.VISIBLE
-        loadMore()
+        loading = !ended
+        adapter.notifyDataSetChanged()
+        listView.setSelection(0)
+        loading = false
+        if (!ended) loadMore()
     }
 
     private fun buildUi() {
@@ -565,40 +673,34 @@ internal class TabletHistoryPageView(
             setTextColor(c.text)
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
-        header.addView(TextView(activity).apply {
-            text = "搜索历史"
-            textSize = 12.5f
-            typeface = Ds.body(true)
-            setTextColor(c.text)
-            background = Ds.pill(activity, c.surface, c.lineSoft, Ds.hairline(activity))
-            setPadding(dp(14), dp(6), dp(14), dp(6))
-            isClickable = true
-            Ds.bindPressFeedback(this, 0.94f)
-            setOnClickListener {
-                activity.startActivity(Intent(activity, HistorySearchActivity::class.java))
-            }
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { rightMargin = dp(8) })
-
-        header.addView(TextView(activity).apply {
-            text = "刷新"
-            textSize = 12.5f
-            typeface = Ds.body(true)
-            setTextColor(c.muted)
-            background = Ds.pill(activity, c.surfaceRaised, c.lineSoft, Ds.hairline(activity))
-            setPadding(dp(14), dp(6), dp(14), dp(6))
-            isClickable = true
-            Ds.bindPressFeedback(this, 0.94f)
-            setOnClickListener { refresh() }
-        })
+        header.addView(FrameLayout(activity).apply {
+            isFocusable = true
+            contentDescription = "搜索观看历史"
+            addView(Ds.searchIcon(activity, c.text, 1.8f), LayoutParams(dp(20), dp(20), Gravity.CENTER))
+            Ds.bindPressFeedback(this, 0.92f)
+            setOnClickListener { onSearch() }
+        }, LinearLayout.LayoutParams(dp(48), dp(48)))
         col.addView(header, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ))
 
         val host = FrameLayout(activity)
+        retryPage = TextView(activity).apply {
+            textSize = 12f
+            setTextColor(c.muted)
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(14), dp(12), dp(14))
+            visibility = View.GONE
+            isFocusable = true
+            setOnClickListener {
+                pageError = false
+                visibility = View.GONE
+                loadMore()
+            }
+        }
         adapter = HistoryGridAdapter()
         listView = ListView(activity).apply {
+            addFooterView(retryPage, null, true)
             divider = null
             dividerHeight = 0
             setSelector(android.R.color.transparent)
@@ -643,25 +745,39 @@ internal class TabletHistoryPageView(
     }
 
     private fun loadMore() {
-        if (loading || ended) return
+        if (!active || loading || ended || pageError) return
+        if (session != BiliSessionStore.cookie()) { refresh(); return }
         loading = true
         val expected = gen
+        val expectedSession = session
         BiliApi.fetchHistory(cursorMax, cursorViewAt, cursorBusiness) { list, error, nextMax, nextViewAt, nextBiz, isEnd ->
-            if (expected != gen) return@fetchHistory
+            if (!active || expected != gen) return@fetchHistory
+            if (expectedSession != BiliSessionStore.cookie()) { refresh(); return@fetchHistory }
             loading = false
             if (error != null) {
+                pageError = true
                 if (items.isEmpty()) {
                     stateView.text = "加载历史失败：$error\n\n点这里重试"
                     stateView.visibility = View.VISIBLE
-                    stateView.setOnClickListener { refresh() }
+                    stateView.setOnClickListener {
+                        pageError = false
+                        stateView.text = "正在加载观看历史…"
+                        stateView.setOnClickListener(null)
+                        loadMore()
+                    }
+                } else {
+                    retryPage.text = "云端历史暂未同步，点此重试"
+                    retryPage.visibility = View.VISIBLE
                 }
                 return@fetchHistory
             }
-            list.forEach { v -> if (v.bvid.isNotBlank() && seen.add(v.bvid)) items.add(v) }
+            retryPage.visibility = View.GONE
+            cloudRows.addAll(list)
+            items.clear()
+            items.addAll(HistoryStore.mergeRows(activity, cloudRows))
             cursorMax = nextMax
             cursorViewAt = nextViewAt
             cursorBusiness = nextBiz.ifBlank { "archive" }
-            // 收到分页后，只有原始 API 声明结束或无下一游标才停，避免过滤导致误判提前结束
             ended = isEnd || nextMax <= 0L
             adapter.notifyDataSetChanged()
             stateView.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
@@ -675,7 +791,7 @@ internal class TabletHistoryPageView(
         private val cardH = VideoCardUi.cardHeight(coverH, activity)
 
         override fun getCount(): Int = (items.size + cols - 1) / cols
-        override fun getItem(position: Int): VideoItem? = items.getOrNull(position * cols)
+        override fun getItem(position: Int): VideoItem? = items.getOrNull(position * cols)?.video
         override fun getItemId(position: Int): Long = position.toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
@@ -691,7 +807,7 @@ internal class TabletHistoryPageView(
                     val card = VideoCardUi.createCard(activity, cardW, coverH, cardH).apply {
                         setOnClickListener {
                             (tag as? VideoCardUi.Holder)?.boundVideo?.let { v ->
-                                VideoDetailActivity.open(activity, v.bvid, v.aid, v.cid)
+                                VideoDetailActivity.openHistory(activity, v)
                             }
                         }
                     }
@@ -711,7 +827,8 @@ internal class TabletHistoryPageView(
             for (c in 0 until cols) {
                 val card = row.getChildAt(c) as LinearLayout
                 val holder = holders.getOrNull(c) ?: continue
-                val video = items.getOrNull(base + c)
+                val history = items.getOrNull(base + c)
+                val video = history?.video
                 if (video == null) {
                     card.visibility = View.INVISIBLE
                     card.isClickable = false
@@ -722,8 +839,9 @@ internal class TabletHistoryPageView(
                     card.isClickable = true
                     // 历史接口把删除键 archive_xxx 暂存在 rcmdReason，且接口不返回播放量；
                     // 展示时清空 rcmdReason 以正常显示 UP 主昵称，封面左下展示观看进度/观看日期，右下展示「已看/总时长」。
-                    val displayVideo = video.copy(rcmdReason = "")
+                    val displayVideo = video.copy(rcmdReason = "", publishedAt = history.viewedAtSec)
                     VideoCardUi.bind(card, holder, displayVideo, showPublishDate = true)
+                    holder.boundVideo = video
                     val progressBadge = formatHistoryCoverBadge(
                         progressSec = video.watchProgressSec.takeIf { it != 0L },
                         durationSec = video.duration

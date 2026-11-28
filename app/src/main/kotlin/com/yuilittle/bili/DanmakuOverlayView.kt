@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.os.SystemClock
 import android.view.Choreographer
@@ -40,6 +41,7 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
     }
 
     private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val glyphBounds = RectF()
 
     private var settings = DanmakuSettingsStore.Snapshot()
     private var isFullscreenMode = false
@@ -89,12 +91,15 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
         val bitmap: Bitmap,
         val baselineOffsetY: Float,
         val padX: Float,
+        val textSizePx: Float,
         val bytes: Int
     )
 
     private var frameScheduled = false
     private var lastViewportW = 0
     private var lastViewportH = 0
+    private var appliedFullscreen = false
+    private var viewportScale = 1f
 
     // 每秒准入限流计数
     private var rateWindowSec = -1L
@@ -144,12 +149,6 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
     fun setFullscreenMode(fullscreen: Boolean) {
         if (isFullscreenMode == fullscreen) return
         isFullscreenMode = fullscreen
-        measureCache.clear()
-        clearGlyphCache()
-        clearActiveDanmaku()
-        if (segmentItems.isNotEmpty()) {
-            nextEmitIndex = lowerBound(segmentItems, currentMediaMs.toInt())
-        }
         invalidate()
     }
 
@@ -259,6 +258,7 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
     }
 
     fun clearForMediaChange() {
+        playing = false
         segmentItems = emptyList()
         currentSegmentIndex = 0
         nextEmitIndex = 0
@@ -283,21 +283,55 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
 
     override fun onDetachedFromWindow() {
         stopFrameLoop()
-        clearGlyphCache()
         super.onDetachedFromWindow()
     }
 
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        super.onSizeChanged(w, h, oldw, oldh)
+    private fun layoutActiveForViewport(checkCrowding: Boolean = false) {
+        val w = width
+        val h = height
         if (w <= 0 || h <= 0) return
-        if (w != lastViewportW || h != lastViewportH) {
-            lastViewportW = w
-            lastViewportH = h
-            clearActiveDanmaku()
-            if (segmentItems.isNotEmpty()) {
-                nextEmitIndex = lowerBound(segmentItems, currentMediaMs.toInt())
+        val changed = w != lastViewportW || h != lastViewportH || appliedFullscreen != isFullscreenMode
+        if (!changed && !checkCrowding) return
+        val topMargin = if (isFullscreenMode) dp(10f) else dp(6f)
+        val bottomMargin = if (isFullscreenMode) dp(16f) else dp(8f)
+        val naturalLine = naturalLineHeightPx()
+        val occupied = 1 + maxOf(activeScroll.maxOfOrNull { it.lane } ?: -1,
+            activeTop.maxOfOrNull { it.lane } ?: -1, activeBottom.maxOfOrNull { it.lane } ?: -1)
+        val fit = viewportTextFit((h * settings.areaFraction - max(topMargin, bottomMargin)).coerceAtLeast(1f), naturalLine, occupied)
+        // 收窄后只临时缩放仍在途的密集轨道；不丢弃它们，也不再往溢出轨道准入。
+        if (!changed && (viewportScale == 1f || fit < 1f)) return
+        val oldWidth = lastViewportW.takeIf { it > 0 } ?: w
+        viewportScale = fit
+        val line = computeLineHeightPx()
+        val now = currentMediaMs
+        val laneCounts = IntArray(occupied)
+        for (d in activeScroll) laneCounts[d.lane]++
+        fun place(list: ArrayList<ActiveDanmaku>, scrolling: Boolean, bottom: Boolean) {
+            for (d in list) {
+                val item = d.item ?: continue
+                val newSize = resizedTextSize(d.laneSizePerPixel, computeTextSizePx(item.fontSize), w,
+                    sharedLane = scrolling && laneCounts[d.lane] > 1)
+                val newText = d.textWidth * (newSize / d.textSizePx)
+                if (scrolling) {
+                    val next = DanmakuTravel(d.currentX(now), d.speedPxPerMs).resized(oldWidth, d.textWidth, w, newText)
+                    d.anchorX = next.left
+                    d.speedPxPerMs = next.velocity
+                    d.anchorMediaMs = now
+                } else {
+                    d.anchorX = (w - newText) * 0.5f
+                }
+                d.textWidth = newText
+                d.textSizePx = newSize
+                d.yBaseline = if (bottom) (h - bottomMargin - d.lane * line - line * 0.12f).coerceAtLeast(topMargin + newSize)
+                    else topMargin + d.lane * line + newSize * 0.92f
             }
         }
+        place(activeScroll, scrolling = true, bottom = false)
+        place(activeTop, scrolling = false, bottom = false)
+        place(activeBottom, scrolling = false, bottom = true)
+        lastViewportW = w
+        lastViewportH = h
+        appliedFullscreen = isFullscreenMode
     }
 
     private fun scheduleFrame() {
@@ -317,9 +351,14 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
         val viewH = height
         if (viewW <= 0 || viewH <= 0) return
 
+        layoutActiveForViewport()
+        val before = activeScroll.size + activeTop.size + activeBottom.size
         sweepExpired(activeScroll, mediaMs, viewW)
         sweepExpired(activeTop, mediaMs, viewW)
         sweepExpired(activeBottom, mediaMs, viewW)
+        if (viewportScale < 1f && before != activeScroll.size + activeTop.size + activeBottom.size) {
+            layoutActiveForViewport(checkCrowding = true)
+        }
 
         val list = segmentItems
         if (list.isEmpty() || nextEmitIndex >= list.size) return
@@ -360,8 +399,7 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
         val textSizePx = computeTextSizePx(item.fontSize)
         val lineHeight = computeLineHeightPx()
         val topMargin = if (isFullscreenMode) dp(10f) else dp(6f)
-        val areaBottom = (viewH * settings.areaFraction).coerceAtLeast(topMargin + lineHeight)
-        val maxLanes = ((areaBottom - topMargin) / lineHeight).toInt().coerceAtLeast(1)
+        val maxLanes = ((viewH * settings.areaFraction - topMargin) / naturalLineHeightPx()).toInt().coerceAtLeast(1)
 
         val textWidth = measureTextWidth(item.text, textSizePx)
         val isReverse = item.mode == DanmakuItem.MODE_SCROLL_REVERSE
@@ -423,6 +461,9 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
                 d.yBaseline = topMargin + lane * lineHeight + textSizePx * 0.92f
                 d.reverse = isReverse
                 d.glyph = obtainGlyph(item, textSizePx, textWidth)
+                // 同轨间距在准入时已校验。这里只记录此刻的字号/窗宽，切窗不能累乘上一次缩放结果。
+                for (other in activeScroll) if (other.lane == lane) other.laneSizePerPixel = other.textSizePx / viewW
+                d.laneSizePerPixel = textSizePx / viewW
                 activeScroll.add(d)
                 true
             }
@@ -462,7 +503,7 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
         c.drawText(item.text, pad, baselineY, fillPaint)
 
         val bytes = bmp.allocationByteCount
-        val glyph = CachedGlyph(bmp, baselineY, pad, bytes)
+        val glyph = CachedGlyph(bmp, baselineY, pad, textSizePx, bytes)
         bitmapCache[key] = glyph
         cachedBitmapBytes += bytes
         trimGlyphCacheIfNeeded()
@@ -575,6 +616,7 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (!settings.enabled) return
+        layoutActiveForViewport()
         if (activeScroll.isEmpty() && activeTop.isEmpty() && activeBottom.isEmpty()) return
 
         val mediaMs = currentMediaMs
@@ -601,8 +643,12 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
             val y = d.yBaseline
             val glyph = d.glyph
             if (glyph != null && !glyph.bitmap.isRecycled) {
-                // 单次位图 blit，硬件加速纹理上传一次后全生命周期 60fps 零文字描边开销
-                canvas.drawBitmap(glyph.bitmap, x - glyph.padX, y - glyph.baselineOffsetY, bitmapPaint)
+                // 全屏动画/连续缩放期间复用在屏字形，不在主线程重新生成整屏位图。
+                val scale = d.textSizePx / glyph.textSizePx
+                val left = x - glyph.padX * scale
+                val top = y - glyph.baselineOffsetY * scale
+                glyphBounds.set(left, top, left + glyph.bitmap.width * scale, top + glyph.bitmap.height * scale)
+                canvas.drawBitmap(glyph.bitmap, null, glyphBounds, bitmapPaint)
             } else {
                 val size = d.textSizePx
                 fillPaint.textSize = size
@@ -635,10 +681,12 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
             else -> 1.0f
         }
         val baseSp = if (isFullscreenMode) 17.5f else 13.0f
-        return baseSp * scaledDensity * settings.textScale * fontFactor
+        return baseSp * scaledDensity * settings.textScale * fontFactor * viewportScale
     }
 
-    private fun computeLineHeightPx(): Float {
+    private fun computeLineHeightPx(): Float = naturalLineHeightPx() * viewportScale
+
+    private fun naturalLineHeightPx(): Float {
         val baseSp = if (isFullscreenMode) 17.5f else 13.0f
         val basePx = baseSp * scaledDensity * settings.textScale
         return ceil(basePx * 1.28f)
@@ -693,6 +741,7 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
             val newSpeed = (viewW + newWidth) / newDuration.toFloat()
             d.textSizePx = newSize
             d.textWidth = newWidth
+            d.laneSizePerPixel = newSize / viewW
             d.anchorX = curX
             d.anchorMediaMs = mediaMs
             d.speedPxPerMs = if (d.reverse) newSpeed else -newSpeed
@@ -783,6 +832,7 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
     }
 
     private fun clearActiveDanmaku() {
+        viewportScale = 1f
         for (i in 0 until activeScroll.size) recycleActive(activeScroll[i])
         for (i in 0 until activeTop.size) recycleActive(activeTop[i])
         for (i in 0 until activeBottom.size) recycleActive(activeBottom[i])
@@ -818,6 +868,7 @@ internal class DanmakuOverlayView(context: Context) : View(context) {
         var item: DanmakuItem? = null
         var glyph: CachedGlyph? = null
         var lane: Int = 0
+        var laneSizePerPixel = 0f
         var textSizePx: Float = 0f
         var textWidth: Float = 0f
         var anchorMediaMs: Double = 0.0

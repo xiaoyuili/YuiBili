@@ -2,7 +2,6 @@ package com.yuilittle.bili
 
 import android.app.Activity
 import android.content.Context
-import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -51,8 +50,9 @@ class HistorySearchActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Theme.init(this)
+        BiliSessionStore.init(this)
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        LayoutMode.applyScreenOrientation(this)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -279,8 +279,8 @@ class HistorySearchActivity : Activity() {
                 scroll.visibility = View.VISIBLE
             }
             var added = 0
-            videos.forEach { item ->
-                if (!seen.add(item.bvid)) return@forEach
+            HistoryStore.withLocalProgress(this, videos).forEach { item ->
+                if (!seen.add(item.historyMedia.rowKey)) return@forEach
                 val row = buildRow(item)
                 listBox.addView(row)
                 animateRowIn(row, rowAnimIndex++)
@@ -310,12 +310,7 @@ class HistorySearchActivity : Activity() {
             setPadding(dp(10), dp(10), dp(12), dp(10))
             isClickable = true
             isFocusable = true
-            setOnClickListener {
-                startActivity(
-                    Intent(this@HistorySearchActivity, VideoDetailActivity::class.java)
-                        .putExtra(VideoDetailActivity.EXTRA_BVID, item.bvid)
-                )
-            }
+            setOnClickListener { VideoDetailActivity.openHistory(this@HistorySearchActivity, item) }
         }
         val thumbBox = FrameLayout(this).apply {
             Ds.clipRounded(this, Ds.Radius.chip)

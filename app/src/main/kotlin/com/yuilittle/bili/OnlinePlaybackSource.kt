@@ -44,7 +44,9 @@ internal object OnlinePlaybackSource {
         } else {
             builder.removeHeader("Cookie")
         }
+        val startedAt = android.os.SystemClock.elapsedRealtime()
         val response = chain.proceed(builder.build())
+        PlaybackDiagnostics.response(response, android.os.SystemClock.elapsedRealtime() - startedAt)
         validateMediaResponse(response)
         response
     }
@@ -165,102 +167,55 @@ internal object OnlinePlaybackSource {
     ) : BaseDataSource(/* isNetwork= */ true) {
         private var currentSource: DataSource? = null
         private var currentUri: Uri? = null
-        private var currentCandidateIndex = 0
         private var currentSpec: DataSpec? = null
-        private var totalReadFromSpec = 0L
+        private var transferOpen = false
+        private val reader = FallbackMediaReader(candidates.size) { index, position, length ->
+            val spec = checkNotNull(currentSpec).buildUpon()
+                .setUri(Uri.parse(candidates[index]))
+                .setPosition(position)
+                .setLength(length)
+                .build()
+            val source = delegateFactory.createDataSource()
+            try {
+                val openedLength = source.open(spec)
+                currentSource = source
+                currentUri = source.uri ?: spec.uri
+                object : FallbackMediaReader.Source {
+                    override val length = openedLength
+                    override fun read(buffer: ByteArray, offset: Int, length: Int): Int = source.read(buffer, offset, length)
+                    override fun close() {
+                        try { source.close() } finally { if (currentSource === source) currentSource = null }
+                    }
+                }
+            } catch (error: IOException) {
+                runCatching { source.close() }
+                throw error
+            }
+        }
 
         override fun open(dataSpec: DataSpec): Long {
-            val urls = candidates.ifEmpty { listOf(dataSpec.uri.toString()) }
-            var lastError: IOException? = null
-            for (index in urls.indices) {
-                val url = urls[index]
-                val candidateSpec = dataSpec.buildUpon().setUri(Uri.parse(url)).build()
-                val source = delegateFactory.createDataSource()
-                try {
-                    val length = source.open(candidateSpec)
-                    currentSource = source
-                    currentCandidateIndex = index
-                    currentUri = source.uri ?: Uri.parse(url)
-                    currentSpec = dataSpec
-                    totalReadFromSpec = 0L
-                    transferInitializing(candidateSpec)
-                    transferStarted(candidateSpec)
-                    return length
-                } catch (e: IOException) {
-                    lastError = e
-                    runCatching { source.close() }
-                }
-            }
-            throw lastError ?: IOException("没有可用的媒体候选地址")
+            close()
+            currentSpec = dataSpec
+            transferInitializing(dataSpec)
+            val length = reader.open(dataSpec.position, dataSpec.length)
+            transferOpen = true
+            transferStarted(dataSpec)
+            return length
         }
 
-        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-            val active = currentSource ?: throw IOException("媒体源未打开")
-            return try {
-                val read = active.read(buffer, offset, length)
-                if (read > 0) {
-                    totalReadFromSpec += read
-                    bytesTransferred(read)
-                }
-                read
-            } catch (e: IOException) {
-                if (reopenNextCandidate()) {
-                    val next = currentSource ?: throw e
-                    val read = next.read(buffer, offset, length)
-                    if (read > 0) {
-                        totalReadFromSpec += read
-                        bytesTransferred(read)
-                    }
-                    read
-                } else {
-                    throw e
-                }
-            }
-        }
-
-        private fun reopenNextCandidate(): Boolean {
-            val spec = currentSpec ?: return false
-            val urls = candidates
-            val nextStart = currentCandidateIndex + 1
-            if (nextStart >= urls.size) return false
-            runCatching { currentSource?.close() }
-            currentSource = null
-            val resumedPosition = spec.position + totalReadFromSpec
-            val remainingLength = if (spec.length == C.LENGTH_UNSET.toLong()) {
-                C.LENGTH_UNSET.toLong()
-            } else {
-                (spec.length - totalReadFromSpec).coerceAtLeast(0L)
-            }
-            for (index in nextStart until urls.size) {
-                val candidateSpec = spec.buildUpon()
-                    .setUri(Uri.parse(urls[index]))
-                    .setPosition(resumedPosition)
-                    .setLength(remainingLength)
-                    .build()
-                val source = delegateFactory.createDataSource()
-                try {
-                    source.open(candidateSpec)
-                    currentSource = source
-                    currentCandidateIndex = index
-                    currentUri = source.uri ?: Uri.parse(urls[index])
-                    return true
-                } catch (_: IOException) {
-                    runCatching { source.close() }
-                }
-            }
-            return false
-        }
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+            reader.read(buffer, offset, length).also { if (it > 0) bytesTransferred(it) }
 
         override fun getUri(): Uri? = currentUri
 
+        override fun getResponseHeaders(): Map<String, List<String>> = currentSource?.responseHeaders.orEmpty()
+
         override fun close() {
+            reader.close()
             currentUri = null
             currentSpec = null
-            totalReadFromSpec = 0L
-            try {
-                currentSource?.close()
-            } finally {
-                currentSource = null
+            if (transferOpen) {
+                transferOpen = false
                 transferEnded()
             }
         }

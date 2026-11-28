@@ -795,12 +795,9 @@ object BiliPlayUrl {
         if (!stream.isDash || stream.videoTracks.isEmpty()) return stream
         val activeTracks = stream.videoTracks.filterNot { (it.id to it.codecs) in excludedTracks }
             .ifEmpty { stream.videoTracks }
-        val requestedOrLower = activeTracks
-            .filter { it.id <= requestedQuality }
-            .ifEmpty { activeTracks }
-        val selectedQuality = requestedOrLower.maxOfOrNull { it.id }
-            ?: activeTracks.maxOfOrNull { it.id }
-        val qualityTracks = requestedOrLower.filter { it.id == selectedQuality }
+        val selectedQuality = if (requestedQuality == PreferredVideoQuality.HIGHEST) activeTracks.maxOf { it.id }
+            else activeTracks.filter { it.id <= requestedQuality }.maxOfOrNull { it.id } ?: activeTracks.minOf { it.id }
+        val qualityTracks = activeTracks.filter { it.id == selectedQuality }
         val video = qualityTracks.minWithOrNull(
             compareBy<DashVideoTrack> { codecStabilityRank(it.codecs) }
                 .thenByDescending { it.bandwidth }

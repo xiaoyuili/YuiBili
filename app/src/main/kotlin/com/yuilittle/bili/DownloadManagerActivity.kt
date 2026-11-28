@@ -17,7 +17,7 @@ class DownloadManagerActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Ds.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        LayoutMode.applyScreenOrientation(this)
         window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Ds.colors.bg))
         DownloadManager.init(this)
 

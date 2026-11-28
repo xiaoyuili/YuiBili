@@ -1,32 +1,38 @@
 package com.yuilittle.bili
 
-/**
- * 评论 @昵称 → mid 的解析表。
- * B 站评论接口不直接给出被 @ 用户的 mid，这里用已加载评论的作者补全映射，
- * 命中不了时点击不跳转（不猜测，避免跳到错误用户）。
- */
 internal object CommentMentionResolver {
-    private val nameToMid = HashMap<String, Long>()
-    private val midToName = HashMap<Long, String>()
-
-    fun register(name: String, mid: Long) {
-        if (name.isBlank() || mid <= 0L) return
-        nameToMid[name] = mid
-        midToName[mid] = name
+    fun fromEntries(entries: Iterable<Pair<String, String>>): Map<String, Long> {
+        val result = LinkedHashMap<String, Long>()
+        val ambiguous = HashSet<String>()
+        for ((rawName, rawMid) in entries) {
+            val name = rawName.removePrefix("@")
+            val mid = rawMid.toLongOrNull()?.takeIf { it > 0L } ?: continue
+            if (name.isBlank() || name in ambiguous) continue
+            val previous = result[name]
+            if (previous != null && previous != mid) {
+                result.remove(name)
+                ambiguous += name
+            } else result[name] = mid
+        }
+        return result
     }
 
-    fun register(comment: VideoComment) {
-        register(comment.user, comment.userMid)
-        comment.replies.forEach { register(it) }
-    }
+    data class Mention(val start: Int, val end: Int, val name: String, val mid: Long)
 
-    fun resolve(name: String): Long {
-        if (name.isBlank()) return 0L
-        return nameToMid[name] ?: 0L
-    }
-
-    fun clear() {
-        nameToMid.clear()
-        midToName.clear()
+    fun find(text: String, members: Map<String, Long>): List<Mention> {
+        if (members.isEmpty() || '@' !in text) return emptyList()
+        val names = members.keys.sortedByDescending(String::length)
+        val result = ArrayList<Mention>()
+        var start = text.indexOf('@')
+        while (start >= 0) {
+            val name = names.firstOrNull { name ->
+                val end = start + 1 + name.length
+                text.regionMatches(start + 1, name, 0, name.length) &&
+                    (end == text.length || text[end].isWhitespace() || text[end] in "：:，,。!！?？、;；@()（）[]【】")
+            }
+            if (name != null) result += Mention(start, start + 1 + name.length, name, members.getValue(name))
+            start = text.indexOf('@', if (name != null) start + 1 + name.length else start + 1)
+        }
+        return result
     }
 }

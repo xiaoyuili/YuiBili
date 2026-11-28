@@ -31,6 +31,18 @@ object BiliSessionStore {
     private var cachedCookie: String? = null
 
     @Volatile
+    private var sessionEpoch = 0L
+
+    class SessionSnapshot internal constructor(val epoch: Long, internal val cookie: String)
+
+    @Synchronized
+    fun snapshot(): SessionSnapshot = SessionSnapshot(sessionEpoch, cachedCookie.orEmpty())
+
+    @Synchronized
+    fun isCurrent(snapshot: SessionSnapshot): Boolean =
+        snapshot.epoch == sessionEpoch && snapshot.cookie == cachedCookie.orEmpty()
+
+    @Volatile
     private var vipStatus = 0
 
     @Volatile
@@ -217,6 +229,7 @@ object BiliSessionStore {
         val normalized = normalize(rawCookie)
         if (normalized.isBlank()) return false
         if (cachedCookie != normalized) {
+            sessionEpoch++
             clearProfileCache()
             resetVip()
         }
@@ -234,6 +247,7 @@ object BiliSessionStore {
     fun clear(context: Context) {
         clearProfileCache()
         init(context)
+        if (!cachedCookie.isNullOrBlank()) sessionEpoch++
         cachedCookie = ""
         resetVip()
         appContext!!.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

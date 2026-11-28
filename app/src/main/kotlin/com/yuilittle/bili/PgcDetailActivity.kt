@@ -12,7 +12,6 @@ import android.content.Context
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.BitmapShader
 import android.graphics.Canvas
@@ -126,7 +125,6 @@ class PgcDetailActivity : Activity() {
         portraitDanmakuToggle?.updateState(s.enabled)
     }
     private lateinit var gestureLayer: PlayerGestureView
-    private lateinit var fullscreenContainer: FrameLayout
     private lateinit var playerBack: View
     private lateinit var playerSpinner: BrandSpinnerView
     private lateinit var playerError: TextView
@@ -177,6 +175,8 @@ class PgcDetailActivity : Activity() {
     private var seasonDrawerItems: List<FullscreenSeasonItem> = emptyList()
     /** 切集请求进行中 currentDetail 会置空，用该缓存保证抽屉仍可展开。 */
     private var cachedSeason: UgcSeason? = null
+    private var onlinePlayMode = DownloadManager.LocalPlayMode.SEASON_SEQUENCE
+    private var pendingIntro: VideoItem? = null
     private var isFullscreen = false
     private var currentStream: BiliPlayUrl.DashStream? = null
     private var streamSession = ""
@@ -217,11 +217,18 @@ class PgcDetailActivity : Activity() {
     }
     private lateinit var playerTopTitle: TextView
     private lateinit var playerSeekHint: TextView
+    private lateinit var playerSkipHint: TextView
+    private val hideSkipHint = Runnable { if (::playerSkipHint.isInitialized) playerSkipHint.visibility = View.GONE }
+    private var speedPopup: PopupWindow? = null
+    private var introPlayMode: TextView? = null
+    private var drawerPlayMode: PlayModeIconView? = null
+    private var drawerPlayModeButton: View? = null
+    private var drawerModePopup: PopupWindow? = null
     private lateinit var replayBtn: ReplayIcon
     private lateinit var bottomBar: ViewGroup
     private lateinit var playPauseBtn: PlayPauseIcon
     private var nextEpisodeBtn: NextEpisodeIcon? = null
-    private lateinit var progressContainer: SeekBarView
+    private lateinit var progressContainer: PlaybackProgressBar
     private lateinit var infoArea: View
     private lateinit var timeText: TextView
     private lateinit var durationText: TextView
@@ -234,7 +241,6 @@ class PgcDetailActivity : Activity() {
     private lateinit var boostIndicator: TextView
     private var boostAnimator: ValueAnimator? = null
     private var endedState = false
-    private var exitingFullscreen = false
     private var fsTransitioning = false
     private var controlsVisible = true
     private var controlsAnimating = false
@@ -252,17 +258,8 @@ class PgcDetailActivity : Activity() {
     private lateinit var tabCommentIndicator: View
     private lateinit var infoPager: HorizontalPagerView
     private lateinit var introScroll: ScrollView
-    private lateinit var commentScroll: ScrollView
-    private lateinit var commentContent: LinearLayout
-    private lateinit var commentState: TextView
-    private lateinit var commentMore: TextView
-    private var commentCursor = -1
-    /** rpids already rendered, so a broken cursor can never duplicate rows. */
-    private val seenCommentRpids = HashSet<Long>()
-    private var commentLoginHintShown = false
-    private var commentsLoading = false
-    private var commentsLoaded = false
-    private var commentGeneration = 0
+    private lateinit var commentScroll: CommentListView
+    private var restoredComments: Bundle? = null
     private var currentDetail: VideoItem? = null
     private var currentTab = 0
 
@@ -279,19 +276,9 @@ class PgcDetailActivity : Activity() {
     private var titleHeightAnimator: ValueAnimator? = null
     private var descHeightAnimator: ValueAnimator? = null
     // ── Comments: sort (0=hot likes, 1=newest) + auto paging + total badge ──
-    private var commentSort = 0
-    private var commentHasMore = false
     private lateinit var commentBubble: TextView
-    private var commentHeaderBar: CommentSectionUi.CommentHeaderBar? = null
-    private var commentPrefetchHandle: CoverLoader.PrefetchHandle? = null
-    private lateinit var commentSortBtn: TextView
-    private lateinit var commentHeaderTitle: TextView
     /** Fixed info-tab navigation row; reply sheets start immediately below it. */
     private var infoTabBarAnchor: View? = null
-    /** Comment section header row; used only for the sort row. */
-    private var commentHeaderAnchor: View? = null
-    /** Locally liked comment rpids (server sync pending until login lands). */
-    // Comment likes are always re-fetched from Bilibili after action; no local store.
     // ── Follow button state (server-backed; no local fake store) ──
     private var followBtnRef: TextView? = null
     private var followInFlight = false
@@ -313,33 +300,35 @@ class PgcDetailActivity : Activity() {
     private var restoreEndedState = false
     private var retryScheduled = false
     private var stallRetries = 0
-    /** BUFFERING 看门狗：超过阈值仍未就绪则强制重试，避免无限转圈。 */
+    private val stallMonitor = PlaybackStallMonitor(STALL_TIMEOUT_MS)
+    private val playbackDiagnostics by lazy { PlaybackDiagnostics(this, "pgc") }
+    /** 只按可播缓冲的前沿判断进展，网络收到了字节不等于视频已可播放。 */
     private val stallWatchdog: Runnable by lazy(LazyThreadSafetyMode.NONE) {
         Runnable {
-            if (isFinishing || isDestroyed) return@Runnable
+            if (isFinishing || isDestroyed || !activityResumed || !userWantsPlayback || isSeeking || playerListener == null) return@Runnable
             val player = exoPlayer ?: return@Runnable
-            if (player.playbackState == Player.STATE_BUFFERING && !retryScheduled) {
+            if (player.playbackState == Player.STATE_BUFFERING && player.playWhenReady && !retryScheduled) {
+                val now = SystemClock.elapsedRealtime()
+                stallMonitor.observe(now, playerGlobalBufferedPosition(player))
+                val remaining = stallMonitor.remainingMs(now)
+                if (remaining > 0L) { handler.postDelayed(stallWatchdog, remaining); return@Runnable }
                 if (stallRetries >= MAX_STALL_RETRIES) {
                     Log.w("YuiBiliPlayer", "stall watchdog: 已达重试上限，停止重试")
                     playerSpinner.visibility = View.GONE
+                    retryScheduled = true
                     showError("加载超时，点这里重试")
                     return@Runnable
                 }
                 stallRetries++
                 retryScheduled = true
-                Log.w("YuiBiliPlayer", "stall watchdog: BUFFERING 超过 ${STALL_TIMEOUT_MS}ms，第 ${stallRetries} 次重试")
+                Log.w("YuiBiliPlayer", "stall watchdog: 可播缓冲停滞，第 ${stallRetries} 次恢复")
                 playerSpinner.visibility = View.VISIBLE
                 playerError.visibility = View.GONE
-                // 清掉可能越界的续播位置，并从源头重建（用 switchingLocalTask 避免位置被写回）
-                pendingResumePositionMs = 0L
-                resumeSegmentIndex = 0
-                switchingLocalTask = true
-                try {
-                    if (currentBvid.isNotBlank() && currentCid > 0L) {
-                        loadPlayer(bypassCache = true)
-                    }
-                } finally {
-                    switchingLocalTask = false
+                rememberPlaybackPosition()
+                playbackDiagnostics.recovering(pendingResumePositionMs, playerGlobalBufferedPosition(player), stallRetries)
+                if (currentBvid.isNotBlank() && currentCid > 0L) {
+                    loadPlayer(PreferredVideoQuality.resumeRequestQuality(requestedQuality, lastRequestedQuality,
+                        BiliSessionStore.isLoggedIn(), streamSession != BiliSessionStore.cookie()), bypassCache = true)
                 }
             }
         }
@@ -376,26 +365,25 @@ class PgcDetailActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         BiliSessionStore.init(this)
+        restoredComments = savedInstanceState?.getBundle("comments")
         DanmakuSettingsStore.init(this)
         seasonId = savedInstanceState?.getLong(EXTRA_SEASON_ID)
             ?: intent.getLongExtra(EXTRA_SEASON_ID, 0L)
+        currentEpId = savedInstanceState?.getLong(STATE_EP_ID) ?: 0L
+        currentCid = savedInstanceState?.getLong(STATE_EP_CID) ?: 0L
         pendingResumePositionMs = savedInstanceState?.getLong(STATE_PLAY_POSITION) ?: 0L
         resumeSegmentIndex = savedInstanceState?.getInt(STATE_SEGMENT_INDEX) ?: 0
         userWantsPlayback = savedInstanceState?.getBoolean(STATE_PLAY_WHEN_READY, true) ?: true
         restoreEndedState = savedInstanceState?.getBoolean(STATE_PLAY_ENDED) ?: false
         speedIndex = savedInstanceState?.getInt(STATE_SPEED_INDEX)?.coerceIn(speeds.indices) ?: 1
+        onlinePlayMode = savedOnlinePlayMode(qualityPrefs)
         requestedQuality = loadQualityPreference()
         if (seasonId <= 0L) { finish(); return }
         startupAtMs = SystemClock.elapsedRealtime()
         BiliPlayUrl.prewarm()
         // 视频播放页顶部紧邻黑色视频窗口，状态栏固定纯黑配白色图标，底栏跟随主题色
         applyPlayerSystemBars()
-        if (LayoutMode.isTablet) {
-            LayoutMode.applyTabletOrientationIfEnabled(this)
-        } else {
-            // Detail page is portrait-designed; fullscreen switches to landscape temporarily.
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
+        LayoutMode.applyScreenOrientation(this)
 
         activityRoot = FrameLayout(this).apply { setBackgroundColor(COLOR_BACKGROUND) }
         page = LinearLayout(this).apply {
@@ -404,18 +392,13 @@ class PgcDetailActivity : Activity() {
         }
 
         // ── Gesture detector ──
-        gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-            override fun onDown(e: MotionEvent): Boolean = true
-            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                if (longPressBoost) return true
-                toggleControls()
-                return true
-            }
-            override fun onDoubleTap(e: MotionEvent): Boolean {
-                togglePlayPause()
-                return true
-            }
-        })
+        gestureDetector = playerTapDetector(this, single = { if (!longPressBoost) toggleControls() }, armDouble = {
+            handler.removeCallbacks(longPressBoostRunnable)
+            longPressCandidate = false
+        }) { x ->
+            val delta = PlayerSeekPolicy.doubleTapDelta(isFullscreen, x, playerHost.width)
+            if (delta == 0L) togglePlayPause() else skipByDoubleTap(delta)
+        }
 
         // ── Player host: Media3 PlayerView owns aspect-ratio and video surface ──
         playerHost = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
@@ -534,21 +517,6 @@ class PgcDetailActivity : Activity() {
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(18) })
 
-        // ── Seek preview pill: 滑动进度提示胶囊，松手后才真正 seek ──
-        playerSeekHint = TextView(this).apply {
-            textSize = 14f
-            setTextColor(Color.WHITE)
-            typeface = Ds.display(bold = true)
-            gravity = Gravity.CENTER
-            setPadding(dp(16), dp(8), dp(16), dp(8))
-            background = Ds.pill(this@PgcDetailActivity, 0xCC14161B.toInt(), 0x33FFFFFF)
-            alpha = 0f
-            visibility = View.GONE
-        }
-        playerHost.addView(playerSeekHint, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.CENTER))
-
         // ── Brightness / volume adjustment indicator (center overlay) ──
         adjustIndicator = AdjustIndicator(this).apply {
             alpha = 0f
@@ -561,6 +529,29 @@ class PgcDetailActivity : Activity() {
 
         // ── Control overlay ──
         createControlOverlay()
+        playerSeekHint = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            typeface = Ds.body(true)
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            setShadowLayer(dpf(3f), 0f, dpf(1f), 0xB3000000.toInt())
+            visibility = View.GONE
+        }
+        playerHost.addView(playerSeekHint, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
+        progressRow.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionSeekHint() }
+        playerSkipHint = TextView(this).apply {
+            textSize = 13f
+            typeface = Ds.body(true)
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setShadowLayer(dpf(3f), 0f, dpf(1f), 0xB3000000.toInt())
+            translationY = dpf(38f)
+            visibility = View.GONE
+        }
+        playerHost.addView(playerSkipHint, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         infoArea = createInfoArea()
         tabletSplitDivider = View(this).apply {
             setBackgroundColor(Ds.colors.lineSoft)
@@ -571,12 +562,6 @@ class PgcDetailActivity : Activity() {
         page.addView(infoArea)
         applyPageSplitLayout()
         activityRoot.addView(page, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        fullscreenContainer = FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK)
-            visibility = View.GONE
-        }
-        activityRoot.addView(fullscreenContainer, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         setContentView(activityRoot)
         loadVideoAndPlayer()
         BiliSessionStore.refreshVipInfo()
@@ -657,7 +642,7 @@ class PgcDetailActivity : Activity() {
             background = Ds.pill(this@PgcDetailActivity, 0x33000000, 0x2EFFFFFF)
             isClickable = true
             Ds.bindPressFeedback(this, 0.90f)
-            setOnClickListener { cycleSpeed() }
+            setOnClickListener { showSpeedMenu() }
         }
         bottomBar.addView(speedBtn, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, dp(26)).apply {
@@ -714,9 +699,12 @@ class PgcDetailActivity : Activity() {
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             gravity = Gravity.CENTER_VERTICAL })
 
-        progressContainer = SeekBarView(this).apply {
+        progressContainer = PlaybackProgressBar(this).apply {
             isClickable = true
+            var touchGeneration = -1
             setOnTouchListener { _, event ->
+                if (event.actionMasked == MotionEvent.ACTION_DOWN) touchGeneration = playbackGeneration
+                else if (!isDragging || touchGeneration != playbackGeneration) return@setOnTouchListener true
                 val p = exoPlayer ?: return@setOnTouchListener true
                 val totalDuration = playerGlobalDuration(p)
                 if (totalDuration <= 0L || width <= 0) return@setOnTouchListener true
@@ -756,7 +744,8 @@ class PgcDetailActivity : Activity() {
                         parent?.requestDisallowInterceptTouchEvent(false)
                     }
                 }
-                onManualSeek(seekPos, totalDuration)
+                if (event.actionMasked == MotionEvent.ACTION_CANCEL || event.actionMasked == MotionEvent.ACTION_UP) updatePlaybackProgress()
+                else onManualSeek(seekPos, totalDuration)
                 true
             }
         }
@@ -1082,6 +1071,15 @@ class PgcDetailActivity : Activity() {
         setOnClickListener { openSeasonDrawer() }
     }
 
+    private fun setOnlinePlayMode(mode: DownloadManager.LocalPlayMode) {
+        onlinePlayMode = mode
+        qualityPrefs.edit().putString("online_queue_mode", mode.name).apply()
+        introPlayMode?.text = mode.label()
+        introPlayMode?.contentDescription = "合集播放模式：${mode.label()}"
+        drawerPlayMode?.update(mode, Color.WHITE)
+        drawerPlayModeButton?.contentDescription = "播放模式：${mode.label()}"
+    }
+
     private fun buildSeasonDrawerOverlay(): View {
         val overlay = FrameLayout(this).apply {
             setBackgroundColor(0x4D000000)
@@ -1111,8 +1109,7 @@ class PgcDetailActivity : Activity() {
             maxWidth = dp(150)
         }
         seasonDrawerTitleText = headerTitle
-        header.addView(headerTitle, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        header.addView(headerTitle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         seasonDrawerCountText = TextView(this).apply {
             text = ""
             textSize = 12f
@@ -1124,11 +1121,27 @@ class PgcDetailActivity : Activity() {
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             leftMargin = dp(8)
         })
-        header.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
-        header.addView(Ds.closeIcon(this, 0xB3FFFFFF.toInt(), 1.7f).apply {
-            isClickable = true
+        drawerPlayMode = PlayModeIconView(this, onlinePlayMode, Color.WHITE, 1.7f)
+        drawerPlayModeButton = FrameLayout(this).apply {
+            isFocusable = true
+            contentDescription = "播放模式：${onlinePlayMode.label()}"
+            addView(drawerPlayMode, FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
+            Ds.bindPressFeedback(this, 0.92f)
+            setOnClickListener {
+                val modes = DownloadManager.LocalPlayMode.entries
+                drawerModePopup?.dismiss()
+                drawerModePopup = showAnchoredMenu(this, modes.map { it.label() }, modes.indexOf(onlinePlayMode), playerStyle = true) { i -> setOnlinePlayMode(modes[i]) }
+                drawerModePopup?.setOnDismissListener { drawerModePopup = null }
+            }
+        }
+        header.addView(drawerPlayModeButton, LinearLayout.LayoutParams(dp(48), dp(48)))
+        header.addView(FrameLayout(this).apply {
+            isFocusable = true
+            contentDescription = "关闭合集"
+            addView(Ds.closeIcon(this@PgcDetailActivity, 0xB3FFFFFF.toInt(), 1.7f),
+                FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
             setOnClickListener { closeSeasonDrawer() }
-        }, LinearLayout.LayoutParams(dp(28), dp(28)))
+        }, LinearLayout.LayoutParams(dp(48), dp(48)))
         panel.addView(header, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         panel.addView(View(this).apply { setBackgroundColor(0x1FFFFFFF) },
@@ -1232,8 +1245,7 @@ class PgcDetailActivity : Activity() {
 
     private fun collectSeasonItems(): List<FullscreenSeasonItem> {
         val episodes = (currentDetail?.season ?: cachedSeason)?.episodes.orEmpty()
-        val currentIndex = episodes.indexOfFirst { currentCid > 0L && it.cid == currentCid }.takeIf { it >= 0 }
-            ?: episodes.indexOfFirst { it.cid <= 0L && it.bvid == currentBvid && it.aid == currentAid }
+        val currentIndex = episodes.playingIndex(currentBvid, currentAid, currentCid)
         return episodes.mapIndexed { index, episode ->
             FullscreenSeasonItem(
                 label = "P${index + 1}",
@@ -1252,8 +1264,7 @@ class PgcDetailActivity : Activity() {
     private fun resolveNextSeasonTarget(): NextSeasonTarget? {
         val episodes = (currentDetail?.season ?: cachedSeason)?.episodes.orEmpty()
         if (episodes.size <= 1) return null
-        val idx = episodes.indexOfFirst { currentCid > 0L && it.cid == currentCid }.takeIf { it >= 0 }
-            ?: episodes.indexOfFirst { it.cid <= 0L && it.bvid == currentBvid && it.aid == currentAid }
+        val idx = episodes.playingIndex(currentBvid, currentAid, currentCid)
         if (idx < 0 || idx >= episodes.lastIndex) return null
         return NextSeasonTarget.Online(episodes[idx + 1])
     }
@@ -1345,6 +1356,7 @@ class PgcDetailActivity : Activity() {
     }
 
     private fun closeSeasonDrawer(immediate: Boolean = false) {
+        drawerModePopup?.dismiss()
         if (!seasonDrawerOpen) return
         seasonDrawerOpen = false
         val overlay = seasonDrawerOverlay ?: return
@@ -1484,50 +1496,15 @@ class PgcDetailActivity : Activity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         // ── Comment tab content ──
-        commentScroll = ScrollView(this).apply {
-            isFillViewport = true
-            isVerticalScrollBarEnabled = false
-            setOnScrollChangeListener { _, _, scrollY, _, _ ->
-                val content = commentContent
-                if (content.height > 0 && scrollY + height >= content.height - dp(140)) {
-                    maybeLoadMoreComments()
-                }
-            }
+        commentScroll = CommentListView(this, { showSnackbar(it) }, {
+            val pos = IntArray(2)
+            infoTabBarAnchor?.getLocationOnScreen(pos)
+            pos[1] + (infoTabBarAnchor?.height ?: dp(64))
+        }).apply {
+            restoreState(restoredComments)
+            restoreRetainedState(lastNonConfigurationInstance as? CommentListView.RetainedState)
         }
-        val commentWrap = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        val headerBar = CommentSectionUi.CommentHeaderBar(this) { toggleCommentSort() }
-        commentHeaderBar = headerBar
-        commentHeaderTitle = headerBar.titleView
-        commentSortBtn = headerBar.sortLabel
-        commentHeaderAnchor = headerBar
-        commentWrap.addView(headerBar, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        commentContent = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(2), dp(16), dp(28))
-        }
-        commentState = TextView(this).apply {
-            text = "正在加载评论…"
-            textSize = 14f; gravity = Gravity.CENTER; setTextColor(COLOR_MUTED)
-            setPadding(0, dp(24), 0, dp(24))
-        }
-        commentContent.addView(commentState, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        commentMore = TextView(this).apply {
-            text = "加载更多评论"; textSize = 13f; gravity = Gravity.CENTER
-            setTextColor(COLOR_ROSE); setPadding(0, dp(14), 0, dp(6))
-            visibility = View.GONE
-            isClickable = true
-            setOnClickListener { loadComments(reset = false) }
-        }
-        commentContent.addView(commentMore, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        commentWrap.addView(commentContent, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        commentScroll.addView(commentWrap, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        restoredComments = null
 
         // ── Horizontal pager: 简介 | 评论 (drag + fling, tab bar stays in sync) ──
         infoPager = HorizontalPagerView(this).apply {
@@ -1551,19 +1528,23 @@ class PgcDetailActivity : Activity() {
     }
 
     private fun ensureCommentsStarted() {
-        if (!commentsLoaded && !commentsLoading && currentDetail != null) {
-            loadComments(reset = true)
+        val item = currentDetail ?: return
+        if (::commentScroll.isInitialized && item.aid > 0L) {
+            commentScroll.bindTarget(item.aid.toString(), 1, item.ownerMid)
+            commentScroll.setPageActive(activityResumed && !isFullscreen)
         }
     }
 
     private fun updateTabUI(index: Int) {
         if (currentTab == index) {
             syncTabVisuals(index)
+            if (::commentScroll.isInitialized) commentScroll.setPageActive(index == 1 && activityResumed && !isFullscreen)
             return
         }
         currentTab = index
         syncTabVisuals(index)
         if (index == 1) ensureCommentsStarted()
+        if (::commentScroll.isInitialized) commentScroll.setPageActive(index == 1 && activityResumed && !isFullscreen)
     }
 
     /** Final visual state once the pager has settled on a page. */
@@ -1593,14 +1574,6 @@ class PgcDetailActivity : Activity() {
 
     private fun lerpColor(from: Int, to: Int, t: Float): Int =
         (android.animation.ArgbEvaluator().evaluate(t.coerceIn(0f, 1f), from, to) as Int)
-
-    /** Swap comment order: 按热度 (hot) <-> 按时间 (newest), then reload from page 1. */
-    private fun toggleCommentSort() {
-        if (commentsLoading) return
-        commentSort = if (commentSort == 0) 1 else 0
-        commentHeaderBar?.applySort(commentSort)
-        loadComments(reset = true)
-    }
 
     /** Video like/unlike: optimistic UI, then real server sync when logged in. */
     private fun toggleVideoLike(btn: ActionIconView) {
@@ -2148,6 +2121,11 @@ class PgcDetailActivity : Activity() {
                 infoState.text = "该季暂无可播放的分集"
                 return@fetchPgcSeason
             }
+            if (ep.epId != currentEpId || ep.cid != currentCid) {
+                pendingResumePositionMs = 0L
+                resumeSegmentIndex = 0
+                restoreEndedState = false
+            }
             val item = pgcItemFor(ep, data)
             currentBvid = ep.bvid
             currentAid = ep.aid
@@ -2170,8 +2148,8 @@ class PgcDetailActivity : Activity() {
         }
         loadPlayer()
         bindDanmakuForCurrentMedia()
-        renderIntroduction(selected)
-        if (currentTab == 1 && !commentsLoaded) loadComments(reset = true)
+        if (isFullscreen) pendingIntro = selected else renderIntroduction(selected)
+        if (!isFullscreen && currentTab == 1) ensureCommentsStarted()
         playingStream?.let(::showPreviewNotice)
         refreshSeasonDrawerSelection()
     }
@@ -2179,9 +2157,9 @@ class PgcDetailActivity : Activity() {
     private fun selectEpisode(episode: UgcEpisode) {
         reportPlayHistory(status = 2)
         val ep = pgcDetail?.episodes?.firstOrNull {
-            (episode.cid > 0L && it.cid == episode.cid) ||
-                (episode.bvid.isNotBlank() && it.bvid == episode.bvid)
+            if (episode.cid > 0L) it.cid == episode.cid else episode.bvid.isNotBlank() && it.bvid == episode.bvid
         } ?: return
+        requestedQuality = loadQualityPreference()
         val sameEpisode = ep.epId == currentEpId
         currentBvid = ep.bvid
         currentAid = ep.aid
@@ -2208,6 +2186,11 @@ class PgcDetailActivity : Activity() {
 
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     private fun clearPlaybackForMediaChange() {
+        stallRetries = 0
+        isSeeking = false
+        gestureSeeking = false
+        progressContainer.isDragging = false
+        progressContainer.setProgress(0L, 0L, 0L)
         playbackGeneration++
         playbackRequest?.cancel()
         playbackRequest = null
@@ -2399,8 +2382,7 @@ class PgcDetailActivity : Activity() {
         val season = item.season ?: return
         if (isFinishing || isDestroyed || season.episodes.isEmpty()) return
         val episodes = season.episodes
-        val currentIndex = episodes.indexOfFirst { item.cid > 0L && it.cid == item.cid }.takeIf { it >= 0 }
-            ?: episodes.indexOfFirst { it.cid <= 0L && it.bvid == item.bvid && it.aid == item.aid }
+        val currentIndex = episodes.playingIndex(item.bvid, item.aid, item.cid)
 
         val section = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -2437,6 +2419,8 @@ class PgcDetailActivity : Activity() {
             ellipsize = android.text.TextUtils.TruncateAt.END
             includeFontPadding = false
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        introPlayMode = seasonModeChip(this, { onlinePlayMode }, ::setOnlinePlayMode)
+        header.addView(introPlayMode)
         if (currentIndex >= 0) {
             header.addView(TextView(this).apply {
                 text = "${currentIndex + 1}/${episodes.size}"
@@ -2608,37 +2592,19 @@ class PgcDetailActivity : Activity() {
 
             override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
                 super.onScrollChanged(l, t, oldl, oldt)
-                syncVisibleCards(l, width)
-            }
-
-            override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-                super.onSizeChanged(w, h, oldw, oldh)
-                syncVisibleCards(scrollX, w)
+                if (isInLayout) post { syncVisibleCards(scrollX, width) }
+                else if (width > 0) syncVisibleCards(l, width)
             }
         }.apply {
             isHorizontalScrollBarEnabled = false
             overScrollMode = View.OVER_SCROLL_NEVER
-            addView(strip, FrameLayout.LayoutParams(totalStripW, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
-                minimumHeight = cardHeightEstimate
-            })
+            strip.minimumHeight = cardHeightEstimate
+            addView(strip, FrameLayout.LayoutParams(totalStripW, FrameLayout.LayoutParams.WRAP_CONTENT))
         }
         section.addView(hScroll, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
-        val initialScroll = if (currentIndex > 0) {
-            val estWidth = (resources.displayMetrics.widthPixels - dp(32)).coerceAtLeast(cardW)
-            (currentIndex * stepPx - (estWidth - cardW) / 2).coerceIn(0, (totalStripW - estWidth).coerceAtLeast(0))
-        } else 0
-        syncVisibleCards(initialScroll, resources.displayMetrics.widthPixels)
-
-        if (currentIndex > 0) {
-            hScroll.post {
-                val scrollTarget = (currentIndex * stepPx - (hScroll.width - cardW) / 2)
-                    .coerceIn(0, (totalStripW - hScroll.width).coerceAtLeast(0))
-                hScroll.scrollTo(scrollTarget, 0)
-                syncVisibleCards(scrollTarget, hScroll.width)
-            }
-        }
+        hScroll.bindEpisodeViewport(currentIndex, stepPx, cardW, totalStripW, ::syncVisibleCards)
     }
 
     /** 底部半屏全集选择清单（点击头部「全部 ›」呼出）。 */
@@ -2909,158 +2875,7 @@ class PgcDetailActivity : Activity() {
     // ─────────────────────────────────────────────────
 
     private fun resetComments() {
-        commentGeneration++
-        commentPrefetchHandle?.cancel()
-        commentPrefetchHandle = null
-        commentsLoading = false
-        commentsLoaded = false
-        commentHasMore = false
-        commentLoginHintShown = false
-        seenCommentRpids.clear()
-        commentContent.removeAllViews()
-        commentContent.addView(commentState)
-        commentState.text = "正在加载评论…"
-        commentState.visibility = View.VISIBLE
-        commentState.setOnClickListener(null)
-        commentMore.visibility = View.GONE
-        commentScroll.scrollTo(0, 0)
-    }
-
-    private fun loadComments(reset: Boolean) {
-        val item = currentDetail ?: return
-        if (item.aid <= 0L) {
-            commentState.text = "暂无评论"
-            commentMore.visibility = View.GONE
-            return
-        }
-        if (commentsLoading) return
-        commentsLoading = true
-        if (reset) {
-            commentCursor = 1
-            commentsLoaded = false
-            commentHasMore = false
-            seenCommentRpids.clear()
-            commentContent.removeAllViews()
-            commentContent.addView(commentState, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            commentState.text = "正在加载评论…"
-            commentState.visibility = View.VISIBLE
-            commentMore.visibility = View.GONE
-        } else {
-            commentMore.text = "正在加载更多…"
-        }
-        val generation = commentGeneration
-        BiliApi.fetchComments(item.aid, commentCursor, commentSort) { list, next, error ->
-            if (isFinishing || isDestroyed || generation != commentGeneration) return@fetchComments
-            commentsLoading = false
-            commentState.visibility = View.GONE
-            if (error != null) {
-                if (!commentsLoaded) {
-                    if (commentState.parent == null) commentContent.addView(commentState, 0)
-                    commentState.text = "评论加载失败：$error\n\n点这里重试"
-                    commentState.visibility = View.VISIBLE
-                    commentState.isClickable = true
-                    commentState.setOnClickListener { loadComments(reset = true) }
-                } else {
-                    commentMore.text = "加载失败，点这里重试"
-                    commentMore.isClickable = true
-                }
-                return@fetchComments
-            }
-            commentsLoaded = true
-            commentHasMore = next >= 0
-            if (reset) commentContent.removeAllViews()
-            // Deduplicate by rpid: even if the cursor were ever wrong, already
-            // rendered comments are never appended a second time.
-            val fresh = list.filter { seenCommentRpids.add(it.id) }
-            if (reset && fresh.isNotEmpty()) {
-                commentPrefetchHandle?.cancel()
-                commentPrefetchHandle = CommentSectionUi.prefetchCommentTopMedia(this, fresh)
-            }
-            fresh.forEachIndexed { index, comment ->
-                if (index > 0 || !reset) {
-                    commentContent.addView(CommentSectionUi.buildCommentDivider(this))
-                }
-                commentContent.addView(buildCommentRow(comment))
-            }
-            commentCursor = next
-            if (commentHasMore) {
-                if (commentMore.parent == null) commentContent.addView(commentMore)
-                if (reset) {
-                    // First load: show the affordance once; later pages load
-                    // automatically on scroll and the hint stays hidden.
-                    commentMore.text = "上滑加载更多"
-                    commentMore.visibility = View.VISIBLE
-                } else {
-                    commentMore.visibility = View.GONE
-                }
-            } else {
-                commentMore.visibility = View.GONE
-                if (list.isEmpty() && commentContent.childCount == 0) {
-                    if (commentState.parent == null) commentContent.addView(commentState)
-                    commentState.text = "暂无评论"
-                    commentState.visibility = View.VISIBLE
-                } else if (!BiliSessionStore.isLoggedIn() && !commentLoginHintShown) {
-                    // Bilibili now caps anonymous comment lists at 3 hot replies; guide login.
-                    commentLoginHintShown = true
-                    val hint = TextView(this).apply {
-                        text = "仅展示热门评论，登录后可查看全部回复 →"
-                        textSize = 12f; setTextColor(COLOR_ROSE)
-                        gravity = Gravity.CENTER
-                        setPadding(0, dp(14), 0, dp(14))
-                        isClickable = true
-                        setOnClickListener {
-                            startActivity(Intent(this@PgcDetailActivity, MainActivity::class.java).apply {
-                                flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                                putExtra(EXTRA_SWITCH_TO_ACCOUNT, true)
-                            })
-                        }
-                    }
-                    commentContent.addView(hint, LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-                }
-            }
-        }
-    }
-
-    /** Auto-paging: when the user scrolls near the bottom, load the next page. */
-    private fun maybeLoadMoreComments() {
-        if (!commentsLoaded || commentsLoading || !commentHasMore) return
-        loadComments(reset = false)
-    }
-
-    private fun buildCommentRow(comment: VideoComment): View =
-        CommentSectionUi.buildUnifiedCommentItem(
-            activity = this,
-            comment = comment,
-            ownerMid = currentDetail?.ownerMid ?: 0L,
-            targetOid = (currentDetail?.aid ?: 0L).toString(),
-            commentType = 1,
-            isSheet = false,
-            showRootTag = false,
-            onOpenReplySheet = { root -> showReplySheet(root) },
-            onFeedback = { msg -> showSnackbar(msg) }
-        )
-
-    private fun showReplySheet(root: VideoComment) {
-        val aid = currentDetail?.aid ?: 0L
-        if (root.id <= 0L || aid <= 0L) return
-        CommentSectionUi.ReplySheetDialog(
-            activity = this,
-            root = root,
-            targetOid = aid.toString(),
-            commentType = 1,
-            ownerMid = currentDetail?.ownerMid ?: 0L,
-            anchorTopProvider = {
-                val anchor = infoTabBarAnchor
-                if (anchor == null) dp(64) else {
-                    val pos = IntArray(2)
-                    anchor.getLocationOnScreen(pos)
-                    pos[1] + anchor.height
-                }
-            },
-            onFeedback = { msg -> showSnackbar(msg) }
-        ).show()
+        if (::commentScroll.isInitialized) commentScroll.bindTarget("", 1, 0L)
     }
 
     private fun loadPlayer(quality: Int = effectiveQuality(), bypassCache: Boolean = false) {
@@ -3105,7 +2920,7 @@ class PgcDetailActivity : Activity() {
                 streamLoadedAt = SystemClock.elapsedRealtime()
                 val selected = selectStableStream(stream, quality)
                 val targetId = selected.videoTracks.firstOrNull()?.id ?: selected.actualQuality
-                if (stream.isDash && quality > BiliPlayUrl.QUALITY_720 && targetId < quality &&
+                if (requestedQuality != PreferredVideoQuality.HIGHEST && stream.isDash && quality > BiliPlayUrl.QUALITY_720 && targetId < quality &&
                     quality in stream.acceptedQualities
                 ) {
                     val hint = if (quality >= BiliPlayUrl.QUALITY_1080_PLUS && !BiliSessionStore.isBigVip()) {
@@ -3122,6 +2937,7 @@ class PgcDetailActivity : Activity() {
     }
 
     private fun beginPlaybackChange(): Int {
+        clearPlayerFeedback()
         val generation = ++playbackGeneration
         playbackRequest?.cancel()
         playbackRequest = null
@@ -3146,16 +2962,21 @@ class PgcDetailActivity : Activity() {
     }
 
     private fun stopPlayerSource() {
+        playerHost.keepScreenOn = false
+        handler.removeCallbacks(stallWatchdog)
+        stallMonitor.reset()
         handler.removeCallbacks(progressUpdater)
         handler.removeCallbacks(historyTick)
+        val listener = playerListener
+        playerListener = null
         cancelLongPressBoost()
+        danmakuController?.freezeClock()
         exoPlayer?.let { player ->
-            playerListener?.let(player::removeListener)
+            listener?.let(player::removeListener)
             player.pause()
             player.stop()
             player.clearMediaItems()
         }
-        playerListener = null
     }
 
     private fun canUsePlayback(generation: Int): Boolean =
@@ -3190,7 +3011,8 @@ class PgcDetailActivity : Activity() {
     }
 
     private fun selectStableStream(stream: BiliPlayUrl.DashStream, effective: Int): BiliPlayUrl.DashStream {
-        val selected = BiliPlayUrl.selectDashStreamTrack(stream, effective, failedCodecTracks)
+        val selected = BiliPlayUrl.selectDashStreamTrack(stream,
+            PreferredVideoQuality.selectionQuality(requestedQuality, effective), failedCodecTracks)
         val video = selected.videoTracks.firstOrNull()
         val audio = selected.audioTracks.firstOrNull()
         if (video != null) {
@@ -3206,6 +3028,7 @@ class PgcDetailActivity : Activity() {
     private fun bindPlayerSource(sources: List<MediaSource>, generation: Int) {
         if (!canUsePlayback(generation)) return
         val player = exoPlayer ?: createPlayer().also { exoPlayer = it }
+        playbackDiagnostics.bind(playingStream)
         playerListener?.let(player::removeListener)
         endedState = restoreEndedState
         playPauseBtn.setEnded(endedState)
@@ -3237,17 +3060,17 @@ class PgcDetailActivity : Activity() {
                     }
                     Player.STATE_BUFFERING -> if (!isSeeking) {
                         playerSpinner.visibility = View.VISIBLE
-                        handler.removeCallbacks(stallWatchdog)
-                        handler.postDelayed(stallWatchdog, STALL_TIMEOUT_MS)
                     }
                     Player.STATE_ENDED -> {
                         playerSpinner.visibility = View.GONE
                         cancelLongPressBoost()
-                        // 连播下一集（选集排序中的下一集）
-                        val next = resolveNextSeasonTarget()
-                        if (next is NextSeasonTarget.Online) {
-                            selectEpisode(next.episode)
-                            return
+                        if (userWantsPlayback && activityResumed) {
+                            val episodes = cachedSeason?.episodes.orEmpty()
+                            val idx = episodes.playingIndex(currentBvid, currentAid, currentCid)
+                            nextEpisodeIndex(episodes.size, idx, onlinePlayMode, automatic = true)?.let { next ->
+                                if (next == idx) replay() else selectEpisode(episodes[next])
+                                return
+                            }
                         }
                         endedState = true
                         playPauseBtn.setEnded(true)
@@ -3257,6 +3080,10 @@ class PgcDetailActivity : Activity() {
                     }
                 }
                 updatePlaybackProgress()
+            }
+
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                if (canUsePlayback(generation) && player === exoPlayer) updatePlaybackProgress()
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -3334,25 +3161,23 @@ class PgcDetailActivity : Activity() {
         }.build()
         return ExoPlayer.Builder(this, DefaultRenderersFactory(this).setEnableDecoderFallback(true))
             .setLoadControl(loadControl)
-            .build()
+            .build().also { it.addAnalyticsListener(playbackDiagnostics) }
     }
 
     /**
      * Quality the user is allowed to play right now. Guests are capped at
      * 480p (720p and above require login, 1080p+ requires a big member).
      */
-    private fun effectiveQuality(): Int {
-        if (BiliSessionStore.isLoggedIn()) return requestedQuality
-        return minOf(requestedQuality, BiliPlayUrl.QUALITY_480)
-    }
+    private fun effectiveQuality(): Int =
+        PreferredVideoQuality.requestQuality(requestedQuality, BiliSessionStore.isLoggedIn())
 
     private fun switchQuality(quality: Int) {
+        requestedQuality = quality
+        PreferredVideoQuality.onManualSelection(this, quality)
         if (quality == playingStream?.actualQuality && playerListener != null &&
             playerError.visibility != View.VISIBLE && streamSession == BiliSessionStore.cookie() &&
             playbackRequest == null && !retryScheduled
         ) return
-        requestedQuality = quality
-        saveQualityPreference(quality)
         playRetryCount = 0
         lastPlaybackError = null
         val effective = effectiveQuality()
@@ -3367,16 +3192,7 @@ class PgcDetailActivity : Activity() {
         }
     }
 
-    private fun loadQualityPreference(): Int {
-        val stored = qualityPrefs.getInt(KEY_LAST_QUALITY, 0)
-        return if (stored in SUPPORTED_QUALITIES) stored else BiliPlayUrl.QUALITY_720
-    }
-
-    private fun saveQualityPreference(quality: Int) {
-        if (quality in SUPPORTED_QUALITIES) {
-            qualityPrefs.edit().putInt(KEY_LAST_QUALITY, quality).apply()
-        }
-    }
+    private fun loadQualityPreference(): Int = PreferredVideoQuality.initial(this)
 
     private fun recoverPlayback(
         stream: BiliPlayUrl.DashStream,
@@ -3556,6 +3372,9 @@ class PgcDetailActivity : Activity() {
             ?: playingStream?.durationMs ?: 0L
 
     private fun seekPlayerGlobal(player: ExoPlayer, positionMs: Long) {
+        stallMonitor.reset()
+        handler.removeCallbacks(stallWatchdog)
+        if (endedState && positionMs < playerGlobalDuration(player)) clearEndedState()
         if (segmentTimeline.durationMs == 0L) {
             player.seekTo(positionMs.coerceAtLeast(0L))
         } else {
@@ -3600,7 +3419,18 @@ class PgcDetailActivity : Activity() {
     private fun updatePlaybackProgress() {
         handler.removeCallbacks(progressUpdater)
         val player = exoPlayer ?: return
+        playerHost.keepScreenOn = activityResumed && playerListener != null && player.playWhenReady &&
+            (player.playbackState == Player.STATE_READY || player.playbackState == Player.STATE_BUFFERING)
         if (!activityResumed || playerListener == null) return
+        playbackDiagnostics.sample(player)
+        if (player.playbackState == Player.STATE_BUFFERING && player.playWhenReady && userWantsPlayback && !isSeeking && !retryScheduled) {
+            val newlyBuffering = !stallMonitor.started
+            stallMonitor.observe(SystemClock.elapsedRealtime(), playerGlobalBufferedPosition(player))
+            if (newlyBuffering) handler.postDelayed(stallWatchdog, STALL_TIMEOUT_MS)
+        } else {
+            stallMonitor.reset()
+            handler.removeCallbacks(stallWatchdog)
+        }
         val duration = playerGlobalDuration(player)
         val position = playerGlobalPosition(player)
         val speed = player.playbackParameters.speed.takeIf { it > 0f } ?: 1f
@@ -3611,7 +3441,7 @@ class PgcDetailActivity : Activity() {
             speed = speed
         )
         if (duration > 0L && !isSeeking) {
-            progressContainer.updateFromPlayer()
+            progressContainer.setProgress(position, playerGlobalBufferedPosition(player), duration)
             if (position / 1000L != lastPositionSecond) {
                 lastPositionSecond = position / 1000L
                 timeText.text = formatTime(position)
@@ -3631,7 +3461,6 @@ class PgcDetailActivity : Activity() {
         lastPositionSecond = pos / 1000L
         timeText.text = formatTime(pos)
         progressContainer.seekToFraction(pos.toFloat() / dur.toFloat())
-        if (endedState && pos < dur - 1500) clearEndedState()
     }
 
     private fun clearEndedState() {
@@ -3696,7 +3525,7 @@ class PgcDetailActivity : Activity() {
 
     private fun applyLongPressBoost() {
         val p = exoPlayer ?: return
-        if (!longPressDown || endedState || !p.isPlaying) return
+        if (!longPressDown || !longPressCandidate || endedState || !p.isPlaying) return
         longPressBoost = true
         normalSpeed = p.playbackParameters.speed.let { if (it > 0f) it else 1f }
         p.playbackParameters = PlaybackParameters(2.0f)
@@ -3744,8 +3573,17 @@ class PgcDetailActivity : Activity() {
         boostIndicator.scaleY = 1f
     }
 
+    private fun positionSeekHint() {
+        if (!::playerSeekHint.isInitialized) return
+        val lp = playerSeekHint.layoutParams as FrameLayout.LayoutParams
+        val progressLayout = progressRow.layoutParams as FrameLayout.LayoutParams
+        val bottom = progressLayout.bottomMargin + progressLayout.height + dp(6)
+        if (lp.bottomMargin != bottom) { lp.bottomMargin = bottom; playerSeekHint.layoutParams = lp }
+    }
+
     private fun showSeekHint(posMs: Long, durMs: Long) {
         if (!::playerSeekHint.isInitialized) return
+        positionSeekHint()
         playerSeekHint.text = "${formatTime(posMs)}  /  ${formatTime(durMs)}"
         playerSeekHint.animate().cancel()
         if (playerSeekHint.visibility != View.VISIBLE) {
@@ -3766,38 +3604,50 @@ class PgcDetailActivity : Activity() {
         }
     }
 
-    private fun showSpeedToast(text: String) {
-        val toast = TextView(this).apply {
-            this.text = text
-            textSize = 14.5f
-            setTextColor(Color.WHITE)
-            typeface = Ds.display(bold = true)
-            gravity = Gravity.CENTER
-            background = Ds.pill(this@PgcDetailActivity, 0xCC14161B.toInt(), 0x33FFFFFF)
-            setPadding(dp(18), dp(7), dp(18), dp(7))
-        }
-        val overlay = FrameLayout(this).apply {
-            isClickable = false
-            addView(toast, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
-        }
-        playerHost.addView(overlay, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        toast.alpha = 0f
-        toast.animate().alpha(1f).setDuration(120).start()
-        overlay.postDelayed({
-            toast.animate().alpha(0f).setDuration(160)
-                .withEndAction { playerHost.removeView(overlay) }.start()
-        }, 650)
+    private fun showSkipHint(text: String) {
+        handler.removeCallbacks(hideSkipHint)
+        playerSkipHint.text = text
+        playerSkipHint.visibility = View.VISIBLE
+        handler.postDelayed(hideSkipHint, 800L)
     }
 
-    private fun cycleSpeed() {
-        speedIndex = (speedIndex + 1) % speeds.size
-        val speed = speeds[speedIndex]
-        exoPlayer?.playbackParameters = PlaybackParameters(speed)
-        speedBtn.text = "${speed}x"
+    private fun clearPlayerFeedback() {
+        speedPopup?.dismiss()
+        speedPopup = null
+        handler.removeCallbacks(hideSkipHint)
+        hideSkipHint.run()
+        if (::playerSeekHint.isInitialized) {
+            playerSeekHint.animate().cancel()
+            playerSeekHint.visibility = View.GONE
+        }
+    }
+
+    private fun skipByDoubleTap(delta: Long) {
+        val p = exoPlayer ?: return
+        val duration = playerGlobalDuration(p)
+        if (duration <= 0 || playerListener == null || !p.isCurrentMediaItemSeekable) return
+        val target = (playerGlobalPosition(p) + delta).coerceIn(0L, duration)
+        seekPlayerGlobal(p, target)
+        danmakuController?.onSeeked(target)
+        onManualSeek(target, duration)
         updatePlaybackProgress()
-        showSpeedToast("${speed}x")
+        showSkipHint(if (delta < 0L) "后退 10 秒" else "前进 10 秒")
+    }
+
+    private fun showSpeedMenu() {
+        speedPopup?.dismiss()
+        controlsHideRunnable?.let(handler::removeCallbacks)
+        speedPopup = showPlayerSpeedMenu(speedBtn, playerHost, speeds, speedIndex, onDismiss = {
+            speedPopup = null
+            if (activityResumed && exoPlayer?.isPlaying == true) scheduleAutoHide()
+        }) { index ->
+            cancelLongPressBoost()
+            speedIndex = index
+            val speed = speeds[index]
+            exoPlayer?.playbackParameters = PlaybackParameters(speed)
+            speedBtn.text = "${speed}x"
+            updatePlaybackProgress()
+        }
     }
 
     private fun showQualityMenu(anchor: View) {
@@ -3806,7 +3656,7 @@ class PgcDetailActivity : Activity() {
             .distinct().sortedDescending()
         if (qualities.isEmpty()) return
         val loggedIn = BiliSessionStore.isLoggedIn()
-        val playingId = playingStream?.actualQuality ?: requestedQuality
+        val playingId = playingStream?.actualQuality ?: effectiveQuality()
         val availableIds = stream.videoTracks.map { it.id }.toSet()
 
         val menu = LinearLayout(this).apply {
@@ -3931,32 +3781,29 @@ class PgcDetailActivity : Activity() {
 
     private fun scheduleAutoHide() {
         controlsHideRunnable?.let { handler.removeCallbacks(it) }
-        controlsHideRunnable = Runnable { if (exoPlayer?.isPlaying == true) hideControls() }
+        controlsHideRunnable = Runnable { if (exoPlayer?.isPlaying == true && speedPopup?.isShowing != true) hideControls() }
         handler.postDelayed(controlsHideRunnable!!, 3500)
     }
 
     // ─────────────────────────────────────────────────
-    //  Fullscreen: re-parent into a dedicated overlay container.
-    //  Landscape videos rotate to landscape; portrait videos stay portrait.
+    //  全屏仅改变布局，保留视频表面和弹幕层的窗口绑定。
     // ─────────────────────────────────────────────────
 
-    private fun isPortraitVideo(): Boolean {
-        val track = playingStream?.videoTracks?.firstOrNull() ?: return false
-        return track.width > 0 && track.height > 0 && track.height > track.width
-    }
-
     private fun toggleFullscreen() {
-        if (!::fullscreenContainer.isInitialized || !::playerHost.isInitialized) return
+        if (!::infoArea.isInitialized || !::playerHost.isInitialized) return
         if (fsTransitioning) return
+        clearPlayerFeedback()
         isFullscreen = !isFullscreen
         fsBtn.setFullscreen(isFullscreen)
-        if (::danmakuView.isInitialized) danmakuView.setFullscreenMode(isFullscreen)
+        if (isFullscreen) danmakuView.setFullscreenMode(true)
         if (!isFullscreen) {
             closeSeasonDrawer(immediate = true)
             danmakuSettingsDrawer?.close(immediate = true)
         }
         controlsHideRunnable?.let { handler.removeCallbacks(it) }
-        if (isFullscreen) enterFullscreen() else exitFullscreen()
+        if (isFullscreen) enterFullscreen() else movePlayerBackToPage()
+        if (::commentScroll.isInitialized) commentScroll.setPageActive(activityResumed && !isFullscreen && currentTab == 1)
+        if (!isFullscreen && currentTab == 1) ensureCommentsStarted()
     }
 
     private fun isTabletSplitActive(): Boolean =
@@ -3981,7 +3828,7 @@ class PgcDetailActivity : Activity() {
         } else {
             page.orientation = LinearLayout.VERTICAL
             val raw16x9 = dm.widthPixels * 9 / 16
-            val playerHeight = if (LayoutMode.isTablet) {
+            val playerHeight = if (LayoutMode.isTablet || dm.widthPixels > dm.heightPixels) {
                 minOf(raw16x9, (dm.heightPixels * 0.45f).toInt())
             } else {
                 raw16x9
@@ -3996,41 +3843,28 @@ class PgcDetailActivity : Activity() {
 
     private fun enterFullscreen() {
         fsTransitioning = true
-        (playerHost.parent as? ViewGroup)?.removeView(playerHost)
-        fullscreenContainer.removeAllViews()
-        fullscreenContainer.addView(playerHost, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        fullscreenContainer.visibility = View.VISIBLE
-        page.visibility = View.GONE
+        LayoutMode.applyScreenOrientation(this, fullscreen = true)
+        infoArea.visibility = View.GONE
+        tabletSplitDivider?.visibility = View.GONE
+        playerHost.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT)
         hideSystemBars()
         adjustIndicator.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
-        if (!LayoutMode.isTablet && !isPortraitVideo() &&
-            resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) {
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-        }
         applyControlSizing()
         showControls()
         fsTransitioning = false
     }
 
-    private fun exitFullscreen() {
-        if (LayoutMode.isTablet || resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT) {
-            movePlayerBackToPage()
-        } else {
-            exitingFullscreen = true
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
-    }
-
     private fun movePlayerBackToPage() {
-        exitingFullscreen = false
         fsTransitioning = true
+        LayoutMode.applyScreenOrientation(this)
         showSystemBars()
-        fullscreenContainer.removeView(playerHost)
-        fullscreenContainer.visibility = View.GONE
-        page.addView(playerHost, 0)
+        infoArea.visibility = View.VISIBLE
         applyPageSplitLayout()
-        page.visibility = View.VISIBLE
+        pendingIntro?.let { item ->
+            pendingIntro = null
+            renderIntroduction(item)
+            if (currentTab == 1) ensureCommentsStarted()
+        }
         adjustIndicator.animate().scaleX(COMPACT_ADJUST_SCALE).scaleY(COMPACT_ADJUST_SCALE)
             .setDuration(200).start()
         applyControlSizing()
@@ -4095,19 +3929,19 @@ class PgcDetailActivity : Activity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        if (exitingFullscreen && newConfig.orientation == Configuration.ORIENTATION_PORTRAIT) {
-            handler.post { if (exitingFullscreen) movePlayerBackToPage() }
-        } else if (LayoutMode.isTablet && !isFullscreen) {
-            handler.post {
-                applyPageSplitLayout()
-                applyControlSizing()
-            }
+        speedPopup?.dismiss()
+        drawerModePopup?.dismiss()
+        if (!::activityRoot.isInitialized) return
+        activityRoot.post {
+            if (!isFullscreen) applyPageSplitLayout()
+            applyControlSizing()
         }
         updateFullscreenStatusVisibility()
     }
 
     private fun retryPlayer() {
-        exoPlayer?.let { pendingResumePositionMs = playerGlobalPosition(it) }
+        rememberPlaybackPosition()
+        stallRetries = 0
         playRetryCount = 0
         retryScheduled = false
         userWantsPlayback = true
@@ -4453,78 +4287,6 @@ class PgcDetailActivity : Activity() {
         }
     }
 
-    /** Custom drawn seek bar with rounded track and thumb */
-    private inner class SeekBarView(context: Context) : FrameLayout(context) {
-        init { setWillNotDraw(false) }
-
-        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0x40FFFFFF.toInt(); style = Paint.Style.FILL
-        }
-        // Buffered (prefetched) segment: white, drawn between played and unplayed.
-        private val bufferedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xB3FFFFFF.toInt(); style = Paint.Style.FILL
-        }
-        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Ds.colors.accent; style = Paint.Style.FILL
-        }
-        private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Ds.colors.accent; style = Paint.Style.FILL
-        }
-        private val thumbBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = dpf(2f)
-        }
-        var fillWidth = 0f
-            private set
-        var bufferedWidth = 0f
-            private set
-        var isDragging = false
-        private val barRect = RectF()
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            val h = height.toFloat()
-            val trackH = dpf(4f)
-            val trackY = (h - trackH) / 2f
-            val r = trackH / 2f
-
-            barRect.set(0f, trackY, width.toFloat(), trackY + trackH)
-            canvas.drawRoundRect(barRect, r, r, trackPaint)
-            val fw = fillWidth.coerceAtLeast(0f)
-            val bw = bufferedWidth.coerceAtLeast(fw)
-            if (bw > 0) {
-                barRect.set(fw, trackY, bw, trackY + trackH)
-                canvas.drawRoundRect(barRect, r, r, bufferedPaint)
-            }
-            if (fw > 0) {
-                barRect.set(0f, trackY, fw, trackY + trackH)
-                canvas.drawRoundRect(barRect, r, r, fillPaint)
-            }
-            val thumbR = dpf(5f)
-            val thumbX = fw.coerceIn(thumbR, width.toFloat() - thumbR)
-            canvas.drawCircle(thumbX, h / 2f, thumbR, thumbPaint)
-            canvas.drawCircle(thumbX, h / 2f, thumbR, thumbBorderPaint)
-        }
-
-        fun seekToFraction(fraction: Float) {
-            fillWidth = (fraction * width).coerceIn(0f, width.toFloat())
-            invalidate()
-        }
-
-        fun updateFromPlayer() {
-            val p = exoPlayer ?: return
-            val duration = playerGlobalDuration(p)
-            if (duration > 0L && width > 0 && !isDragging) {
-                val fill = (playerGlobalPosition(p).toFloat() / duration.toFloat()).coerceIn(0f, 1f) * width
-                val buffered = (playerGlobalBufferedPosition(p).toFloat() / duration.toFloat()).coerceIn(0f, 1f) * width
-                if (abs(fill - fillWidth) >= 0.5f || abs(buffered - bufferedWidth) >= 0.5f) {
-                    fillWidth = fill
-                    bufferedWidth = buffered
-                    invalidate()
-                }
-            }
-        }
-    }
-
     private inner /**
          * Circular avatar. Never draws a square background — that was the
          * "square shadow border" around comment avatars (COLOR_COVER square bg
@@ -4601,8 +4363,20 @@ class PgcDetailActivity : Activity() {
 
     private inner class PlayerGestureView(context: Context) : View(context) {
         init { isClickable = true }
+        private var touchGeneration = -1
 
         override fun onTouchEvent(ev: MotionEvent): Boolean {
+            if (ev.actionMasked == MotionEvent.ACTION_DOWN) touchGeneration = playbackGeneration
+            else if (ev.pointerCount > 1 || touchGeneration != playbackGeneration) {
+                if (touchGeneration != -1) {
+                    cancelTapDetector(gestureDetector, ev)
+                    cancelLongPressBoost()
+                    if (gestureSeeking) { gestureSeeking = false; isSeeking = false; hideSeekHint(); updatePlaybackProgress() }
+                    if (adjustMode != 0) { adjustMode = 0; hideAdjust() }
+                }
+                touchGeneration = -1
+                return true
+            }
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     gestureStartX = ev.x
@@ -4627,11 +4401,8 @@ class PgcDetailActivity : Activity() {
                         handler.removeCallbacks(longPressBoostRunnable)
                     }
                     if (gestureSeeking) {
-                        val p = exoPlayer ?: return true
                         val duration = gestureSeekDuration
-                        if (duration <= 0L) return true
-                        val seekDelta = ((dx / width.toFloat().coerceAtLeast(1f)) * duration * 0.65f).toLong()
-                        val newPos = (gestureSeekStartPos + seekDelta).coerceIn(0L, duration)
+                        val newPos = PlayerSeekPolicy.swipePosition(gestureSeekStartPos, duration, dx, width, dpf(20f))
                         gestureSeekTargetPos = newPos
                         onManualSeek(newPos, duration)
                         showSeekHint(newPos, duration)
@@ -4644,11 +4415,13 @@ class PgcDetailActivity : Activity() {
                             val p = exoPlayer
                             val dur = if (p != null) playerGlobalDuration(p) else 0L
                             if (p != null && dur > 0L) {
+                                cancelTapDetector(gestureDetector, ev)
                                 gestureSeeking = true
                                 isSeeking = true
                                 gestureSeekDuration = dur
                                 gestureSeekStartPos = playerGlobalPosition(p)
-                                gestureSeekTargetPos = gestureSeekStartPos
+                                gestureSeekTargetPos = PlayerSeekPolicy.swipePosition(gestureSeekStartPos, dur, dx, width, dpf(20f))
+                                showSeekHint(gestureSeekTargetPos, dur)
                                 gestureSeekWasPlaying = p.playWhenReady && userWantsPlayback
                                 controlsHideRunnable?.let(handler::removeCallbacks)
                             }
@@ -4659,6 +4432,7 @@ class PgcDetailActivity : Activity() {
                                 else -> 0
                             }
                             if (zone != 0) {
+                                cancelTapDetector(gestureDetector, ev)
                                 adjustMode = zone
                                 adjustStartValue = if (zone == 1) {
                                     val b = window.attributes.screenBrightness
@@ -4675,7 +4449,7 @@ class PgcDetailActivity : Activity() {
                     return true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    val boosted = longPressBoost
+                    val claimed = longPressBoost || gestureSeeking || adjustMode != 0
                     cancelLongPressBoost()
                     if (adjustMode != 0) {
                         adjustMode = 0
@@ -4692,15 +4466,10 @@ class PgcDetailActivity : Activity() {
                         }
                         isSeeking = false
                         hideSeekHint()
+                        updatePlaybackProgress()
                         if (p?.isPlaying == true || gestureSeekWasPlaying) scheduleAutoHide()
-                    } else if (boosted) {
-                        // A boost release must not also toggle the controls: feed a synthetic
-                        // CANCEL to the detector so it skips single-tap confirmation.
-                        val synthetic = MotionEvent.obtain(ev)
-                        synthetic.action = MotionEvent.ACTION_CANCEL
-                        gestureDetector.onTouchEvent(synthetic)
-                        synthetic.recycle()
-                    } else {
+                    }
+                    if (claimed) cancelTapDetector(gestureDetector, ev) else {
                         gestureDetector.onTouchEvent(ev)
                     }
                     gestureSeeking = false
@@ -5085,7 +4854,7 @@ class PgcDetailActivity : Activity() {
             aid = currentAid,
             referer = referer,
             durationMs = durationMs,
-            isLocalMode = false
+            startPositionMs = pendingResumePositionMs
         )
     }
 
@@ -5145,7 +4914,8 @@ class PgcDetailActivity : Activity() {
                         startExoPlayer(cached, beginPlaybackChange())
                     } else {
                         playRetryCount = 0
-                        loadPlayer(bypassCache = sessionChanged)
+                        loadPlayer(PreferredVideoQuality.resumeRequestQuality(requestedQuality, lastRequestedQuality,
+                            BiliSessionStore.isLoggedIn(), sessionChanged), bypassCache = sessionChanged)
                     }
                 }
             }
@@ -5163,15 +4933,18 @@ class PgcDetailActivity : Activity() {
         refreshBatteryState()
         if (userWantsPlayback && !endedState && playerListener != null) exoPlayer?.play()
         updatePlaybackProgress()
-        if (commentsLoaded && commentLoginHintShown && BiliSessionStore.isLoggedIn()) {
-            commentLoginHintShown = false
-            loadComments(reset = true)
-        }
+        if (::commentScroll.isInitialized) commentScroll.setPageActive(currentTab == 1 && !isFullscreen)
+        if (currentTab == 1 && !isFullscreen) ensureCommentsStarted()
     }
 
     override fun onPause() {
         reportPlayHistory(status = 2)
         activityResumed = false
+        if (::commentScroll.isInitialized) commentScroll.setPageActive(false)
+        handler.removeCallbacks(stallWatchdog)
+        stallMonitor.reset()
+        clearPlayerFeedback()
+        if (::playerHost.isInitialized) playerHost.keepScreenOn = false
         handler.removeCallbacks(historyTick)
         handler.removeCallbacks(progressUpdater)
         controlsHideRunnable?.let(handler::removeCallbacks)
@@ -5180,7 +4953,7 @@ class PgcDetailActivity : Activity() {
         closeSeasonDrawer(immediate = true)
         danmakuSettingsDrawer?.close(immediate = true)
         exoPlayer?.pause()
-        danmakuView.setPlaying(false)
+        danmakuController?.freezeClock()
         super.onPause()
     }
 
@@ -5216,9 +4989,15 @@ class PgcDetailActivity : Activity() {
         super.onStop()
     }
 
+    override fun onRetainNonConfigurationInstance(): Any? =
+        if (::commentScroll.isInitialized) commentScroll.retainState() else null
+
     override fun onSaveInstanceState(outState: Bundle) {
+        if (::commentScroll.isInitialized) outState.putBundle("comments", commentScroll.saveState())
         rememberPlaybackPosition()
         outState.putLong(EXTRA_SEASON_ID, seasonId)
+        outState.putLong(STATE_EP_ID, currentEpId)
+        outState.putLong(STATE_EP_CID, currentCid)
         outState.putLong(STATE_PLAY_POSITION, pendingResumePositionMs)
         outState.putInt(STATE_SEGMENT_INDEX, resumeSegmentIndex)
         outState.putInt(STATE_SPEED_INDEX, speedIndex)
@@ -5228,8 +5007,7 @@ class PgcDetailActivity : Activity() {
     }
 
     override fun onDestroy() {
-        commentPrefetchHandle?.cancel()
-        commentPrefetchHandle = null
+        if (::commentScroll.isInitialized) commentScroll.dispose()
         DanmakuSettingsStore.removeListener(danmakuUiSettingsListener)
         danmakuController?.onDestroy()
         danmakuController = null
@@ -5252,6 +5030,7 @@ class PgcDetailActivity : Activity() {
     }
 
     private fun releasePlayer() {
+        playerHost.keepScreenOn = false
         val player = exoPlayer ?: return
         playerListener?.let(player::removeListener)
         playerListener = null
@@ -5292,19 +5071,14 @@ class PgcDetailActivity : Activity() {
         private const val COMMENT_COLLAPSE_LINES = 4
         /** Brightness/volume indicator scale when the player is NOT fullscreen. */
         private const val COMPACT_ADJUST_SCALE = 0.68f
-        private const val KEY_LAST_QUALITY = "last_quality"
-        private val SUPPORTED_QUALITIES = setOf(
-            BiliPlayUrl.QUALITY_360, BiliPlayUrl.QUALITY_480, BiliPlayUrl.QUALITY_720,
-            BiliPlayUrl.QUALITY_1080, BiliPlayUrl.QUALITY_1080_PLUS, BiliPlayUrl.QUALITY_4K,
-            116, 125, 126, 127
-        )
         // Action bar icon kinds.
         const val KIND_LIKE = 0
         const val KIND_FAVORITE = 1
         const val KIND_DOWNLOAD = 2
         const val KIND_SHARE = 3
         const val EXTRA_SEASON_ID = "pgc_season_id"
-        private const val STATE_SEASON_ID = "pgc_state_season_id"
+        private const val STATE_EP_ID = "pgc_ep_id"
+        private const val STATE_EP_CID = "pgc_ep_cid"
         /** 番剧评论区挂载在分集对应稿件上（type=1 + aid），实测与官方一致。 */
         private const val COMMENT_TYPE_VIDEO = 1
 

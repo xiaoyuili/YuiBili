@@ -28,7 +28,10 @@ internal class DanmakuController(
 
     private var metaRequest: BiliRequest? = null
     private val segmentRequests = HashMap<Int, BiliRequest>()
-    private val deliveredSegments = HashMap<Int, BiliDanmakuRepository.SegmentData>()
+    private val deliveredSegments = object : LinkedHashMap<Int, BiliDanmakuRepository.SegmentData>(4, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, BiliDanmakuRepository.SegmentData>?) = size > 2
+    }
+    private var metaRequested = false
     private var xmlWholePoolDelivered = false
 
     private var activeSegmentIndex = 0
@@ -53,7 +56,8 @@ internal class DanmakuController(
         aid: Long,
         referer: String,
         durationMs: Long = 0L,
-        isLocalMode: Boolean = false
+        isLocalMode: Boolean = false,
+        startPositionMs: Long = 0L
     ) {
         this.localMode = isLocalMode
         if (isLocalMode || cid <= 0L) {
@@ -61,7 +65,7 @@ internal class DanmakuController(
             return
         }
         val epoch = BiliDanmakuRepository.currentAuthEpoch()
-        if (this.cid == cid && this.authEpoch == epoch && !serverClosed) {
+        if (this.cid == cid && this.authEpoch == epoch) {
             if (aid > 0L) this.aid = aid
             if (durationMs > 0L) this.lastKnownDurationMs = durationMs
             return
@@ -74,9 +78,12 @@ internal class DanmakuController(
         this.referer = referer.ifBlank { "https://www.bilibili.com/" }
         this.segmentDurationMs = DanmakuParser.DEFAULT_SEGMENT_MS
         this.knownTotalSegments = 0
+        this.metaRequested = false
         this.serverClosed = false
         this.lastKnownDurationMs = durationMs.coerceAtLeast(0L)
         this.activeSegmentIndex = 0
+        this.lastPositionMs = startPositionMs.coerceAtLeast(0L)
+        this.isPlaying = false
         this.deliveredSegments.clear()
         this.xmlWholePoolDelivered = false
         view.clearForMediaChange()
@@ -85,9 +92,16 @@ internal class DanmakuController(
         view.applySettings(settings)
         if (!settings.enabled) return
 
+        requestMetaIfNeeded()
+        ensureSegmentsForPosition(lastPositionMs, lastKnownDurationMs, lastPlaybackSpeed)
+    }
+
+    private fun requestMetaIfNeeded() {
+        if (metaRequested || cid <= 0L || serverClosed) return
+        metaRequested = true
         val gen = mediaGeneration
-        metaRequest = BiliDanmakuRepository.fetchViewMeta(cid, aid, epoch, this.referer) { meta ->
-            if (gen != mediaGeneration || this.cid != cid) return@fetchViewMeta
+        metaRequest = BiliDanmakuRepository.fetchViewMeta(cid, aid, authEpoch, referer) { meta ->
+            if (gen != mediaGeneration) return@fetchViewMeta
             metaRequest = null
             if (meta == null) return@fetchViewMeta
             if (meta.isClosed) {
@@ -103,7 +117,6 @@ internal class DanmakuController(
                 knownTotalSegments = meta.totalSegments
             }
         }
-        ensureSegmentsForPosition(lastPositionMs, lastKnownDurationMs, lastPlaybackSpeed)
     }
 
     /** 播放页在 250ms 进度刷新与状态变化时调用（传入全局视频时钟，支持多段 DURL）。 */
@@ -128,7 +141,7 @@ internal class DanmakuController(
         // 检测登录/退出切换
         val epoch = BiliDanmakuRepository.currentAuthEpoch()
         if (epoch != authEpoch) {
-            bindMedia(cid, aid, referer, lastKnownDurationMs, isLocalMode = false)
+            bindMedia(cid, aid, referer, lastKnownDurationMs, startPositionMs = safePos)
             return
         }
 
@@ -138,6 +151,7 @@ internal class DanmakuController(
             return
         }
 
+        requestMetaIfNeeded()
         view.syncClock(safePos, playing, safeSpeed)
         ensureSegmentsForPosition(safePos, lastKnownDurationMs, safeSpeed)
     }
@@ -165,9 +179,14 @@ internal class DanmakuController(
     }
 
     /** 切后台（onStop）：停止预取与在途请求，保留有界内存缓存，暂停渲染。 */
+    fun freezeClock() {
+        isPlaying = false
+        view.setPlaying(false)
+    }
+
     fun onStop() {
         cancelAllRequests()
-        view.setPlaying(false)
+        freezeClock()
     }
 
     /** 销毁页面（onDestroy）：解绑监听与所有引用。 */
@@ -186,6 +205,9 @@ internal class DanmakuController(
         aid = 0L
         serverClosed = false
         activeSegmentIndex = 0
+        lastPositionMs = 0L
+        lastKnownDurationMs = 0L
+        isPlaying = false
         deliveredSegments.clear()
         xmlWholePoolDelivered = false
         view.clearForMediaChange()
@@ -224,7 +246,8 @@ internal class DanmakuController(
                     deliveredSegments[segIdx] = it
                 }
             if (localSeg != null) {
-                deliverSegmentToView(localSeg)
+                acceptSegment(localSeg)
+                if (serverClosed || xmlWholePoolDelivered) return
             } else {
                 requestSegmentIfNeeded(segIdx, isPrefetch = false, pinCurrent = segIdx)
             }
@@ -269,21 +292,8 @@ internal class DanmakuController(
             if (gen != mediaGeneration || reqCid != cid || reqEpoch != authEpoch) return@fetchSegment
             segmentRequests.remove(segmentIndex)
             when (outcome) {
-                is BiliDanmakuRepository.FetchOutcome.Ready -> {
-                    deliveredSegments[segmentIndex] = outcome.segment
-                    if (outcome.segment.source == BiliDanmakuRepository.SourceKind.XML_FALLBACK) {
-                        xmlWholePoolDelivered = true
-                        deliverSegmentToView(outcome.segment)
-                    } else if (segmentIndexOf(lastPositionMs) == segmentIndex) {
-                        deliverSegmentToView(outcome.segment)
-                    }
-                }
-                is BiliDanmakuRepository.FetchOutcome.Empty -> {
-                    deliveredSegments[segmentIndex] = outcome.segment
-                    if (segmentIndexOf(lastPositionMs) == segmentIndex) {
-                        activeSegmentIndex = segmentIndex
-                    }
-                }
+                is BiliDanmakuRepository.FetchOutcome.Ready -> acceptSegment(outcome.segment)
+                is BiliDanmakuRepository.FetchOutcome.Empty -> acceptSegment(outcome.segment)
                 BiliDanmakuRepository.FetchOutcome.Closed -> {
                     serverClosed = true
                     cancelAllRequests()
@@ -299,7 +309,20 @@ internal class DanmakuController(
         segmentRequests[segmentIndex] = req
     }
 
-    private fun deliverSegmentToView(segment: BiliDanmakuRepository.SegmentData) {
+    private fun acceptSegment(segment: BiliDanmakuRepository.SegmentData) {
+        if (segment.closed) {
+            serverClosed = true
+            cancelAllRequests()
+            view.clearForMediaChange()
+            return
+        }
+        if (serverClosed || xmlWholePoolDelivered) return
+        deliveredSegments[segment.segmentIndex] = segment
+        if (segment.source == BiliDanmakuRepository.SourceKind.XML_FALLBACK) {
+            xmlWholePoolDelivered = true
+            segmentRequests.values.forEach { it.cancel() }
+            segmentRequests.clear()
+        } else if (segment.segmentIndex != segmentIndexOf(lastPositionMs)) return
         activeSegmentIndex = segment.segmentIndex
         // 晚到分段从当前播放位置继续，避免一口气倾泻几百条已过期弹幕
         view.setSegmentData(
@@ -333,6 +356,7 @@ internal class DanmakuController(
     }
 
     private fun cancelAllRequests() {
+        if (metaRequest != null) metaRequested = false
         metaRequest?.cancel()
         metaRequest = null
         segmentRequests.values.forEach { it.cancel() }

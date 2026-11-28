@@ -196,11 +196,22 @@ internal object CommentSectionUi {
     }
 
     /** 极简线性回复气泡小图标（用于评论操作栏右侧的回复数快捷入口）。 */
-    private class ReplyCountBadge(
+    class ReplyCountBadge(
         context: Context,
         count: Long,
         onClick: () -> Unit
     ) : LinearLayout(context) {
+        private val countText = TextView(context).apply {
+            textSize = 11.5f
+            typeface = Ds.body(bold = false)
+            fontFeatureSettings = "tnum"
+            includeFontPadding = false
+            setTextColor(Ds.colors.muted)
+        }
+        fun bindCount(value: Long) {
+            countText.text = if (value > 0) formatViews(value) else ""
+            countText.visibility = if (value > 0) View.VISIBLE else View.GONE
+        }
         init {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -246,18 +257,10 @@ internal object CommentSectionUi {
                 }
             }
             addView(icon, LayoutParams(Ds.dp(context, 15).toInt(), Ds.dp(context, 15).toInt()))
-            if (count > 0L) {
-                addView(TextView(context).apply {
-                    text = formatViews(count)
-                    textSize = 11.5f
-                    typeface = Ds.body(bold = false)
-                    fontFeatureSettings = "tnum"
-                    includeFontPadding = false
-                    setTextColor(Ds.colors.muted)
-                }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
-                    leftMargin = Ds.dp(context, 4).toInt()
-                })
-            }
+            addView(countText, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+                leftMargin = Ds.dp(context, 4).toInt()
+            })
+            bindCount(count)
         }
     }
 
@@ -404,7 +407,8 @@ internal object CommentSectionUi {
             buildExpandableCommentText(
                 activity, comment.content, comment.emotes, comment.jumpLinks,
                 textSizeSp = if (isReplyInSheet) 14f else 14.8f,
-                onFeedback = onFeedback
+                onFeedback = onFeedback,
+                mentions = comment.mentions
             ),
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
@@ -504,7 +508,7 @@ internal object CommentSectionUi {
         return row
     }
 
-    private fun buildRoleTag(activity: Activity, label: String): TextView = TextView(activity).apply {
+    fun buildRoleTag(activity: Activity, label: String): TextView = TextView(activity).apply {
         text = label
         textSize = 10f
         typeface = Ds.body(bold = true)
@@ -521,9 +525,10 @@ internal object CommentSectionUi {
         emotes: Map<String, String>,
         jumpLinks: Map<String, String>,
         textSizeSp: Float,
-        onFeedback: (String) -> Unit
+        onFeedback: (String) -> Unit,
+        mentions: Map<String, Long> = emptyMap()
     ): View {
-        val fullText = commentSpannable(activity, content, emotes, jumpLinks = jumpLinks)
+        val fullText = commentSpannable(activity, content, emotes, jumpLinks = jumpLinks, mentions = mentions)
         val box = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, activity.dp(6), 0, 0)
@@ -545,7 +550,7 @@ internal object CommentSectionUi {
             setText(fullText, TextView.BufferType.SPANNABLE)
         }
         // B 站链接异步换成标题，非 B 站保持原链接
-        resolveBiliTitles(activity, body, content, emotes, jumpLinks)
+        resolveBiliTitles(activity, body, content, emotes, jumpLinks, mentions)
         val fadeScrim = View(activity).apply {
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
@@ -647,7 +652,7 @@ internal object CommentSectionUi {
     }
 
     /**
-     * 评论区首屏受控预取（评论 JSON 返回后立即触发，与实际构建的配图/头像共享完全一致的规范化 Key）：
+     * 评论区首屏受控预取（仅静图；GIF 源文件按可见性加载）：
      * - 仅预取前 4 条评论，配图最多 4 张 + 头像最多 4 张（合计最多 8 张），配图优先；
      * - 返回 PrefetchHandle，供切集/切换排序/销毁页面时随时取消。
      */
@@ -667,7 +672,7 @@ internal object CommentSectionUi {
             for (i in 0 until shownCount) {
                 if (picBudget <= 0) break
                 val pic = c.pictures[i]
-                if (pic.url.isNotBlank()) {
+                if (pic.url.isNotBlank() && resolveCoverKey(pic.url, original = false)?.gif == false) {
                     specs.add(
                         CoverLoader.PrefetchSpec(
                             rawUrl = pic.url,
@@ -699,7 +704,7 @@ internal object CommentSectionUi {
 
     private const val COMMENT_PIC_THUMB_EDGE = 320
 
-    private fun buildPicturesRow(
+    fun buildPicturesRow(
         activity: Activity,
         pics: List<CommentPicture>,
         onFeedback: (String) -> Unit
@@ -707,25 +712,38 @@ internal object CommentSectionUi {
         val shown = minOf(2, pics.size)
         val extraCount = pics.size - shown
         val gap = activity.dp(6)
-        val bodyW = activity.resources.displayMetrics.widthPixels - activity.dp(84)
         val cardCount = shown + (if (extraCount > 0) 1 else 0)
-        val cardW = if (pics.size == 1) {
-            val p = pics[0]
-            val h = activity.dp(132)
-            if (p.width > 0 && p.height > 0)
-                (h.toFloat() * p.width / p.height).toInt().coerceIn(activity.dp(72), minOf(activity.dp(228), bodyW))
-            else h
-        } else {
-            (bodyW - gap * (cardCount - 1)) / cardCount
-        }
-        val cardH = if (pics.size == 1) activity.dp(132) else
-            pics.take(shown).map { picture ->
-                if (picture.width > 0 && picture.height > 0)
-                    (cardW.toFloat() * picture.height / picture.width).toInt().coerceIn(activity.dp(84), activity.dp(168))
-                else activity.dp(120)
-            }.maxOrNull() ?: activity.dp(120)
+        val cardW = activity.dp(72)
+        val cardH = activity.dp(132)
         val thumbEdge = COMMENT_PIC_THUMB_EDGE
-        val imageRow = LinearLayout(activity).apply {
+        val imageRow = object : LinearLayout(activity) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                val available = (MeasureSpec.getSize(widthMeasureSpec) - paddingLeft - paddingRight).coerceAtLeast(1)
+                val width = if (pics.size == 1) {
+                    val picture = pics[0]
+                    commentSinglePictureCardWidth(
+                        available,
+                        picture.width,
+                        picture.height,
+                        activity.dp(132),
+                        activity.dp(72),
+                        activity.dp(228)
+                    )
+                } else commentPictureCardWidth(available, cardCount, gap)
+                val height = if (pics.size == 1) activity.dp(132) else pics.take(shown).maxOf { picture ->
+                    if (picture.width > 0 && picture.height > 0)
+                        (width.toDouble() * picture.height / picture.width).toInt().coerceIn(activity.dp(84), activity.dp(168))
+                    else activity.dp(120)
+                }
+                for (index in 0 until childCount) {
+                    val params = getChildAt(index).layoutParams as LayoutParams
+                    params.width = width
+                    params.height = height
+                    params.rightMargin = if (index < childCount - 1) gap else 0
+                }
+                super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+            }
+        }.apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, activity.dp(9), 0, 0)
         }
@@ -738,8 +756,6 @@ internal object CommentSectionUi {
         }
 
         fun loadCommentPicture(iv: ImageView, rawUrl: String) {
-            // 列表内统一先出轻量静态缩略图（含 GIF 首帧静态 poster），避免大 GIF 直接下载完整原文件拖慢首帧；
-            // 点开大图预览时再加载完整高清原图 / 动态 GIF。
             CoverLoader.load(
                 iv,
                 rawUrl,
@@ -748,7 +764,7 @@ internal object CommentSectionUi {
                 animate = true,
                 thumbEdge = thumbEdge,
                 priority = CoverLoader.PRIORITY_NORMAL + 1,
-                allowAnimatedGif = false
+                allowAnimatedGif = true
             )
         }
 
@@ -805,7 +821,7 @@ internal object CommentSectionUi {
         return imageRow
     }
 
-    private fun buildCommentUpBadge(activity: Activity): TextView = TextView(activity).apply {
+    fun buildCommentUpBadge(activity: Activity): TextView = TextView(activity).apply {
         text = "UP"
         textSize = 9.5f
         typeface = Ds.body(bold = true)
@@ -816,7 +832,7 @@ internal object CommentSectionUi {
         setPadding(activity.dp(5), activity.dp(2), activity.dp(5), activity.dp(2))
     }
 
-    private fun buildSubCommentItem(
+    fun buildSubCommentItem(
         activity: Activity,
         sub: VideoComment,
         ownerMid: Long,
@@ -854,7 +870,7 @@ internal object CommentSectionUi {
                 )
             }
             span.append("：")
-            span.append(commentSpannable(activity, sub.content, sub.emotes, emoteSizeDp = 17))
+            span.append(commentSpannable(activity, sub.content, sub.emotes, emoteSizeDp = 17, mentions = sub.mentions))
             text = span
             textSize = 13f
             setTextColor(COLOR_INK)
@@ -875,9 +891,9 @@ internal object CommentSectionUi {
     /** 评论点赞按钮，支持任意 commentType + targetOid（视频=1/aid，动态=11/17等），按内容自适应宽度。 */
     class CommentLikeButton(
         private val activity: Activity,
-        private val comment: VideoComment,
-        private val targetOid: String,
-        private val commentType: Int,
+        private var comment: VideoComment,
+        private var targetOid: String,
+        private var commentType: Int,
         private val onFeedback: (String) -> Unit
     ) : View(activity) {
         private val density = resources.displayMetrics.density
@@ -889,11 +905,21 @@ internal object CommentSectionUi {
         private var liked: Boolean
         private var likes: Long
         private var inFlight = false
+        private val thumbPath = Path()
+        private var key = CommentLikeKey(BiliSessionStore.snapshot().epoch, commentType, targetOid, comment.id)
+        private val listener = CommentLikes.Listener { state ->
+            liked = state.liked
+            likes = state.count
+            inFlight = state.pending
+            isEnabled = !state.pending
+            requestLayout()
+            invalidate()
+        }
 
         init {
-            val bridged = LikeStateBridge.resolveComment(comment.id, comment.liked, comment.likes)
-            liked = bridged.first
-            likes = bridged.second
+            val initial = CommentLikes.read(key, comment)
+            liked = initial.liked
+            likes = initial.count
             isClickable = true
             Ds.bindPressFeedback(this, 0.92f)
             setOnClickListener { toggleLike() }
@@ -924,7 +950,8 @@ internal object CommentSectionUi {
             val cx = dpf(9f)
             val cy = height / 2f
             paint.style = if (liked) Paint.Style.FILL_AND_STROKE else Paint.Style.STROKE
-            val thumb = Path().apply {
+            val thumb = thumbPath.apply {
+                rewind()
                 moveTo(cx - dpf(1.1f), cy - dpf(5.3f))
                 quadTo(cx + dpf(1.5f), cy - dpf(6.5f), cx + dpf(2.9f), cy - dpf(4.0f))
                 lineTo(cx + dpf(2.0f), cy - dpf(1.1f))
@@ -950,43 +977,43 @@ internal object CommentSectionUi {
             }
         }
 
+        fun bind(comment: VideoComment, targetOid: String, commentType: Int) {
+            CommentLikes.unsubscribe(key, listener)
+            this.comment = comment
+            this.targetOid = targetOid
+            this.commentType = commentType
+            key = CommentLikeKey(BiliSessionStore.snapshot().epoch, commentType, targetOid, comment.id)
+            listener.changed(CommentLikes.read(key, comment))
+            if (isAttachedToWindow) CommentLikes.subscribe(key, listener)
+        }
+
+        fun unbind() {
+            CommentLikes.unsubscribe(key, listener)
+            animate().cancel()
+            scaleX = 1f
+            scaleY = 1f
+        }
+
+        override fun onAttachedToWindow() {
+            super.onAttachedToWindow()
+            listener.changed(CommentLikes.read(key, comment))
+            CommentLikes.subscribe(key, listener)
+        }
+
+        override fun onDetachedFromWindow() {
+            unbind()
+            super.onDetachedFromWindow()
+        }
+
         private fun toggleLike() {
             if (inFlight) return
-            if (!BiliSessionStore.isLoggedIn()) {
-                onFeedback("请先登录后再点赞评论")
-                return
+            if (targetOid.isBlank() || commentType <= 0 || comment.id <= 0L) return
+            val operationKey = key
+            CommentLikes.toggle(operationKey, comment) { message ->
+                if (key == operationKey && isAttachedToWindow && !activity.isFinishing && !activity.isDestroyed) onFeedback(message)
             }
-            if (targetOid.isBlank() || commentType <= 0 || comment.id <= 0L) {
-                onFeedback("评论信息未就绪，请稍后再试")
-                return
-            }
-            val previousLiked = liked
-            val previousLikes = likes
-            val newLiked = !previousLiked
-            liked = newLiked
-            likes = (previousLikes + if (newLiked) 1 else -1).coerceAtLeast(0L)
-            inFlight = true
-            isEnabled = false
-            requestLayout()
             animate().scaleX(1.22f).scaleY(1.22f).setDuration(100)
                 .withEndAction { animate().scaleX(1f).scaleY(1f).setDuration(140).start() }.start()
-            invalidate()
-            BiliApi.postCommentLikeForTarget(targetOid, commentType, comment.id, newLiked) { ok, error ->
-                if (activity.isFinishing || activity.isDestroyed) return@postCommentLikeForTarget
-                inFlight = false
-                isEnabled = true
-                if (ok) {
-                    LikeStateBridge.rememberComment(comment.id, liked, likes)
-                    requestLayout()
-                    invalidate()
-                } else {
-                    liked = previousLiked
-                    likes = previousLikes
-                    requestLayout()
-                    invalidate()
-                    onFeedback(error ?: "评论点赞失败，请稍后再试")
-                }
-            }
         }
     }
 
@@ -1000,31 +1027,22 @@ internal object CommentSectionUi {
         private val anchorTopProvider: () -> Int,
         private val onFeedback: (String) -> Unit
     ) : Dialog(activity) {
-        private var page = 1
-        private var hasMore = true
-        private var loading = false
-        private var loadedRoot = false
-        private var hasReplyRows = false
-        private var pagesToLoad = 0
-        private var generation = 0
         private var closing = false
         private var panelHeightPx = 0
         private var panelTopPx = 0
         private var panelWidthPx = 0
         private val useSideDrawer = LayoutMode.isWideScreen(activity)
-        private lateinit var listBox: LinearLayout
-        private lateinit var scroll: ScrollView
+        private lateinit var comments: CommentListView
         private lateinit var panel: LinearLayout
-        private var skeletonBox: LinearLayout? = null
-        private var skeletonAnimator: ValueAnimator? = null
-        private var retryView: TextView? = null
-        private val seenReplyIds = HashSet<Long>()
 
-        private val sheetTopY: Int
-            get() = anchorTopProvider().coerceIn(0, activity.resources.displayMetrics.heightPixels - activity.dp(260))
-
-        private val sheetHeight: Int
-            get() = (activity.resources.displayMetrics.heightPixels - sheetTopY).coerceAtLeast(activity.dp(260))
+        private val sheetBounds: CommentSheetBounds
+            get() = commentSheetBounds(
+                anchorTopProvider(),
+                activity.resources.displayMetrics.heightPixels,
+                activity.dp(260)
+            )
+        private val sheetTopY: Int get() = sheetBounds.topPx
+        private val sheetHeight: Int get() = sheetBounds.heightPx
 
         init {
             requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -1084,21 +1102,9 @@ internal object CommentSectionUi {
             }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
             panel.addView(View(activity).apply { setBackgroundColor(Ds.colors.lineSoft) },
                 LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(activity)))
-            scroll = ScrollView(activity).apply {
-                isFillViewport = false
-                clipToPadding = false
-                overScrollMode = View.OVER_SCROLL_NEVER
-            }
-            listBox = LinearLayout(activity).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(0, 0, 0, activity.dp(16))
-            }
-            scroll.addView(listBox, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT
-            ))
-            panel.addView(scroll, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-            ))
+            comments = CommentListView(activity, onFeedback, anchorTopProvider, sheetRoot = root, showSort = false)
+            comments.bindTarget(targetOid, commentType, ownerMid)
+            panel.addView(comments, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
             overlay.addView(panel, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, sheetHeight, Gravity.BOTTOM
             ))
@@ -1107,11 +1113,11 @@ internal object CommentSectionUi {
                 val location = IntArray(2)
                 overlay.getLocationOnScreen(location)
                 val overlayTop = location[1]
-                val overlayWidth = overlay.width.coerceAtLeast(activity.dp(320))
-                val overlayHeight = overlay.height.coerceAtLeast(activity.dp(260))
+                val overlayWidth = overlay.width.coerceAtLeast(1)
+                val overlayHeight = overlay.height.coerceAtLeast(1)
                 if (useSideDrawer) {
                     // 平板横屏：以右侧滑出抽屉呈现，宽度约 38%（360~460dp），不遮挡左侧视频播放画面
-                    panelWidthPx = (overlayWidth * 0.38f).toInt().coerceIn(activity.dp(360), activity.dp(460))
+                    panelWidthPx = minOf(overlayWidth, (overlayWidth * 0.38f).toInt().coerceIn(activity.dp(360), activity.dp(460)))
                     panelHeightPx = overlayHeight
                     panel.background = Ds.card(
                         activity,
@@ -1133,7 +1139,7 @@ internal object CommentSectionUi {
                 } else {
                     panelTopPx = (sheetTopY - overlayTop)
                         .coerceIn(0, (overlayHeight - activity.dp(260)).coerceAtLeast(0))
-                    panelHeightPx = (overlayHeight - panelTopPx).coerceAtLeast(activity.dp(260))
+                    panelHeightPx = (overlayHeight - panelTopPx).coerceAtLeast(1)
                     panel.layoutParams = (panel.layoutParams as FrameLayout.LayoutParams).apply {
                         width = FrameLayout.LayoutParams.MATCH_PARENT
                         height = panelHeightPx
@@ -1145,217 +1151,13 @@ internal object CommentSectionUi {
                         .setInterpolator(DecelerateInterpolator()).start()
                 }
             }
-            scroll.setOnScrollChangeListener { _, _, scrollY, _, _ ->
-                val child = scroll.getChildAt(0) ?: return@setOnScrollChangeListener
-                if (scrollY >= child.height - scroll.height - activity.dp(260)) {
-                    if (hasMore) loadReplies(maxPages = 2)
-                }
-            }
-            loadReplies(maxPages = 2)
+            comments.setPageActive(true)
         }
-
-        private fun loadReplies(maxPages: Int = 1) {
-            if (!hasMore) return
-            pagesToLoad = maxOf(pagesToLoad, maxPages.coerceIn(1, 2))
-            retryView?.let {
-                listBox.removeView(it)
-                retryView = null
-            }
-            showSkeleton()
-            if (!loading) requestNextReplyPage()
-        }
-
-        private fun requestNextReplyPage() {
-            if (loading || !hasMore || pagesToLoad <= 0) {
-                if (!loading) hideSkeleton()
-                return
-            }
-            loading = true
-            val requestGeneration = generation
-            val requestPage = page
-            BiliApi.fetchSubRepliesForTarget(targetOid, commentType, root.id, requestPage) { list, next, error ->
-                if (activity.isFinishing || activity.isDestroyed || requestGeneration != generation) return@fetchSubRepliesForTarget
-                loading = false
-                if (error != null) {
-                    pagesToLoad = 0
-                    hideSkeleton()
-                    showReplyRetry()
-                    return@fetchSubRepliesForTarget
-                }
-                if (!loadedRoot) {
-                    loadedRoot = true
-                    listBox.addView(buildSheetRootItem(root), 0)
-                    listBox.addView(LinearLayout(activity).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER_VERTICAL
-                        setBackgroundColor(Ds.colors.surfaceRaised)
-                        setPadding(activity.dp(16), activity.dp(9), activity.dp(16), activity.dp(9))
-                        addView(TextView(activity).apply {
-                            text = "全部回复"
-                            textSize = 12.5f
-                            typeface = Ds.display(bold = true)
-                            setTextColor(COLOR_INK)
-                        })
-                        if (root.replyCount > 0L) {
-                            addView(TextView(activity).apply {
-                                text = "${root.replyCount}"
-                                textSize = 11.5f
-                                typeface = Ds.body(bold = true)
-                                fontFeatureSettings = "tnum"
-                                setTextColor(COLOR_MUTED)
-                            }, LinearLayout.LayoutParams(
-                                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                            ).apply { leftMargin = activity.dp(6) })
-                        }
-                    }, 1, LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                    ))
-                }
-                list.forEach { sub ->
-                    if (sub.id <= 0L || !seenReplyIds.add(sub.id)) return@forEach
-                    val insertAt = skeletonBox?.let { listBox.indexOfChild(it) }
-                        ?.takeIf { it >= 0 } ?: listBox.childCount
-                    if (hasReplyRows) {
-                        listBox.addView(View(activity).apply { setBackgroundColor(Ds.colors.lineSoft) },
-                            insertAt, LinearLayout.LayoutParams(
-                                LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(activity)
-                            ).apply {
-                                leftMargin = activity.dp(66); rightMargin = activity.dp(16)
-                            })
-                    }
-                    val rowInsertAt = skeletonBox?.let { listBox.indexOfChild(it) }
-                        ?.takeIf { it >= 0 } ?: listBox.childCount
-                    listBox.addView(buildSheetReplyItem(sub), rowInsertAt)
-                    hasReplyRows = true
-                }
-                hasMore = next > 0
-                page = if (next > 0) next else page + 1
-                pagesToLoad = (pagesToLoad - 1).coerceAtLeast(0)
-                if (hasMore && pagesToLoad > 0) {
-                    listBox.post { requestNextReplyPage() }
-                } else {
-                    hideSkeleton()
-                }
-            }
-        }
-
-        private fun showSkeleton() {
-            if (skeletonBox != null) return
-            val box = LinearLayout(activity).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(activity.dp(16), activity.dp(8), activity.dp(16), 0)
-            }
-            repeat(3) { index ->
-                box.addView(buildReplySkeletonItem(), LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, activity.dp(64)
-                ).apply {
-                    if (index > 0) topMargin = activity.dp(8)
-                })
-            }
-            skeletonBox = box
-            listBox.addView(box)
-            skeletonAnimator?.cancel()
-            skeletonAnimator = ValueAnimator.ofFloat(0.42f, 0.9f).apply {
-                duration = 760L
-                repeatMode = ValueAnimator.REVERSE
-                repeatCount = ValueAnimator.INFINITE
-                addUpdateListener { box.alpha = it.animatedValue as Float }
-                start()
-            }
-        }
-
-        private fun hideSkeleton() {
-            skeletonAnimator?.cancel()
-            skeletonAnimator = null
-            skeletonBox?.let { listBox.removeView(it) }
-            skeletonBox = null
-        }
-
-        private fun showReplyRetry() {
-            if (retryView != null) return
-            retryView = TextView(activity).apply {
-                text = "加载失败，点击重试"
-                textSize = 12f
-                setTextColor(COLOR_MUTED)
-                gravity = Gravity.CENTER
-                setPadding(0, activity.dp(12), 0, activity.dp(16))
-                setOnClickListener {
-                    listBox.removeView(this)
-                    retryView = null
-                    loadReplies(maxPages = 1)
-                }
-            }
-            listBox.addView(retryView)
-        }
-
-        private fun buildReplySkeletonItem(): View {
-            val row = LinearLayout(activity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.TOP
-                background = rounded(COLOR_SOFT_FILL, activity.dp(10))
-                setPadding(activity.dp(10), activity.dp(10), activity.dp(10), activity.dp(10))
-            }
-            val avatar = View(activity).apply {
-                background = rounded(COLOR_SOFT_FILL_STRONG, activity.dp(18))
-            }
-            row.addView(avatar, LinearLayout.LayoutParams(activity.dp(30), activity.dp(30)))
-            val bars = LinearLayout(activity).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(activity.dp(10), 0, activity.dp(22), 0)
-                addView(View(activity).apply {
-                    background = rounded(COLOR_SOFT_FILL_STRONG, activity.dp(5))
-                }, LinearLayout.LayoutParams(activity.dp(92), activity.dp(10)))
-                addView(View(activity).apply {
-                    background = rounded(COLOR_SOFT_FILL, activity.dp(5))
-                }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, activity.dp(10)).apply {
-                    topMargin = activity.dp(9)
-                })
-                addView(View(activity).apply {
-                    background = rounded(COLOR_SOFT_FILL, activity.dp(5))
-                }, LinearLayout.LayoutParams(activity.dp(150), activity.dp(10)).apply {
-                    topMargin = activity.dp(7)
-                })
-            }
-            row.addView(bars, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
-            return row
-        }
-
-        private fun buildSheetRootItem(comment: VideoComment): View =
-            buildUnifiedCommentItem(
-                activity = activity,
-                comment = comment,
-                ownerMid = ownerMid,
-                targetOid = targetOid,
-                commentType = commentType,
-                isSheet = true,
-                showRootTag = true,
-                onOpenReplySheet = null,
-                onFeedback = onFeedback
-            ).apply {
-                setPadding(activity.dp(16), activity.dp(12), activity.dp(16), activity.dp(14))
-            }
-
-        private fun buildSheetReplyItem(comment: VideoComment): View =
-            buildUnifiedCommentItem(
-                activity = activity,
-                comment = comment,
-                ownerMid = ownerMid,
-                targetOid = targetOid,
-                commentType = commentType,
-                isSheet = true,
-                showRootTag = false,
-                onOpenReplySheet = null,
-                onFeedback = onFeedback
-            ).apply {
-                setPadding(activity.dp(24), activity.dp(12), activity.dp(16), activity.dp(12))
-            }
 
         private fun dismissWithAnim() {
             if (!isShowing || closing) return
             closing = true
-            generation++
-            pagesToLoad = 0
-            hideSkeleton()
+            comments.setPageActive(false)
             val anim = if (useSideDrawer) {
                 panel.animate().translationX(panelWidthPx.toFloat())
             } else {
@@ -1367,9 +1169,7 @@ internal object CommentSectionUi {
         }
 
         override fun onStop() {
-            generation++
-            pagesToLoad = 0
-            if (::listBox.isInitialized) hideSkeleton()
+            if (::comments.isInitialized) comments.dispose()
             super.onStop()
         }
 
@@ -1498,13 +1298,14 @@ internal object CommentSectionUi {
         return null
     }
 
-    private fun commentSpannable(
+    fun commentSpannable(
         activity: Activity,
         content: String,
         emotes: Map<String, String>,
         emoteSizeDp: Int = 22,
         jumpLinks: Map<String, String> = emptyMap(),
-        titles: Map<String, String> = emptyMap()
+        titles: Map<String, String> = emptyMap(),
+        mentions: Map<String, Long> = emptyMap()
     ): SpannableString {
         val display = applyBiliTitles(content, titles)
         val spannable = SpannableString(display)
@@ -1526,7 +1327,7 @@ internal object CommentSectionUi {
         // 2. 网址链接（淡绿可点击）
         applyLinkSpans(activity, display, spannable, jumpLinks, titles)
         // 3. @用户（淡蓝）
-        applyMentionSpans(activity, display, spannable)
+        applyMentionSpans(activity, display, spannable, mentions)
         return spannable
     }
 
@@ -1622,25 +1423,29 @@ internal object CommentSectionUi {
      * B 站链接把裸 URL 换成内容标题（视频标题 / 剧集标题）；
      * 非 B 站链接保持原链接。标题取回后重建 span。
      */
-    private fun resolveBiliTitles(
+    fun resolveBiliTitles(
         activity: Activity,
         tv: TextView,
         content: String,
         emotes: Map<String, String>,
-        jumpLinks: Map<String, String>
+        jumpLinks: Map<String, String>,
+        mentions: Map<String, Long> = emptyMap(),
+        onResolved: () -> Unit = {}
     ) {
+        val bindTag = Any()
+        tv.setTag(R.id.comment_title_bind_tag, bindTag)
         val links = CommentLinkParser.findPlainLinks(content).filter {
             searchKeywordOf(it.url) == null && BiliLinkTitle.isBiliUrl(it.url) && !jumpLinks.values.contains(it.url)
         }
         if (links.isEmpty()) return
-        val bindTag = content.hashCode()
-        tv.setTag(R.id.comment_title_bind_tag, bindTag)
         BiliLinkTitle.resolveBatchAsync(links.map { it.url }) { titles ->
             if (titles.isEmpty()) return@resolveBatchAsync
             tv.post {
                 if (!tv.isAttachedToWindow || tv.getTag(R.id.comment_title_bind_tag) != bindTag) return@post
-                tv.text = commentSpannable(activity, content, emotes, jumpLinks = jumpLinks, titles = titles)
+                if (tv.selectionStart >= 0 && tv.selectionStart != tv.selectionEnd) return@post
+                tv.text = commentSpannable(activity, content, emotes, jumpLinks = jumpLinks, titles = titles, mentions = mentions)
                 attachEmoteSpans(tv)
+                onResolved()
             }
         }
     }
@@ -1677,33 +1482,19 @@ internal object CommentSectionUi {
     }
 
     /** 识别 `@昵称` 并着色；昵称后的分隔符（空格/冒号/标点）不计入。 */
-    private fun applyMentionSpans(activity: Activity, content: String, spannable: SpannableString) {
-        if (!content.contains('@')) return
-        var index = content.indexOf('@')
-        while (index >= 0) {
-            var end = index + 1
-            while (end < content.length && !isMentionTerminator(content[end])) end++
-            // 至少要有一个字符才算有效 @
-            if (end > index + 1) {
-                spannable.setSpan(
-                    MentionSpan(activity, content.substring(index + 1, end)),
-                    index, end,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                )
-            }
-            index = content.indexOf('@', end.coerceAtLeast(index + 1))
+    private fun applyMentionSpans(activity: Activity, content: String, spannable: SpannableString, mentions: Map<String, Long>) {
+        CommentMentionResolver.find(content, mentions).forEach { mention ->
+            if (spannable.getSpans(mention.start, mention.end, android.text.style.ClickableSpan::class.java).isNotEmpty() ||
+                spannable.getSpans(mention.start, mention.end, EmoteImageSpan::class.java).isNotEmpty()) return@forEach
+            spannable.setSpan(MentionSpan(activity, mention.name, mention.mid), mention.start, mention.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
     }
-
-    private fun isMentionTerminator(ch: Char): Boolean =
-        ch.isWhitespace() || ch == '：' || ch == ':' || ch == '，' || ch == ',' ||
-            ch == '。' || ch == '!' || ch == '！' || ch == '?' || ch == '？' ||
-            ch == '、' || ch == ';' || ch == '；' || ch == '\n' || ch == '@'
 
     /** @用户 文本样式：淡蓝色，点击进入该用户主页（仅当能解析到 mid）。 */
     private class MentionSpan(
         private val activity: Activity,
-        private val name: String
+        private val name: String,
+        private val mid: Long
     ) : android.text.style.ClickableSpan() {
         override fun updateDrawState(ds: TextPaint) {
             ds.color = Ds.colors.cold
@@ -1711,7 +1502,6 @@ internal object CommentSectionUi {
         }
 
         override fun onClick(widget: View) {
-            val mid = CommentMentionResolver.resolve(name)
             if (mid > 0L) {
                 SpaceActivity.open(activity, mid, name, "")
             }
@@ -1768,7 +1558,7 @@ internal object CommentSectionUi {
         onFeedback: (String) -> Unit
     ) {
         if (activity.isFinishing || activity.isDestroyed || rawUrl.isBlank()) return
-        val cleanUrl = rawUrl.substringBefore('@')
+        val cleanUrl = originalCoverUrl(rawUrl)
         val emoteSize = activity.dp(76)
         val arrowH = activity.dp(8)
         val arrowW = activity.dp(14)
@@ -1913,7 +1703,7 @@ internal object CommentSectionUi {
             .start()
     }
 
-    private fun formatCommentTime(epochSeconds: Long): String {
+    fun formatCommentTime(epochSeconds: Long): String {
         if (epochSeconds <= 0L) return "时间未知"
         val date = Date(epochSeconds * 1000L)
         val now = System.currentTimeMillis()
@@ -2046,14 +1836,14 @@ internal object CommentSectionUi {
             override fun sizeOf(key: String, value: Bitmap) = value.allocationByteCount
         }
         private val retryAfter = LruCache<String, Long>(128)
-        private val failureCount = LruCache<String, Int>(128)
+        private val failures = LruCache<String, EmoteFailure>(128)
         private val pending = HashMap<String, WeakHashMap<TextView, Unit>>()
         private val scheduledRetries = HashMap<String, WeakHashMap<TextView, Unit>>()
         private val retryRunnables = HashMap<String, Runnable>()
         private val pendingRefreshViews = WeakHashMap<TextView, Unit>()
         private var refreshScheduled = false
         private val attachedListeners = WeakHashMap<TextView, View.OnAttachStateChangeListener>()
-        @Volatile private var cacheDir: File? = null
+        @Volatile private var diskCache: EmoteDiskCache? = null
 
         private fun isNearViewport(view: TextView): Boolean {
             if (!view.isAttachedToWindow || !view.isShown || view.windowVisibility != View.VISIBLE) return false
@@ -2084,21 +1874,16 @@ internal object CommentSectionUi {
             if (url.isBlank()) return null
             images.get(url)?.let { return it }
             if (!allowRequest || view == null) return null
-            if (cacheDir == null) {
-                cacheDir = File(view.context.applicationContext.cacheDir, "emote_cache").apply {
-                    if (!isDirectory) mkdirs()
-                }
-            }
+            val app = view.context.applicationContext
             if (!view.isAttachedToWindow || !isNearViewport(view)) {
                 ensureAttachReload(view)
                 return null
             }
-            val fails = failureCount.get(url) ?: 0
-            if (fails >= MAX_RETRY_PER_URL) return null
             val now = SystemClock.uptimeMillis()
-            val blockedUntil = retryAfter.get(url) ?: 0L
+            val failure = failures.get(url)
+            val blockedUntil = maxOf(retryAfter.get(url) ?: 0L, failure?.retryAtMs ?: 0L)
             if (blockedUntil > now) {
-                scheduleRetryAfterCooldown(url, view, blockedUntil - now)
+                if ((failure?.attempts ?: 0) < MAX_RETRY_PER_URL) scheduleRetryAfterCooldown(url, view, blockedUntil - now)
                 return null
             }
             pending[url]?.let { targets ->
@@ -2109,21 +1894,26 @@ internal object CommentSectionUi {
             try {
                 pool.execute {
                     val decoded = try {
+                        if (diskCache == null) synchronized(this) {
+                            if (diskCache == null) diskCache = EmoteDiskCache(File(app.cacheDir, "emote_cache"))
+                        }
                         fetch(url)
                     } catch (_: java.io.IOException) {
                         null
                     } catch (_: IllegalArgumentException) {
                         null
+                    } catch (_: OutOfMemoryError) {
+                        null
                     }
                     main.post {
                         val targets = pending.remove(url) ?: return@post
                         if (decoded == null) {
-                            val nextFail = (failureCount.get(url) ?: 0) + 1
-                            failureCount.put(url, nextFail)
-                            retryAfter.put(url, SystemClock.uptimeMillis() + RETRY_COOLDOWN_MS)
-                            Log.w("YuiBiliEmote", "emote-decode-failed key=${url.hashCode()} tries=$nextFail")
-                            if (nextFail < MAX_RETRY_PER_URL) {
+                            val failure = nextEmoteFailure(failures.get(url), SystemClock.uptimeMillis())
+                            failures.put(url, failure)
+                            Log.w("YuiBiliEmote", "emote-decode-failed key=${url.hashCode()} tries=${failure.attempts}")
+                            if (failure.attempts < MAX_RETRY_PER_URL) {
                                 targets.keys.forEach { tv ->
+                                    if (!usesUrl(tv, url)) return@forEach
                                     if (tv.isAttachedToWindow && isNearViewport(tv)) {
                                         scheduleRetryAfterCooldown(url, tv, RETRY_COOLDOWN_MS + 50L)
                                     } else {
@@ -2134,9 +1924,10 @@ internal object CommentSectionUi {
                         } else {
                             images.put(url, decoded)
                             retryAfter.remove(url)
-                            failureCount.remove(url)
+                            failures.remove(url)
                             cancelScheduledRetry(url)
                             targets.keys.forEach { tv ->
+                                if (!usesUrl(tv, url)) return@forEach
                                 if (tv.isAttachedToWindow) {
                                     scheduleCoalescedRefresh(tv)
                                 } else {
@@ -2194,7 +1985,7 @@ internal object CommentSectionUi {
             val task = Runnable {
                 retryRunnables.remove(url)
                 val views = scheduledRetries.remove(url)?.keys?.toList().orEmpty()
-                val active = views.filter { it.isAttachedToWindow }
+                val active = views.filter { it.isAttachedToWindow && isNearViewport(it) && usesUrl(it, url) }
                 if (active.isEmpty()) return@Runnable
                 val cached = images.get(url)
                 if (cached != null) {
@@ -2217,6 +2008,11 @@ internal object CommentSectionUi {
             }
             retryRunnables[url] = task
             main.postDelayed(task, delayMs.coerceAtLeast(100L))
+        }
+
+        private fun usesUrl(tv: TextView, url: String): Boolean {
+            val text = tv.text as? Spanned ?: return false
+            return text.getSpans(0, text.length, EmoteImageSpan::class.java).any { it.url == url }
         }
 
         private fun applyCachedOrTriggerLoad(tv: TextView) {
@@ -2250,15 +2046,11 @@ internal object CommentSectionUi {
 
         private fun fetch(url: String): Bitmap? {
             for (address in buildEmoteCandidates(url)) {
-                val diskFile = cacheDir?.let { dir ->
-                    val name = java.security.MessageDigest.getInstance("SHA-256")
-                        .digest(address.toByteArray())
-                        .joinToString("") { "%02x".format(it) }
-                    File(dir, "$name.img")
-                }
-                val bytes = if (diskFile != null && diskFile.isFile && diskFile.length() in 1L..MAX_BYTES) {
-                    diskFile.readBytes()
-                } else {
+                val disk = diskCache
+                val name = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(address.toByteArray()).joinToString("") { "%02x".format(it) } + ".img"
+                val cached = runCatching { disk?.read(name, MAX_BYTES) }.getOrNull()
+                val bytes = if (cached != null) cached else {
                     val request = BiliHttp.request(address).header("Accept", "image/*").build()
                     val loaded = try {
                         BiliHttp.mediaClient.newCall(request).execute().use { response ->
@@ -2272,19 +2064,12 @@ internal object CommentSectionUi {
                         null
                     }
                     if (loaded == null || loaded.isEmpty()) continue
-                    if (diskFile != null) {
-                        try {
-                            val tmp = File(diskFile.parentFile, diskFile.name + ".tmp")
-                            tmp.writeBytes(loaded)
-                            tmp.renameTo(diskFile)
-                        } catch (_: Exception) {
-                        }
-                    }
+                    runCatching { disk?.write(name, loaded) }
                     loaded
                 }
                 val bitmap = decodeBytes(bytes)
                 if (bitmap != null) return bitmap
-                if (diskFile != null && diskFile.isFile) diskFile.delete()
+                runCatching { disk?.discard(name) }
             }
             return null
         }

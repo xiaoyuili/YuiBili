@@ -14,9 +14,11 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.drawable.Animatable
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
+import android.media.MediaScannerConnection
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -37,12 +39,10 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+
+internal fun shouldInstallPreviewPoster(boundUrl: String?, url: String, hasDrawable: Boolean): Boolean =
+    boundUrl != url || !hasDrawable
 
 /**
  * 公共全屏图片浏览器弹窗：
@@ -61,7 +61,7 @@ internal object ImagePreviewDialog {
         onFeedback: ((String) -> Unit)? = null
     ) {
         if (activity.isFinishing || activity.isDestroyed) return
-        val images = urls.filter { it.isNotBlank() }.distinct()
+        val images = urls.filter { it.isNotBlank() }.distinct().map(::originalCoverUrl)
         if (images.isEmpty()) return
         var current = startIndex.coerceIn(0, images.size - 1)
         var animating = false
@@ -123,7 +123,11 @@ internal object ImagePreviewDialog {
 
         lateinit var renderPage: () -> Unit
         loadingBox.setOnClickListener {
-            if (retryHint.visibility == View.VISIBLE) renderPage()
+            if (retryHint.visibility == View.VISIBLE) {
+                val raw = images.getOrNull(current) ?: return@setOnClickListener
+                renderPage()
+                CoverLoader.retry(slots[1], raw, original = true, allowAnimatedGif = true)
+            }
         }
 
         slots.forEach { slot ->
@@ -216,13 +220,10 @@ internal object ImagePreviewDialog {
         }
 
         fun loadNeighborThumbnail(slot: ZoomableImageView, imageIndex: Int) {
-            val raw = images[imageIndex].substringBefore('@')
+            val raw = images[imageIndex]
             slot.clearTileSource()
             val poster = posterProvider?.invoke(imageIndex) ?: CoverLoader.cachedThumbnail(raw)
-            if (poster != null && !poster.isRecycled) {
-                slot.bindAssetIdentity(raw, resetTransform = true)
-                slot.setImageDrawable(BitmapDrawable(activity.resources, poster))
-            }
+            val hasPoster = slot.bindAsset(raw, poster, staticOnly = true)
             // 邻页仅加载轻量静态缩略图，不抢占当前图原图并发池
             CoverLoader.load(
                 slot,
@@ -233,11 +234,12 @@ internal object ImagePreviewDialog {
                 thumbEdge = 480,
                 priority = CoverLoader.PRIORITY_LOW,
                 allowAnimatedGif = false,
-                preservePlaceholder = poster != null
+                preservePlaceholder = hasPoster
             )
         }
 
-        renderPage = {
+        renderPage = render@{
+            if (!dialog.isShowing) return@render
             val w = root.width.toFloat().coerceAtLeast(1f)
             hideLoading()
             // 先调度中央图（最高优先），再安排左右邻页轻量占位，防止左邻图抢占原图 2 线程 worker
@@ -245,14 +247,10 @@ internal object ImagePreviewDialog {
             centerSlot.translationX = 0f
             if (current in images.indices) {
                 centerSlot.visibility = View.VISIBLE
-                val raw = images[current].substringBefore('@')
+                val raw = images[current]
+                val gif = resolveCoverKey(raw, original = true)?.gif == true
                 val poster = posterProvider?.invoke(current) ?: CoverLoader.cachedThumbnail(raw)
-                val hasPoster = poster != null && !poster.isRecycled
-                centerSlot.bindAssetIdentity(raw, resetTransform = true)
-                if (hasPoster && !CoverLoader.isCachedOriginal(raw)) {
-                    // 用新 BitmapDrawable 包装同一张已解码缩略图，首帧立即可见，不与列表共用 Drawable 实例
-                    centerSlot.setImageDrawable(BitmapDrawable(activity.resources, poster))
-                }
+                val hasPoster = centerSlot.bindAsset(raw, poster)
                 CoverLoader.load(
                     centerSlot,
                     raw,
@@ -263,17 +261,17 @@ internal object ImagePreviewDialog {
                     allowAnimatedGif = true,
                     preservePlaceholder = hasPoster,
                     onProgress = { percent ->
-                        if (images.getOrNull(current)?.substringBefore('@') == raw) {
+                        if (images.getOrNull(current) == raw) {
                             if (percent >= 100) {
                                 hideLoading()
-                                centerSlot.bindTileSource(raw)
+                                if (!gif) centerSlot.bindTileSource(raw)
                             } else {
                                 scheduleShowLoading(hasPoster, percent)
                             }
                         }
                     },
                     onFailure = { _ ->
-                        if (images.getOrNull(current)?.substringBefore('@') == raw) {
+                        if (images.getOrNull(current) == raw) {
                             showLoadingDelay?.let(root::removeCallbacks)
                             loadingSpinner.visibility = View.GONE
                             loadingPercent.text = if (hasPoster) "原图加载失败" else "图片加载失败"
@@ -282,9 +280,6 @@ internal object ImagePreviewDialog {
                         }
                     }
                 )
-                if (CoverLoader.isCachedOriginal(raw)) {
-                    centerSlot.bindTileSource(raw)
-                }
                 centerSlot.invalidate()
                 centerSlot.drawable?.invalidateSelf()
             } else {
@@ -314,38 +309,44 @@ internal object ImagePreviewDialog {
             Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
         ).apply { bottomMargin = activity.dp(28) })
 
-        val save = TextView(activity).apply {
-            text = "存相册"
-            textSize = 13f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(activity.dp(14), activity.dp(8), activity.dp(14), activity.dp(8))
-            background = rounded(0x66000000.toInt(), activity.dp(18))
-            isClickable = true
-            setOnClickListener {
-                downloadImage(activity, images[current].substringBefore('@'), onFeedback)
+        fun addAction(close: Boolean, action: () -> Unit) {
+            val button = TextView(activity).apply {
+                text = if (close) "×" else "存相册"
+                textSize = if (close) 16f else 13f
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                val padX = activity.dp(if (close) 10 else 14)
+                val padY = activity.dp(if (close) 6 else 8)
+                setPadding(padX, padY, padX, padY)
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                background = rounded(0x66000000.toInt(), activity.dp(if (close) 16 else 18))
             }
+            val hitArea = FrameLayout(activity).apply {
+                minimumWidth = activity.dp(48)
+                minimumHeight = activity.dp(48)
+                contentDescription = if (close) "关闭图片预览" else "保存到相册"
+                isFocusable = true
+                addView(button, FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+                setOnClickListener { action() }
+                Ds.bindPressFeedback(this, 0.96f)
+            }
+            val side = if (close) Gravity.START else Gravity.END
+            val margin = activity.dp(16)
+            root.addView(hitArea, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or side
+            ).apply {
+                topMargin = margin
+                if (close) marginStart = margin else marginEnd = margin
+            })
         }
-        root.addView(save, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.END
-        ).apply { topMargin = activity.dp(16); rightMargin = activity.dp(16) })
+        addAction(close = true) { dialog.dismiss() }
+        addAction(close = false) { downloadImage(activity, images[current], onFeedback) }
 
-        val close = TextView(activity).apply {
-            text = "×"
-            textSize = 16f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(activity.dp(10), activity.dp(6), activity.dp(10), activity.dp(6))
-            background = rounded(0x66000000.toInt(), activity.dp(16))
-            isClickable = true
-            setOnClickListener { dialog.dismiss() }
+        dialog.setOnDismissListener {
+            hideLoading()
+            slots.forEach(CoverLoader::clear)
         }
-        root.addView(close, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.START
-        ).apply { topMargin = activity.dp(16); leftMargin = activity.dp(16) })
-
         dialog.setContentView(root)
         dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
         dialog.window?.setBackgroundDrawable(ColorDrawable(0x00000000))
@@ -360,7 +361,7 @@ internal object ImagePreviewDialog {
         url: String,
         onFeedback: ((String) -> Unit)? = null
     ) {
-        downloadImage(activity, url, onFeedback)
+        downloadImage(activity, originalCoverUrl(url), onFeedback)
     }
 
     private fun downloadImage(
@@ -368,7 +369,8 @@ internal object ImagePreviewDialog {
         url: String,
         onFeedback: ((String) -> Unit)?
     ) {
-        if (url.isBlank()) return
+        if (url.isBlank() || activity.isFinishing || activity.isDestroyed) return
+        if (CommentImageSavePermission.requestIfNeeded(activity, url)) return
         val notify: (String) -> Unit = { msg ->
             activity.runOnUiThread {
                 if (!activity.isFinishing && !activity.isDestroyed) {
@@ -379,9 +381,8 @@ internal object ImagePreviewDialog {
         }
         Thread {
             try {
-                val cached = CoverLoader.cachedOriginalFile(activity, url)
-                val extension = url.substringAfterLast('.', "jpg")
-                    .substringBefore('?')
+                val cached = CoverLoader.cachedOriginalFile(activity, url, includeGif = true)
+                val extension = url.toHttpUrlOrNull()?.pathSegments?.lastOrNull().orEmpty().substringAfterLast('.')
                     .lowercase(java.util.Locale.US)
                     .takeIf { it in setOf("jpg", "jpeg", "png", "webp", "gif") } ?: "jpg"
                 val mimeType = when (extension) {
@@ -427,10 +428,11 @@ internal object ImagePreviewDialog {
                     val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                     if (uri != null) {
                         try {
-                            resolver.openOutputStream(uri)?.use(copyToOut)
+                            val output = resolver.openOutputStream(uri) ?: throw java.io.IOException("无法写入相册")
+                            output.use(copyToOut)
                             values.clear()
                             values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                            resolver.update(uri, values, null, null)
+                            check(resolver.update(uri, values, null, null) > 0) { "相册保存未完成" }
                             true
                         } catch (e: Exception) {
                             resolver.delete(uri, null, null)
@@ -439,10 +441,16 @@ internal object ImagePreviewDialog {
                     } else false
                 } else {
                     @Suppress("DEPRECATION")
-                    val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+                    val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "YuiBili")
+                    check(dir.isDirectory || dir.mkdirs()) { "无法创建图片目录" }
                     val file = File(dir, fileName)
-                    file.parentFile?.mkdirs()
-                    file.outputStream().buffered().use(copyToOut)
+                    try {
+                        file.outputStream().buffered().use(copyToOut)
+                    } catch (error: Exception) {
+                        file.delete()
+                        throw error
+                    }
+                    MediaScannerConnection.scanFile(activity.applicationContext, arrayOf(file.path), arrayOf(mimeType), null)
                     true
                 }
                 notify(if (saved) "已保存到相册（Pictures/YuiBili）" else "保存失败")
@@ -482,7 +490,6 @@ internal object ImagePreviewDialog {
         }
 
         private var tileSourceUrl: String? = null
-        private var tileDecoder: BitmapRegionDecoder? = null
         private var tileRawWidth = 0
         private var tileRawHeight = 0
         private val tileStripHeight = 1024
@@ -491,14 +498,24 @@ internal object ImagePreviewDialog {
             override fun sizeOf(key: Int, value: Bitmap): Int = value.allocationByteCount
             override fun entryRemoved(evicted: Boolean, key: Int, oldValue: Bitmap?, newValue: Bitmap?) = Unit
         }
-        private val tileInFlight = HashSet<Int>()
-        private val tileExecutor = ThreadPoolExecutor(
-            1, 1, 10L, TimeUnit.SECONDS, LinkedBlockingQueue<Runnable>(32)
-        ).apply { allowCoreThreadTimeOut(true) }
+        private val tileMain = android.os.Handler(android.os.Looper.getMainLooper())
+        private val tileWorker = ImageTileWorker<Bitmap>(
+            open = ::openTileSource,
+            deliver = { work -> tileMain.post(work); Unit },
+            onSource = { width, height ->
+                tileRawWidth = width
+                tileRawHeight = height
+                scheduleVisibleTiles()
+                invalidate()
+            },
+            onTile = { index, bitmap ->
+                if (bitmap != null) tileCache.put(index, bitmap)
+                invalidate()
+            }
+        )
         private val tilePaint = Paint(Paint.FILTER_BITMAP_FLAG)
         private val tileSrcRect = Rect()
         private val tileDstRect = RectF()
-        private var tileGeneration = 0
 
         private val scaleDetector = ScaleGestureDetector(
             context,
@@ -595,58 +612,55 @@ internal object ImagePreviewDialog {
         }
 
         fun bindTileSource(rawUrl: String) {
-            if (tileSourceUrl == rawUrl && tileDecoder != null) {
+            if (tileSourceUrl == rawUrl) {
                 scheduleVisibleTiles()
                 return
             }
-            clearTileSource()
             tileSourceUrl = rawUrl
-            val gen = ++tileGeneration
-            val appCtx = context.applicationContext
-            tileExecutor.execute {
-                val file = CoverLoader.cachedOriginalFile(appCtx, rawUrl) ?: return@execute
-                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeFile(file.path, bounds)
-                val rawW = bounds.outWidth
-                val rawH = bounds.outHeight
-                if (rawW <= 0 || rawH <= 2048 || rawH.toFloat() / rawW.toFloat() < 2.0f) return@execute
-                val decoder = try {
-                    @Suppress("DEPRECATION")
-                    if (Build.VERSION.SDK_INT >= 31) BitmapRegionDecoder.newInstance(file.path)
-                    else BitmapRegionDecoder.newInstance(file.path, false)
-                } catch (_: Exception) {
-                    null
-                } ?: return@execute
-                post {
-                    if (gen != tileGeneration || tileSourceUrl != rawUrl) {
-                        runCatching { decoder.recycle() }
-                        return@post
-                    }
-                    tileDecoder = decoder
-                    tileRawWidth = rawW
-                    tileRawHeight = rawH
-                    scheduleVisibleTiles()
-                    invalidate()
-                }
-            }
+            tileRawWidth = 0
+            tileRawHeight = 0
+            tileCache.evictAll()
+            tileWorker.bind(rawUrl)
         }
 
         fun clearTileSource() {
-            tileGeneration++
             tileSourceUrl = null
             tileRawWidth = 0
             tileRawHeight = 0
-            tileInFlight.clear()
             tileCache.evictAll()
-            val oldDecoder = tileDecoder
-            tileDecoder = null
-            if (oldDecoder != null) {
-                tileExecutor.execute { runCatching { oldDecoder.recycle() } }
+            tileWorker.bind(null)
+        }
+
+        private fun openTileSource(rawUrl: String): ImageTileWorker.Source<Bitmap>? {
+            val file = CoverLoader.cachedOriginalFile(context.applicationContext, rawUrl) ?: return null
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.path, bounds)
+            val rawWidth = bounds.outWidth
+            val rawHeight = bounds.outHeight
+            if (rawWidth <= 0 || rawHeight <= 2048 || rawHeight.toFloat() / rawWidth.toFloat() < 2f) return null
+            val decoder = try {
+                @Suppress("DEPRECATION")
+                if (Build.VERSION.SDK_INT >= 31) BitmapRegionDecoder.newInstance(file.path)
+                else BitmapRegionDecoder.newInstance(file.path, false)
+            } catch (_: Exception) { null } ?: return null
+            return object : ImageTileWorker.Source<Bitmap> {
+                override val width = rawWidth
+                override val height = rawHeight
+                override fun decode(index: Int): Bitmap? {
+                    val top = index * tileStripHeight
+                    if (top !in 0 until rawHeight) return null
+                    val bottom = ((index + 1) * tileStripHeight).coerceAtMost(rawHeight)
+                    val options = BitmapFactory.Options().apply {
+                        inSampleSize = imageTileSampleSize(rawWidth)
+                        inPreferredConfig = Bitmap.Config.RGB_565
+                    }
+                    return decoder.decodeRegion(Rect(0, top, rawWidth, bottom), options)
+                }
+                override fun close() { if (!decoder.isRecycled) decoder.recycle() }
             }
         }
 
         private fun scheduleVisibleTiles() {
-            val decoder = tileDecoder ?: return
             val rawW = tileRawWidth
             val rawH = tileRawHeight
             val baseW = imageWidth()
@@ -667,48 +681,16 @@ internal object ImagePreviewDialog {
             val firstTile = ((rawTop / tileStripHeight) - 1).coerceAtLeast(0)
             val maxTile = ((rawH - 1) / tileStripHeight).coerceAtLeast(0)
             val lastTile = ((rawBottom / tileStripHeight) + 2).coerceAtMost(maxTile)
-            val gen = tileGeneration
-
-            val orderedIndices = (firstTile..lastTile).sortedBy { kotlin.math.abs(it - centerTile) }
-            for (idx in orderedIndices) {
-                if (tileCache.get(idx) != null || !tileInFlight.add(idx)) continue
-                val stripTop = idx * tileStripHeight
-                val stripBottom = ((idx + 1) * tileStripHeight).coerceAtMost(rawH)
-                try {
-                    tileExecutor.execute {
-                        val decoded = if (gen == tileGeneration) {
-                            try {
-                                val opts = BitmapFactory.Options().apply {
-                                    inSampleSize = if (rawW > 1440) 2 else 1
-                                    inPreferredConfig = Bitmap.Config.RGB_565
-                                }
-                                synchronized(decoder) {
-                                    if (decoder.isRecycled) null
-                                    else decoder.decodeRegion(Rect(0, stripTop, rawW, stripBottom), opts)
-                                }
-                            } catch (_: Exception) {
-                                null
-                            }
-                        } else null
-                        post {
-                            tileInFlight.remove(idx)
-                            if (gen == tileGeneration && decoded != null) {
-                                tileCache.put(idx, decoded)
-                                invalidate()
-                            }
-                        }
-                    }
-                } catch (_: RejectedExecutionException) {
-                    tileInFlight.remove(idx)
-                }
-            }
+            val orderedIndices = (firstTile..lastTile)
+                .filter { tileCache.get(it) == null }
+                .sortedBy { kotlin.math.abs(it - centerTile) }
+            tileWorker.request(orderedIndices)
         }
 
         override fun onDraw(canvas: Canvas) {
-            val decoder = tileDecoder
             val baseW = imageWidth()
             val baseH = imageHeight()
-            if (decoder == null || tileRawWidth <= 0 || tileRawHeight <= 0 || baseW <= 0f || baseH <= 0f) {
+            if (tileRawWidth <= 0 || tileRawHeight <= 0 || baseW <= 0f || baseH <= 0f) {
                 super.onDraw(canvas)
                 return
             }
@@ -747,13 +729,16 @@ internal object ImagePreviewDialog {
         private var boundAssetUrl: String? = null
         private var pendingResetOnNextDrawable = true
 
-        fun bindAssetIdentity(rawUrl: String, resetTransform: Boolean) {
+        fun bindAsset(rawUrl: String, poster: Bitmap?, staticOnly: Boolean = false): Boolean {
+            val keepDrawable = drawable != null && !(staticOnly && drawable is Animatable)
+            val installPoster = shouldInstallPreviewPoster(boundAssetUrl, rawUrl, keepDrawable)
             if (boundAssetUrl != rawUrl) {
                 boundAssetUrl = rawUrl
                 pendingResetOnNextDrawable = true
-            } else if (resetTransform) {
-                pendingResetOnNextDrawable = true
             }
+            if (poster == null || poster.isRecycled) return false
+            if (installPoster) setImageDrawable(BitmapDrawable(resources, poster))
+            return true
         }
 
         override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -858,7 +843,7 @@ internal object ImagePreviewDialog {
         override fun onDetachedFromWindow() {
             stopFling()
             clearTileSource()
-            tileExecutor.shutdownNow()
+            tileWorker.close()
             super.onDetachedFromWindow()
             velocityTracker?.recycle()
             velocityTracker = null

@@ -8,7 +8,6 @@ import android.app.Activity
 import android.app.Dialog
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.LinearGradient
 import android.graphics.Canvas
@@ -223,11 +222,7 @@ class AudioPlayerActivity : Activity() {
         Theme.init(this)
         Ds.applySystemBars(this)
         window.setBackgroundDrawable(ColorDrawable(Ds.colors.bg))
-        if (LayoutMode.isTablet) {
-            LayoutMode.applyTabletOrientationIfEnabled(this)
-        } else {
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
+        LayoutMode.applyScreenOrientation(this)
         DownloadManager.init(this)
 
         currentTaskId = intent.getLongExtra(EXTRA_TASK_ID, 0L)
@@ -263,9 +258,8 @@ class AudioPlayerActivity : Activity() {
     private fun initPlaylist(): Boolean {
         if (isOnlineMode) return initOnlineQueue()
         val snap = DownloadManager.snapshot()
-        // 与引擎一致：只看实际文件是否存在，不依赖 state 字段
         val entry = snap.firstOrNull {
-            it.id == currentTaskId && it.type == DownloadManager.TYPE_AUDIO && localSourceExists(it)
+            it.id == currentTaskId && it.type == DownloadManager.TYPE_AUDIO && it.playable()
         } ?: return false
 
         playlist.clear()
@@ -319,14 +313,6 @@ class AudioPlayerActivity : Activity() {
 
     private fun currentOnlineIndex(): Int = onlineQueue.indexOfFirst {
         currentOnlineEpisode?.let { cur -> it.sameAsEpisode(cur) } == true
-    }
-
-    /** 本地任务是否有可播的实际文件（不依赖 state）。 */
-    private fun localSourceExists(task: DownloadManager.Task): Boolean = when {
-        task.mpdPath.isNotBlank() -> java.io.File(task.mpdPath).exists()
-        task.audioPath.isNotBlank() -> java.io.File(task.audioPath).exists()
-        task.singlePaths.isNotEmpty() -> task.singlePaths.all { java.io.File(it).exists() }
-        else -> false
     }
 
     private fun loadSavedPlaylistIds(): List<Long> {        val raw = prefs.getString(KEY_SAVED_PLAYLIST_IDS, "").orEmpty()

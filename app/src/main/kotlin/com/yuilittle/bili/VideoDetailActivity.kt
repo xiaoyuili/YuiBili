@@ -12,7 +12,6 @@ import android.content.Context
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.BitmapShader
 import android.graphics.Canvas
@@ -126,7 +125,6 @@ class VideoDetailActivity : Activity() {
         portraitDanmakuToggle?.updateState(s.enabled)
     }
     private lateinit var gestureLayer: PlayerGestureView
-    private lateinit var fullscreenContainer: FrameLayout
     private lateinit var playerBack: View
     private lateinit var playerSpinner: BrandSpinnerView
     private lateinit var playerError: TextView
@@ -151,7 +149,8 @@ class VideoDetailActivity : Activity() {
     private var localPlaylist: List<DownloadManager.Task> = emptyList()
     /** 收藏夹「播放全部」队列；非空时播放页以收藏夹列表为准。 */
     private var favoritePlayback: FavoritePlayback? = null
-    private var favoritePlayMode = DownloadManager.LocalPlayMode.SEASON_SEQUENCE
+    private var onlinePlayMode = DownloadManager.LocalPlayMode.SEASON_SEQUENCE
+    private var pendingIntro: VideoItem? = null
     private var localInfoHost: FrameLayout? = null
     private var localAudioCoverView: ImageView? = null
     private var localAudioCoverOverlay: FrameLayout? = null
@@ -209,11 +208,21 @@ class VideoDetailActivity : Activity() {
     }
     private lateinit var playerTopTitle: TextView
     private lateinit var playerSeekHint: TextView
+    private lateinit var playerSkipHint: TextView
+    private val hideSkipHint = Runnable { if (::playerSkipHint.isInitialized) playerSkipHint.visibility = View.GONE }
+    private var speedPopup: PopupWindow? = null
+    private var introPlayMode: TextView? = null
+    private var drawerPlayMode: PlayModeIconView? = null
+    private var drawerPlayModeButton: View? = null
+    private var drawerModePopup: PopupWindow? = null
+    private var localModeIcon: PlayModeIconView? = null
+    private var localModeLabel: TextView? = null
+    private var localModeButton: View? = null
     private lateinit var replayBtn: ReplayIcon
     private lateinit var bottomBar: ViewGroup
     private lateinit var playPauseBtn: PlayPauseIcon
     private var nextEpisodeBtn: NextEpisodeIcon? = null
-    private lateinit var progressContainer: SeekBarView
+    private lateinit var progressContainer: PlaybackProgressBar
     private lateinit var infoArea: View
     private lateinit var timeText: TextView
     private lateinit var durationText: TextView
@@ -226,7 +235,6 @@ class VideoDetailActivity : Activity() {
     private lateinit var boostIndicator: TextView
     private var boostAnimator: ValueAnimator? = null
     private var endedState = false
-    private var exitingFullscreen = false
     private var fsTransitioning = false
     private var controlsVisible = true
     private var controlsAnimating = false
@@ -244,17 +252,8 @@ class VideoDetailActivity : Activity() {
     private lateinit var tabCommentIndicator: View
     private lateinit var infoPager: HorizontalPagerView
     private lateinit var introScroll: ScrollView
-    private lateinit var commentScroll: ScrollView
-    private lateinit var commentContent: LinearLayout
-    private lateinit var commentState: TextView
-    private lateinit var commentMore: TextView
-    private var commentCursor = -1
-    /** rpids already rendered, so a broken cursor can never duplicate rows. */
-    private val seenCommentRpids = HashSet<Long>()
-    private var commentLoginHintShown = false
-    private var commentsLoading = false
-    private var commentsLoaded = false
-    private var commentGeneration = 0
+    private lateinit var commentScroll: CommentListView
+    private var restoredComments: Bundle? = null
     private var currentDetail: VideoItem? = null
     private var currentTab = 0
 
@@ -272,19 +271,9 @@ class VideoDetailActivity : Activity() {
     private var titleHeightAnimator: ValueAnimator? = null
     private var descHeightAnimator: ValueAnimator? = null
     // ── Comments: sort (0=hot likes, 1=newest) + auto paging + total badge ──
-    private var commentSort = 0
-    private var commentHasMore = false
     private lateinit var commentBubble: TextView
-    private var commentHeaderBar: CommentSectionUi.CommentHeaderBar? = null
-    private var commentPrefetchHandle: CoverLoader.PrefetchHandle? = null
-    private lateinit var commentSortBtn: TextView
-    private lateinit var commentHeaderTitle: TextView
     /** Fixed info-tab navigation row; reply sheets start immediately below it. */
     private var infoTabBarAnchor: View? = null
-    /** Comment section header row; used only for the sort row. */
-    private var commentHeaderAnchor: View? = null
-    /** Locally liked comment rpids (server sync pending until login lands). */
-    // Comment likes are always re-fetched from Bilibili after action; no local store.
     // ── Follow button state (server-backed; no local fake store) ──
     private var followBtnRef: TextView? = null
     private var followInFlight = false
@@ -295,6 +284,9 @@ class VideoDetailActivity : Activity() {
     private var playRetryCount = 0
     private var playbackGeneration = 0
     private var pendingResumePositionMs = 0L
+    private var initialHistoryMedia: HistoryMediaId? = null
+    private var lastHistorySample: Pair<HistoryMediaId, Long>? = null
+    private var lastHistoryWriteAtMs = 0L
     /** 切集期间为 true，避免把上一集的位置写回新分集。 */
     private var switchingLocalTask = false
     private var userWantsPlayback = true
@@ -306,35 +298,37 @@ class VideoDetailActivity : Activity() {
     private var restoreEndedState = false
     private var retryScheduled = false
     private var stallRetries = 0
-    /** BUFFERING 看门狗：超过阈值仍未就绪则强制重试，避免无限转圈。 */
+    private val stallMonitor = PlaybackStallMonitor(STALL_TIMEOUT_MS)
+    private val playbackDiagnostics by lazy { PlaybackDiagnostics(this, "ugc") }
+    /** 只按可播缓冲的前沿判断进展，网络收到了字节不等于视频已可播放。 */
     private val stallWatchdog: Runnable by lazy(LazyThreadSafetyMode.NONE) {
         Runnable {
-            if (isFinishing || isDestroyed) return@Runnable
+            if (isFinishing || isDestroyed || !activityResumed || !userWantsPlayback || isSeeking || playerListener == null) return@Runnable
             val player = exoPlayer ?: return@Runnable
-            if (player.playbackState == Player.STATE_BUFFERING && !retryScheduled) {
+            if (player.playbackState == Player.STATE_BUFFERING && player.playWhenReady && !retryScheduled) {
+                val now = SystemClock.elapsedRealtime()
+                stallMonitor.observe(now, playerGlobalBufferedPosition(player))
+                val remaining = stallMonitor.remainingMs(now)
+                if (remaining > 0L) { handler.postDelayed(stallWatchdog, remaining); return@Runnable }
                 if (stallRetries >= MAX_STALL_RETRIES) {
                     Log.w("YuiBiliPlayer", "stall watchdog: 已达重试上限，停止重试")
                     playerSpinner.visibility = View.GONE
+                    retryScheduled = true
                     showError("加载超时，点这里重试")
                     return@Runnable
                 }
                 stallRetries++
                 retryScheduled = true
-                Log.w("YuiBiliPlayer", "stall watchdog: BUFFERING 超过 ${STALL_TIMEOUT_MS}ms，第 ${stallRetries} 次重试")
+                Log.w("YuiBiliPlayer", "stall watchdog: 可播缓冲停滞，第 ${stallRetries} 次恢复")
                 playerSpinner.visibility = View.VISIBLE
                 playerError.visibility = View.GONE
-                // 清掉可能越界的续播位置，并从源头重建（用 switchingLocalTask 避免位置被写回）
-                pendingResumePositionMs = 0L
-                resumeSegmentIndex = 0
-                switchingLocalTask = true
-                try {
-                    if (isLocalMode) {
-                        loadLocalPlayer()
-                    } else if (currentBvid.isNotBlank() && currentCid > 0L) {
-                        loadPlayer(bypassCache = true)
-                    }
-                } finally {
-                    switchingLocalTask = false
+                rememberPlaybackPosition()
+                playbackDiagnostics.recovering(pendingResumePositionMs, playerGlobalBufferedPosition(player), stallRetries)
+                if (isLocalMode) {
+                    loadLocalPlayer()
+                } else if (currentBvid.isNotBlank() && currentCid > 0L) {
+                    loadPlayer(PreferredVideoQuality.resumeRequestQuality(requestedQuality, lastRequestedQuality,
+                        BiliSessionStore.isLoggedIn(), streamSession != BiliSessionStore.cookie()), bypassCache = true)
                 }
             }
         }
@@ -371,16 +365,17 @@ class VideoDetailActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         BiliSessionStore.init(this)
+        restoredComments = savedInstanceState?.getBundle("comments")
         DanmakuSettingsStore.init(this)
         currentBvid = savedInstanceState?.getString(EXTRA_BVID) ?: intent.getStringExtra(EXTRA_BVID).orEmpty()
         currentAid = savedInstanceState?.getLong(EXTRA_AID) ?: intent.getLongExtra(EXTRA_AID, 0L)
         currentCid = savedInstanceState?.getLong(EXTRA_CID) ?: intent.getLongExtra(EXTRA_CID, 0L)
-        pendingResumePositionMs = savedInstanceState?.getLong(STATE_PLAY_POSITION) ?: 0L
         resumeSegmentIndex = savedInstanceState?.getInt(STATE_SEGMENT_INDEX) ?: 0
         userWantsPlayback = savedInstanceState?.getBoolean(STATE_PLAY_WHEN_READY, true) ?: true
         restoreEndedState = savedInstanceState?.getBoolean(STATE_PLAY_ENDED) ?: false
         speedIndex = savedInstanceState?.getInt(STATE_SPEED_INDEX)?.coerceIn(speeds.indices) ?: 1
-        localTaskId = intent.getLongExtra(EXTRA_LOCAL_TASK_ID, 0L)
+        localTaskId = savedInstanceState?.getLong(EXTRA_LOCAL_TASK_ID, intent.getLongExtra(EXTRA_LOCAL_TASK_ID, 0L))
+            ?: intent.getLongExtra(EXTRA_LOCAL_TASK_ID, 0L)
         localSortOrder = runCatching {
             DownloadManager.SeasonSortOrder.valueOf(
                 intent.getStringExtra(EXTRA_LOCAL_SORT_ORDER)
@@ -393,16 +388,20 @@ class VideoDetailActivity : Activity() {
             )
         }.getOrDefault(DownloadManager.LocalPlayMode.SEASON_SEQUENCE)
         isLocalMode = localTaskId > 0L
-        // 收藏夹「播放全部」入口：携带队列则覆盖 bvid/合集，走收藏夹播放态
+        // 重建时队列仍来自 Intent，但应恢复当前分集，而非队列最初的入口项。
         favoritePlayback = FavoritePlaybackLauncher.read(intent)
-        favoritePlayback?.let { fav ->
+        val savedPosition = savedInstanceState?.takeIf { it.containsKey(STATE_PLAY_POSITION) }?.getLong(STATE_PLAY_POSITION)
+        favoritePlayback?.takeIf { savedPosition == null }?.let { fav ->
             val entry = fav.entries.getOrNull(fav.startIndex) ?: fav.entries.first()
             currentBvid = entry.bvid
             currentAid = entry.aid
             currentCid = entry.cid
-            pendingResumePositionMs = fav.startPositionMs
-            favoritePlayMode = DownloadManager.LocalPlayMode.SEASON_SEQUENCE
         }
+        val start = historyPlaybackStart(savedPosition, savedInstanceState?.getBoolean(STATE_HISTORY_PENDING) == true,
+            favoritePlayback?.startPositionMs, isLocalMode, intent.getLongExtra(EXTRA_HISTORY_POSITION_MS, 0L))
+        pendingResumePositionMs = start.positionMs
+        if (start.validateHistory) initialHistoryMedia = HistoryMediaId(currentBvid, currentAid, currentCid)
+        onlinePlayMode = savedOnlinePlayMode(qualityPrefs)
         requestedQuality = loadQualityPreference()
         if (currentBvid.isBlank() && currentAid <= 0L && !isLocalMode) { finish(); return }
         if (!isLocalMode) {
@@ -417,12 +416,7 @@ class VideoDetailActivity : Activity() {
         }
         // 视频播放页顶部紧邻黑色视频窗口，状态栏固定纯黑配白色图标，底栏跟随主题色
         applyPlayerSystemBars()
-        if (LayoutMode.isTablet) {
-            LayoutMode.applyTabletOrientationIfEnabled(this)
-        } else {
-            // Detail page is portrait-designed; fullscreen switches to landscape temporarily.
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
+        LayoutMode.applyScreenOrientation(this)
 
         activityRoot = FrameLayout(this).apply { setBackgroundColor(COLOR_BACKGROUND) }
         page = LinearLayout(this).apply {
@@ -431,18 +425,13 @@ class VideoDetailActivity : Activity() {
         }
 
         // ── Gesture detector ──
-        gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-            override fun onDown(e: MotionEvent): Boolean = true
-            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                if (longPressBoost) return true
-                toggleControls()
-                return true
-            }
-            override fun onDoubleTap(e: MotionEvent): Boolean {
-                togglePlayPause()
-                return true
-            }
-        })
+        gestureDetector = playerTapDetector(this, single = { if (!longPressBoost) toggleControls() }, armDouble = {
+            handler.removeCallbacks(longPressBoostRunnable)
+            longPressCandidate = false
+        }) { x ->
+            val delta = PlayerSeekPolicy.doubleTapDelta(isFullscreen, x, playerHost.width)
+            if (delta == 0L) togglePlayPause() else skipByDoubleTap(delta)
+        }
 
         // ── Player host: Media3 PlayerView owns aspect-ratio and video surface ──
         playerHost = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
@@ -594,21 +583,6 @@ class VideoDetailActivity : Activity() {
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(18) })
 
-        // ── Seek preview pill: 滑动进度提示胶囊，松手后才真正 seek ──
-        playerSeekHint = TextView(this).apply {
-            textSize = 14f
-            setTextColor(Color.WHITE)
-            typeface = Ds.display(bold = true)
-            gravity = Gravity.CENTER
-            setPadding(dp(16), dp(8), dp(16), dp(8))
-            background = Ds.pill(this@VideoDetailActivity, 0xCC14161B.toInt(), 0x33FFFFFF)
-            alpha = 0f
-            visibility = View.GONE
-        }
-        playerHost.addView(playerSeekHint, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.CENTER))
-
         // ── Brightness / volume adjustment indicator (center overlay) ──
         adjustIndicator = AdjustIndicator(this).apply {
             alpha = 0f
@@ -621,6 +595,29 @@ class VideoDetailActivity : Activity() {
 
         // ── Control overlay ──
         createControlOverlay()
+        playerSeekHint = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            typeface = Ds.body(true)
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            setShadowLayer(dpf(3f), 0f, dpf(1f), 0xB3000000.toInt())
+            visibility = View.GONE
+        }
+        playerHost.addView(playerSeekHint, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
+        progressRow.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionSeekHint() }
+        playerSkipHint = TextView(this).apply {
+            textSize = 13f
+            typeface = Ds.body(true)
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setShadowLayer(dpf(3f), 0f, dpf(1f), 0xB3000000.toInt())
+            translationY = dpf(38f)
+            visibility = View.GONE
+        }
+        playerHost.addView(playerSkipHint, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         infoArea = createInfoArea()
         tabletSplitDivider = View(this).apply {
             setBackgroundColor(Ds.colors.lineSoft)
@@ -631,12 +628,6 @@ class VideoDetailActivity : Activity() {
         page.addView(infoArea)
         applyPageSplitLayout()
         activityRoot.addView(page, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        fullscreenContainer = FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK)
-            visibility = View.GONE
-        }
-        activityRoot.addView(fullscreenContainer, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         setContentView(activityRoot)
         if (isLocalMode) {
             loadLocalPlayer()
@@ -723,7 +714,7 @@ class VideoDetailActivity : Activity() {
             background = Ds.pill(this@VideoDetailActivity, 0x33000000, 0x2EFFFFFF)
             isClickable = true
             Ds.bindPressFeedback(this, 0.90f)
-            setOnClickListener { cycleSpeed() }
+            setOnClickListener { showSpeedMenu() }
         }
         bottomBar.addView(speedBtn, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, dp(26)).apply {
@@ -780,9 +771,12 @@ class VideoDetailActivity : Activity() {
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             gravity = Gravity.CENTER_VERTICAL })
 
-        progressContainer = SeekBarView(this).apply {
+        progressContainer = PlaybackProgressBar(this).apply {
             isClickable = true
+            var touchGeneration = -1
             setOnTouchListener { _, event ->
+                if (event.actionMasked == MotionEvent.ACTION_DOWN) touchGeneration = playbackGeneration
+                else if (!isDragging || touchGeneration != playbackGeneration) return@setOnTouchListener true
                 val p = exoPlayer ?: return@setOnTouchListener true
                 val totalDuration = playerGlobalDuration(p)
                 if (totalDuration <= 0L || width <= 0) return@setOnTouchListener true
@@ -822,7 +816,8 @@ class VideoDetailActivity : Activity() {
                         parent?.requestDisallowInterceptTouchEvent(false)
                     }
                 }
-                onManualSeek(seekPos, totalDuration)
+                if (event.actionMasked == MotionEvent.ACTION_CANCEL || event.actionMasked == MotionEvent.ACTION_UP) updatePlaybackProgress()
+                else onManualSeek(seekPos, totalDuration)
                 true
             }
         }
@@ -1180,8 +1175,7 @@ class VideoDetailActivity : Activity() {
             maxWidth = dp(150)
         }
         seasonDrawerTitleText = headerTitle
-        header.addView(headerTitle, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        header.addView(headerTitle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         seasonDrawerCountText = TextView(this).apply {
             text = ""
             textSize = 12f
@@ -1193,11 +1187,29 @@ class VideoDetailActivity : Activity() {
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             leftMargin = dp(8)
         })
-        header.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
-        header.addView(Ds.closeIcon(this, 0xB3FFFFFF.toInt(), 1.7f).apply {
-            isClickable = true
+        drawerPlayMode = PlayModeIconView(this, currentPlayMode(), Color.WHITE, 1.7f)
+        drawerPlayModeButton = FrameLayout(this).apply {
+            isFocusable = true
+            contentDescription = "播放模式：${currentPlayMode().label()}"
+            addView(drawerPlayMode, FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
+            Ds.bindPressFeedback(this, 0.92f)
+            setOnClickListener {
+                val modes = DownloadManager.LocalPlayMode.entries
+                drawerModePopup?.dismiss()
+                drawerModePopup = showAnchoredMenu(this, modes.map { it.label() }, modes.indexOf(currentPlayMode()), playerStyle = true) { i ->
+                    if (isLocalMode) setLocalPlayMode(modes[i]) else setOnlinePlayMode(modes[i])
+                }
+                drawerModePopup?.setOnDismissListener { drawerModePopup = null }
+            }
+        }
+        header.addView(drawerPlayModeButton, LinearLayout.LayoutParams(dp(48), dp(48)))
+        header.addView(FrameLayout(this).apply {
+            isFocusable = true
+            contentDescription = "关闭合集"
+            addView(Ds.closeIcon(this@VideoDetailActivity, 0xB3FFFFFF.toInt(), 1.7f),
+                FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
             setOnClickListener { closeSeasonDrawer() }
-        }, LinearLayout.LayoutParams(dp(28), dp(28)))
+        }, LinearLayout.LayoutParams(dp(48), dp(48)))
         panel.addView(header, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         panel.addView(View(this).apply { setBackgroundColor(0x1FFFFFFF) },
@@ -1307,7 +1319,7 @@ class VideoDetailActivity : Activity() {
     private fun collectSeasonItems(): List<FullscreenSeasonItem> {
         // 收藏夹播放态：列表以收藏夹为准，屏蔽视频自身的 ugc_season
         favoritePlayback?.let { fav ->
-            val currentIdx = fav.entries.indexOfFirst { it.bvid == currentBvid }
+            val currentIdx = fav.entries.playingIndex(currentBvid, currentAid, currentCid)
             return fav.entries.mapIndexed { index, episode ->
                 FullscreenSeasonItem(
                     label = "${index + 1}",
@@ -1328,8 +1340,7 @@ class VideoDetailActivity : Activity() {
             }
         }
         val episodes = (currentDetail?.season ?: cachedSeason)?.episodes.orEmpty()
-        val currentIndex = episodes.indexOfFirst { currentCid > 0L && it.cid == currentCid }.takeIf { it >= 0 }
-            ?: episodes.indexOfFirst { it.cid <= 0L && it.bvid == currentBvid && it.aid == currentAid }
+        val currentIndex = episodes.playingIndex(currentBvid, currentAid, currentCid)
         return episodes.mapIndexed { index, episode ->
             FullscreenSeasonItem(
                 label = "P${index + 1}",
@@ -1347,32 +1358,14 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun resolveNextSeasonTarget(): NextSeasonTarget? {
-        favoritePlayback?.let { fav ->
-            val idx = fav.entries.indexOfFirst { it.bvid == currentBvid }
-            if (idx < 0) return null
-            val next = when (favoritePlayMode) {
-                DownloadManager.LocalPlayMode.SHUFFLE -> {
-                    if (fav.entries.size <= 1) null
-                    else fav.entries.filterIndexed { i, _ -> i != idx }.random()
-                }
-                DownloadManager.LocalPlayMode.LIST_LOOP ->
-                    fav.entries[(idx + 1) % fav.entries.size]
-                DownloadManager.LocalPlayMode.SINGLE_LOOP -> fav.entries[idx]
-                DownloadManager.LocalPlayMode.SEASON_SEQUENCE ->
-                    fav.entries.getOrNull(idx + 1)
-            }
-            return next?.let { NextSeasonTarget.Online(it) }
-        }
         if (isLocalMode) {
             val idx = localPlaylist.indexOfFirst { it.id == localTaskId }
             if (idx < 0 || idx >= localPlaylist.lastIndex) return null
             return NextSeasonTarget.Local(localPlaylist[idx + 1].id)
         }
-        val episodes = (currentDetail?.season ?: cachedSeason)?.episodes.orEmpty()
-        if (episodes.size <= 1) return null
-        val idx = episodes.indexOfFirst { currentCid > 0L && it.cid == currentCid }.takeIf { it >= 0 }
-            ?: episodes.indexOfFirst { it.cid <= 0L && it.bvid == currentBvid && it.aid == currentAid }
-        if (idx < 0 || idx >= episodes.lastIndex) return null
+        val episodes = favoritePlayback?.entries ?: (currentDetail?.season ?: cachedSeason)?.episodes.orEmpty()
+        val idx = episodes.playingIndex(currentBvid, currentAid, currentCid)
+        if (episodes.size <= 1 || idx !in 0 until episodes.lastIndex) return null
         return NextSeasonTarget.Online(episodes[idx + 1])
     }
 
@@ -1464,6 +1457,7 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun closeSeasonDrawer(immediate: Boolean = false) {
+        drawerModePopup?.dismiss()
         if (!seasonDrawerOpen) return
         seasonDrawerOpen = false
         val overlay = seasonDrawerOverlay ?: return
@@ -1605,50 +1599,15 @@ class VideoDetailActivity : Activity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         // ── Comment tab content ──
-        commentScroll = ScrollView(this).apply {
-            isFillViewport = true
-            isVerticalScrollBarEnabled = false
-            setOnScrollChangeListener { _, _, scrollY, _, _ ->
-                val content = commentContent
-                if (content.height > 0 && scrollY + height >= content.height - dp(140)) {
-                    maybeLoadMoreComments()
-                }
-            }
+        commentScroll = CommentListView(this, { showSnackbar(it) }, {
+            val pos = IntArray(2)
+            infoTabBarAnchor?.getLocationOnScreen(pos)
+            pos[1] + (infoTabBarAnchor?.height ?: dp(64))
+        }).apply {
+            restoreState(restoredComments)
+            restoreRetainedState(lastNonConfigurationInstance as? CommentListView.RetainedState)
         }
-        val commentWrap = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        val headerBar = CommentSectionUi.CommentHeaderBar(this) { toggleCommentSort() }
-        commentHeaderBar = headerBar
-        commentHeaderTitle = headerBar.titleView
-        commentSortBtn = headerBar.sortLabel
-        commentHeaderAnchor = headerBar
-        commentWrap.addView(headerBar, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        commentContent = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(2), dp(16), dp(28))
-        }
-        commentState = TextView(this).apply {
-            text = "正在加载评论…"
-            textSize = 14f; gravity = Gravity.CENTER; setTextColor(COLOR_MUTED)
-            setPadding(0, dp(24), 0, dp(24))
-        }
-        commentContent.addView(commentState, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        commentMore = TextView(this).apply {
-            text = "加载更多评论"; textSize = 13f; gravity = Gravity.CENTER
-            setTextColor(COLOR_ROSE); setPadding(0, dp(14), 0, dp(6))
-            visibility = View.GONE
-            isClickable = true
-            setOnClickListener { loadComments(reset = false) }
-        }
-        commentContent.addView(commentMore, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        commentWrap.addView(commentContent, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        commentScroll.addView(commentWrap, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        restoredComments = null
 
         // ── Horizontal pager: 简介 | 评论 (drag + fling, tab bar stays in sync) ──
         infoPager = HorizontalPagerView(this).apply {
@@ -1672,19 +1631,23 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun ensureCommentsStarted() {
-        if (!commentsLoaded && !commentsLoading && currentDetail != null) {
-            loadComments(reset = true)
+        val item = currentDetail ?: return
+        if (::commentScroll.isInitialized && item.aid > 0L) {
+            commentScroll.bindTarget(item.aid.toString(), 1, item.ownerMid)
+            commentScroll.setPageActive(activityResumed && !isFullscreen)
         }
     }
 
     private fun updateTabUI(index: Int) {
         if (currentTab == index) {
             syncTabVisuals(index)
+            if (::commentScroll.isInitialized) commentScroll.setPageActive(index == 1 && activityResumed && !isFullscreen)
             return
         }
         currentTab = index
         syncTabVisuals(index)
         if (index == 1) ensureCommentsStarted()
+        if (::commentScroll.isInitialized) commentScroll.setPageActive(index == 1 && activityResumed && !isFullscreen)
     }
 
     /** Final visual state once the pager has settled on a page. */
@@ -1715,14 +1678,6 @@ class VideoDetailActivity : Activity() {
 
     private fun lerpColor(from: Int, to: Int, t: Float): Int =
         (android.animation.ArgbEvaluator().evaluate(t.coerceIn(0f, 1f), from, to) as Int)
-
-    /** Swap comment order: 按热度 (hot) <-> 按时间 (newest), then reload from page 1. */
-    private fun toggleCommentSort() {
-        if (commentsLoading) return
-        commentSort = if (commentSort == 0) 1 else 0
-        commentHeaderBar?.applySort(commentSort)
-        loadComments(reset = true)
-    }
 
     /** Video like/unlike: optimistic UI, then real server sync when logged in. */
     private fun toggleVideoLike(btn: ActionIconView) {
@@ -2206,11 +2161,32 @@ class VideoDetailActivity : Activity() {
     }
 
     /** 切换播放模式（顺序 / 单集循环 / 随机）。 */
+    private fun currentPlayMode() = if (isLocalMode) localPlayMode else onlinePlayMode
+
+    private fun setOnlinePlayMode(mode: DownloadManager.LocalPlayMode) {
+        onlinePlayMode = mode
+        qualityPrefs.edit().putString("online_queue_mode", mode.name).apply()
+        syncPlayModeViews()
+    }
+
+    private fun syncPlayModeViews() {
+        val mode = currentPlayMode()
+        introPlayMode?.text = mode.label()
+        introPlayMode?.contentDescription = "合集播放模式：${mode.label()}"
+        drawerPlayMode?.update(mode, Color.WHITE)
+        drawerPlayModeButton?.contentDescription = "播放模式：${mode.label()}"
+        localModeIcon?.update(mode, modeTint(mode))
+        localModeLabel?.text = mode.label()
+        localModeLabel?.setTextColor(modeTint(mode))
+        localModeButton?.background = modeChipBackground(mode)
+        localModeButton?.contentDescription = "播放模式：${mode.label()}"
+    }
+
     private fun setLocalPlayMode(mode: DownloadManager.LocalPlayMode) {
         if (localPlayMode == mode) return
         localPlayMode = mode
         localPlaybackPrefs.edit().putString(KEY_LOCAL_PLAY_MODE, mode.name).apply()
-        rebuildLocalInfoArea()
+        syncPlayModeViews()
     }
 
     private fun switchLocalTask(targetId: Long) {
@@ -2220,6 +2196,7 @@ class VideoDetailActivity : Activity() {
             return
         }
         localTaskId = targetId
+        stallRetries = 0
         pendingResumePositionMs = 0L
         resumeSegmentIndex = 0
         endedState = false
@@ -2350,13 +2327,15 @@ class VideoDetailActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, 0, 0, dp(10))
         }
-        val modeIcon = Ds.playModeIcon(this@VideoDetailActivity, localPlayMode, modeTint(localPlayMode))
+        val modeIcon = PlayModeIconView(this, localPlayMode, modeTint(localPlayMode), 1.65f)
+        localModeIcon = modeIcon
         val modeLabel = TextView(this).apply {
-            text = localPlayMode.seasonLabel()
+            text = localPlayMode.label()
             textSize = 11.5f
             typeface = Ds.body(bold = true)
             setTextColor(modeTint(localPlayMode))
         }
+        localModeLabel = modeLabel
         val modeBtn = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -2366,9 +2345,12 @@ class VideoDetailActivity : Activity() {
             isClickable = true
             Ds.bindPressFeedback(this, 0.94f)
             setOnClickListener {
-                setLocalPlayMode(localPlayMode.nextSeasonMode())
+                val modes = DownloadManager.LocalPlayMode.entries
+                showAnchoredMenu(this, modes.map { it.label() }, modes.indexOf(localPlayMode)) { i -> setLocalPlayMode(modes[i]) }
             }
         }
+        localModeButton = modeBtn
+        modeBtn.contentDescription = "播放模式：${localPlayMode.label()}"
         modeBtn.addView(modeIcon, LinearLayout.LayoutParams(dp(14), dp(14)).apply { rightMargin = dp(4) })
         modeBtn.addView(modeLabel)
         controlRow.addView(modeBtn)
@@ -2521,6 +2503,7 @@ class VideoDetailActivity : Activity() {
 
     private fun localTaskSizeBytes(task: DownloadManager.Task?): Long = when {
         task == null -> 0L
+        task.destination == DownloadDestination.LIBRARY -> task.bytesTotal
         task.mpdPath.isNotBlank() && File(task.mpdPath).exists() -> {
             val dir = File(task.mpdPath).parentFile
             dir?.listFiles()?.filter {
@@ -2563,40 +2546,13 @@ class VideoDetailActivity : Activity() {
             }
         }
         val generation = beginPlaybackChange()
-        val localSources = DefaultDataSource.Factory(this)
         val mediaSources: List<MediaSource>
         try {
             segmentTimeline = PlaybackTimeline(emptyList())
-            mediaSources = when {
-                task.mpdPath.isNotBlank() && File(task.mpdPath).exists() -> {
-                    val item = MediaItem.Builder()
-                        .setUri(Uri.fromFile(File(task.mpdPath)))
-                        .setMimeType(MimeTypes.APPLICATION_MPD)
-                        .build()
-                    listOf(DashMediaSource.Factory(localSources).createMediaSource(item))
-                }
-                task.audioPath.isNotBlank() && File(task.audioPath).exists() -> {
-                    val item = MediaItem.Builder()
-                        .setUri(Uri.fromFile(File(task.audioPath)))
-                        .setMimeType(MimeTypes.APPLICATION_MP4)
-                        .build()
-                    listOf(ProgressiveMediaSource.Factory(localSources).createMediaSource(item))
-                }
-                else -> {
-                    val paths = task.singlePaths.filter { File(it).exists() }
-                    if (paths.size != task.singlePaths.size || paths.isEmpty()) {
-                        showError("本地文件缺失，请返回下载页删除该任务")
-                        return
-                    }
-                    val factory = ProgressiveMediaSource.Factory(localSources)
-                    paths.map { path ->
-                        val item = MediaItem.Builder()
-                            .setUri(Uri.fromFile(File(path)))
-                            .setMimeType(MimeTypes.APPLICATION_MP4)
-                            .build()
-                        factory.createMediaSource(item)
-                    }
-                }
+            mediaSources = task.localMediaSources(this)
+            if (mediaSources.isEmpty()) {
+                showError("本地文件缺失，请返回下载页检查")
+                return
             }
         } catch (e: Exception) {
             showError("本地播放初始化失败：${e.message ?: "未知错误"}\n\n点这里重试")
@@ -2667,7 +2623,8 @@ class VideoDetailActivity : Activity() {
             aid = aid,
             cid = cid,
             title = if (part != null && cid != item.cid) part.title else item.title,
-            duration = part?.duration?.takeIf { it > 0 } ?: item.duration
+            duration = part?.duration?.takeIf { it > 0 } ?: item.duration,
+            season = if (favoritePlayback != null) null else seasonForEpisode(cachedSeason, item.season, item.bvid, aid, cid)
         )
         currentBvid = item.bvid.ifBlank { currentBvid }
         currentAid = aid
@@ -2688,15 +2645,17 @@ class VideoDetailActivity : Activity() {
         }
         bindDanmakuForCurrentMedia()
         if (currentBvid.isBlank() || currentCid <= 0L) showError("无法获取视频信息，点这里重试")
-        renderIntroduction(selected)
-        HistoryStore.add(applicationContext, selected.bvid, selected.title, selected.owner, selected.cover)
-        if (currentTab == 1 && !commentsLoaded) loadComments(reset = true)
+        if (isFullscreen) pendingIntro = selected else renderIntroduction(selected)
+        HistoryStore.record(applicationContext, selected.copy(bvid = currentBvid))
+        if (!isFullscreen && currentTab == 1) ensureCommentsStarted()
         playingStream?.let(::showPreviewNotice)
         refreshSeasonDrawerSelection()
     }
 
     private fun selectEpisode(episode: UgcEpisode) {
         reportPlayHistory(status = 2)
+        pendingIntro = null
+        requestedQuality = loadQualityPreference()
         val sameVideo = episode.bvid.isNotBlank() && episode.bvid == currentBvid ||
             episode.aid > 0L && episode.aid == currentAid
         currentBvid = episode.bvid.ifBlank { if (sameVideo) currentBvid else "" }
@@ -2717,6 +2676,11 @@ class VideoDetailActivity : Activity() {
 
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     private fun clearPlaybackForMediaChange() {
+        stallRetries = 0
+        isSeeking = false
+        gestureSeeking = false
+        progressContainer.isDragging = false
+        progressContainer.setProgress(0L, 0L, 0L)
         playbackGeneration++
         playbackRequest?.cancel()
         playbackRequest = null
@@ -3159,12 +3123,7 @@ class VideoDetailActivity : Activity() {
         }
         if (isFinishing || isDestroyed || season.episodes.isEmpty()) return
         val episodes = season.episodes
-        val currentIndex = if (favorite != null) {
-            episodes.indexOfFirst { it.bvid == item.bvid }
-        } else {
-            episodes.indexOfFirst { item.cid > 0L && it.cid == item.cid }.takeIf { it >= 0 }
-                ?: episodes.indexOfFirst { it.cid <= 0L && it.bvid == item.bvid && it.aid == item.aid }
-        }
+        val currentIndex = episodes.playingIndex(item.bvid, item.aid, item.cid)
 
         val section = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -3202,33 +3161,8 @@ class VideoDetailActivity : Activity() {
             ellipsize = android.text.TextUtils.TruncateAt.END
             includeFontPadding = false
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        // 收藏夹播放态：四种播放模式切换（放在下方区块，不放进控制面板）
-        if (favorite != null) {
-            val modeChip = TextView(this).apply {
-                text = favoritePlayMode.label()
-                textSize = 11.5f
-                typeface = Ds.body(bold = true)
-                includeFontPadding = false
-                gravity = Gravity.CENTER_VERTICAL
-                setTextColor(COLOR_ROSE)
-                background = Ds.pill(this@VideoDetailActivity, COLOR_ROSE_SOFT)
-                setPadding(dp(9), dp(4), dp(9), dp(4))
-                isClickable = true
-                Ds.bindPressFeedback(this, 0.94f)
-                setOnClickListener {
-                    favoritePlayMode = favoritePlayMode.nextMode()
-                    text = favoritePlayMode.label()
-                    refreshSeasonDrawerSelection()
-                }
-            }
-            // chip 自带内边距，TextView.getBaseline() 已含 paddingTop，
-            // 基线对齐会自动让它内部文字与标题落在同一基线。
-            val chipLp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                rightMargin = dp(6)
-            }
-            header.addView(modeChip, chipLp)
-        }
+        introPlayMode = seasonModeChip(this, { onlinePlayMode }, ::setOnlinePlayMode)
+        header.addView(introPlayMode)
         if (currentIndex >= 0) {
             header.addView(TextView(this).apply {
                 text = "${currentIndex + 1}/${episodes.size}"
@@ -3404,37 +3338,19 @@ class VideoDetailActivity : Activity() {
 
             override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
                 super.onScrollChanged(l, t, oldl, oldt)
-                syncVisibleCards(l, width)
-            }
-
-            override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-                super.onSizeChanged(w, h, oldw, oldh)
-                syncVisibleCards(scrollX, w)
+                if (isInLayout) post { syncVisibleCards(scrollX, width) }
+                else if (width > 0) syncVisibleCards(l, width)
             }
         }.apply {
             isHorizontalScrollBarEnabled = false
             overScrollMode = View.OVER_SCROLL_NEVER
-            addView(strip, FrameLayout.LayoutParams(totalStripW, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
-                minimumHeight = cardHeightEstimate
-            })
+            strip.minimumHeight = cardHeightEstimate
+            addView(strip, FrameLayout.LayoutParams(totalStripW, FrameLayout.LayoutParams.WRAP_CONTENT))
         }
         section.addView(hScroll, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
-        val initialScroll = if (currentIndex > 0) {
-            val estWidth = (resources.displayMetrics.widthPixels - dp(32)).coerceAtLeast(cardW)
-            (currentIndex * stepPx - (estWidth - cardW) / 2).coerceIn(0, (totalStripW - estWidth).coerceAtLeast(0))
-        } else 0
-        syncVisibleCards(initialScroll, resources.displayMetrics.widthPixels)
-
-        if (currentIndex > 0) {
-            hScroll.post {
-                val scrollTarget = (currentIndex * stepPx - (hScroll.width - cardW) / 2)
-                    .coerceIn(0, (totalStripW - hScroll.width).coerceAtLeast(0))
-                hScroll.scrollTo(scrollTarget, 0)
-                syncVisibleCards(scrollTarget, hScroll.width)
-            }
-        }
+        hScroll.bindEpisodeViewport(currentIndex, stepPx, cardW, totalStripW, ::syncVisibleCards)
     }
 
     /** 底部半屏全集选择清单（点击头部「全部 ›」呼出）。 */
@@ -3757,158 +3673,7 @@ class VideoDetailActivity : Activity() {
     // ─────────────────────────────────────────────────
 
     private fun resetComments() {
-        commentGeneration++
-        commentPrefetchHandle?.cancel()
-        commentPrefetchHandle = null
-        commentsLoading = false
-        commentsLoaded = false
-        commentHasMore = false
-        commentLoginHintShown = false
-        seenCommentRpids.clear()
-        commentContent.removeAllViews()
-        commentContent.addView(commentState)
-        commentState.text = "正在加载评论…"
-        commentState.visibility = View.VISIBLE
-        commentState.setOnClickListener(null)
-        commentMore.visibility = View.GONE
-        commentScroll.scrollTo(0, 0)
-    }
-
-    private fun loadComments(reset: Boolean) {
-        val item = currentDetail ?: return
-        if (item.aid <= 0L) {
-            commentState.text = "暂无评论"
-            commentMore.visibility = View.GONE
-            return
-        }
-        if (commentsLoading) return
-        commentsLoading = true
-        if (reset) {
-            commentCursor = 1
-            commentsLoaded = false
-            commentHasMore = false
-            seenCommentRpids.clear()
-            commentContent.removeAllViews()
-            commentContent.addView(commentState, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            commentState.text = "正在加载评论…"
-            commentState.visibility = View.VISIBLE
-            commentMore.visibility = View.GONE
-        } else {
-            commentMore.text = "正在加载更多…"
-        }
-        val generation = commentGeneration
-        BiliApi.fetchComments(item.aid, commentCursor, commentSort) { list, next, error ->
-            if (isFinishing || isDestroyed || generation != commentGeneration) return@fetchComments
-            commentsLoading = false
-            commentState.visibility = View.GONE
-            if (error != null) {
-                if (!commentsLoaded) {
-                    if (commentState.parent == null) commentContent.addView(commentState, 0)
-                    commentState.text = "评论加载失败：$error\n\n点这里重试"
-                    commentState.visibility = View.VISIBLE
-                    commentState.isClickable = true
-                    commentState.setOnClickListener { loadComments(reset = true) }
-                } else {
-                    commentMore.text = "加载失败，点这里重试"
-                    commentMore.isClickable = true
-                }
-                return@fetchComments
-            }
-            commentsLoaded = true
-            commentHasMore = next >= 0
-            if (reset) commentContent.removeAllViews()
-            // Deduplicate by rpid: even if the cursor were ever wrong, already
-            // rendered comments are never appended a second time.
-            val fresh = list.filter { seenCommentRpids.add(it.id) }
-            if (reset && fresh.isNotEmpty()) {
-                commentPrefetchHandle?.cancel()
-                commentPrefetchHandle = CommentSectionUi.prefetchCommentTopMedia(this, fresh)
-            }
-            fresh.forEachIndexed { index, comment ->
-                if (index > 0 || !reset) {
-                    commentContent.addView(CommentSectionUi.buildCommentDivider(this))
-                }
-                commentContent.addView(buildCommentRow(comment))
-            }
-            commentCursor = next
-            if (commentHasMore) {
-                if (commentMore.parent == null) commentContent.addView(commentMore)
-                if (reset) {
-                    // First load: show the affordance once; later pages load
-                    // automatically on scroll and the hint stays hidden.
-                    commentMore.text = "上滑加载更多"
-                    commentMore.visibility = View.VISIBLE
-                } else {
-                    commentMore.visibility = View.GONE
-                }
-            } else {
-                commentMore.visibility = View.GONE
-                if (list.isEmpty() && commentContent.childCount == 0) {
-                    if (commentState.parent == null) commentContent.addView(commentState)
-                    commentState.text = "暂无评论"
-                    commentState.visibility = View.VISIBLE
-                } else if (!BiliSessionStore.isLoggedIn() && !commentLoginHintShown) {
-                    // Bilibili now caps anonymous comment lists at 3 hot replies; guide login.
-                    commentLoginHintShown = true
-                    val hint = TextView(this).apply {
-                        text = "仅展示热门评论，登录后可查看全部回复 →"
-                        textSize = 12f; setTextColor(COLOR_ROSE)
-                        gravity = Gravity.CENTER
-                        setPadding(0, dp(14), 0, dp(14))
-                        isClickable = true
-                        setOnClickListener {
-                            startActivity(Intent(this@VideoDetailActivity, MainActivity::class.java).apply {
-                                flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                                putExtra(EXTRA_SWITCH_TO_ACCOUNT, true)
-                            })
-                        }
-                    }
-                    commentContent.addView(hint, LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-                }
-            }
-        }
-    }
-
-    /** Auto-paging: when the user scrolls near the bottom, load the next page. */
-    private fun maybeLoadMoreComments() {
-        if (!commentsLoaded || commentsLoading || !commentHasMore) return
-        loadComments(reset = false)
-    }
-
-    private fun buildCommentRow(comment: VideoComment): View =
-        CommentSectionUi.buildUnifiedCommentItem(
-            activity = this,
-            comment = comment,
-            ownerMid = currentDetail?.ownerMid ?: 0L,
-            targetOid = (currentDetail?.aid ?: 0L).toString(),
-            commentType = 1,
-            isSheet = false,
-            showRootTag = false,
-            onOpenReplySheet = { root -> showReplySheet(root) },
-            onFeedback = { msg -> showSnackbar(msg) }
-        )
-
-    private fun showReplySheet(root: VideoComment) {
-        val aid = currentDetail?.aid ?: 0L
-        if (root.id <= 0L || aid <= 0L) return
-        CommentSectionUi.ReplySheetDialog(
-            activity = this,
-            root = root,
-            targetOid = aid.toString(),
-            commentType = 1,
-            ownerMid = currentDetail?.ownerMid ?: 0L,
-            anchorTopProvider = {
-                val anchor = infoTabBarAnchor
-                if (anchor == null) dp(64) else {
-                    val pos = IntArray(2)
-                    anchor.getLocationOnScreen(pos)
-                    pos[1] + anchor.height
-                }
-            },
-            onFeedback = { msg -> showSnackbar(msg) }
-        ).show()
+        if (::commentScroll.isInitialized) commentScroll.bindTarget("", 1, 0L)
     }
 
     private fun loadPlayer(quality: Int = effectiveQuality(), bypassCache: Boolean = false) {
@@ -3955,7 +3720,7 @@ class VideoDetailActivity : Activity() {
                 streamLoadedAt = SystemClock.elapsedRealtime()
                 val selected = selectStableStream(stream, quality)
                 val targetId = selected.videoTracks.firstOrNull()?.id ?: selected.actualQuality
-                if (stream.isDash && quality > BiliPlayUrl.QUALITY_720 && targetId < quality &&
+                if (requestedQuality != PreferredVideoQuality.HIGHEST && stream.isDash && quality > BiliPlayUrl.QUALITY_720 && targetId < quality &&
                     quality in stream.acceptedQualities
                 ) {
                     val hint = if (quality >= BiliPlayUrl.QUALITY_1080_PLUS && !BiliSessionStore.isBigVip()) {
@@ -3972,6 +3737,7 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun beginPlaybackChange(): Int {
+        clearPlayerFeedback()
         val generation = ++playbackGeneration
         playbackRequest?.cancel()
         playbackRequest = null
@@ -3996,16 +3762,21 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun stopPlayerSource() {
+        playerHost.keepScreenOn = false
+        handler.removeCallbacks(stallWatchdog)
+        stallMonitor.reset()
         handler.removeCallbacks(progressUpdater)
         handler.removeCallbacks(historyTick)
+        val listener = playerListener
+        playerListener = null
         cancelLongPressBoost()
+        danmakuController?.freezeClock()
         exoPlayer?.let { player ->
-            playerListener?.let(player::removeListener)
+            listener?.let(player::removeListener)
             player.pause()
             player.stop()
             player.clearMediaItems()
         }
-        playerListener = null
     }
 
     private fun canUsePlayback(generation: Int): Boolean =
@@ -4035,7 +3806,8 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun selectStableStream(stream: BiliPlayUrl.DashStream, effective: Int): BiliPlayUrl.DashStream {
-        val selected = BiliPlayUrl.selectDashStreamTrack(stream, effective, failedCodecTracks)
+        val selected = BiliPlayUrl.selectDashStreamTrack(stream,
+            PreferredVideoQuality.selectionQuality(requestedQuality, effective), failedCodecTracks)
         val video = selected.videoTracks.firstOrNull()
         val audio = selected.audioTracks.firstOrNull()
         if (video != null) {
@@ -4051,12 +3823,19 @@ class VideoDetailActivity : Activity() {
     private fun bindPlayerSource(sources: List<MediaSource>, generation: Int) {
         if (!canUsePlayback(generation)) return
         val player = exoPlayer ?: createPlayer().also { exoPlayer = it }
+        playbackDiagnostics.bind(if (isLocalMode) null else playingStream)
         playerListener?.let(player::removeListener)
         endedState = restoreEndedState
         playPauseBtn.setEnded(endedState)
         showReplay(endedState)
         playerView.player = player
         playerView.setKeepContentOnPlayerReset(true)
+        initialHistoryMedia?.let { media ->
+            val duration = segmentTimeline.durationMs.takeIf { it > 0L } ?: playingStream?.durationMs ?: 0L
+            pendingResumePositionMs = checkedHistoryStart(media, HistoryMediaId(currentBvid, currentAid, currentCid),
+                pendingResumePositionMs, duration, sources.size == 1 || segmentTimeline.durationMs > 0L)
+            initialHistoryMedia = null
+        }
         val resume = if (segmentTimeline.durationMs > 0L) {
             segmentTimeline.locate(pendingResumePositionMs)
         } else {
@@ -4082,32 +3861,18 @@ class VideoDetailActivity : Activity() {
                     }
                     Player.STATE_BUFFERING -> if (!isSeeking) {
                         playerSpinner.visibility = View.VISIBLE
-                        handler.removeCallbacks(stallWatchdog)
-                        handler.postDelayed(stallWatchdog, STALL_TIMEOUT_MS)
                     }
                     Player.STATE_ENDED -> {
+                        reportPlayHistory(status = 2)
                         playerSpinner.visibility = View.GONE
                         cancelLongPressBoost()
-                        // 收藏夹播放态：按收藏夹队列与模式连播
-                        favoritePlayback?.let { fav ->
-                            val next = resolveNextSeasonTarget()
-                            if (next is NextSeasonTarget.Online) {
-                                if (next.episode.bvid == currentBvid && next.episode.cid == currentCid) {
-                                    // 单集循环：从头重播
-                                    exoPlayer?.seekTo(0L)
-                                    exoPlayer?.playWhenReady = true
-                                } else {
-                                    selectEpisode(next.episode)
-                                }
+                        if (!isLocalMode && userWantsPlayback && activityResumed) {
+                            val episodes = favoritePlayback?.entries ?: cachedSeason?.episodes.orEmpty()
+                            val idx = episodes.playingIndex(currentBvid, currentAid, currentCid)
+                            nextEpisodeIndex(episodes.size, idx, onlinePlayMode, automatic = true)?.let { next ->
+                                if (next == idx) replay() else selectEpisode(episodes[next])
                                 return
                             }
-                            // 顺序播放到底 / 收藏夹仅一条：停在结束态
-                            endedState = true
-                            playPauseBtn.setEnded(true)
-                            playPauseBtn.setPlaying(false)
-                            showReplay(true)
-                            showControls()
-                            return
                         }
                         if (isLocalMode) {
                             val nextId = DownloadManager.resolveNextPlayableTaskId(
@@ -4116,8 +3881,7 @@ class VideoDetailActivity : Activity() {
                             if (nextId != null) {
                                 if (nextId == localTaskId) {
                                     // 单集循环（或仅一集的列表循环）：直接从头重播
-                                    exoPlayer?.seekTo(0L)
-                                    exoPlayer?.playWhenReady = true
+                                    replay()
                                     return
                                 } else {
                                     switchLocalTask(nextId)
@@ -4133,6 +3897,10 @@ class VideoDetailActivity : Activity() {
                     }
                 }
                 updatePlaybackProgress()
+            }
+
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                if (canUsePlayback(generation) && player === exoPlayer) updatePlaybackProgress()
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -4215,25 +3983,23 @@ class VideoDetailActivity : Activity() {
         }.build()
         return ExoPlayer.Builder(this, DefaultRenderersFactory(this).setEnableDecoderFallback(true))
             .setLoadControl(loadControl)
-            .build()
+            .build().also { it.addAnalyticsListener(playbackDiagnostics) }
     }
 
     /**
      * Quality the user is allowed to play right now. Guests are capped at
      * 480p (720p and above require login, 1080p+ requires a big member).
      */
-    private fun effectiveQuality(): Int {
-        if (BiliSessionStore.isLoggedIn()) return requestedQuality
-        return minOf(requestedQuality, BiliPlayUrl.QUALITY_480)
-    }
+    private fun effectiveQuality(): Int =
+        PreferredVideoQuality.requestQuality(requestedQuality, BiliSessionStore.isLoggedIn())
 
     private fun switchQuality(quality: Int) {
+        requestedQuality = quality
+        PreferredVideoQuality.onManualSelection(this, quality)
         if (quality == playingStream?.actualQuality && playerListener != null &&
             playerError.visibility != View.VISIBLE && streamSession == BiliSessionStore.cookie() &&
             playbackRequest == null && !retryScheduled
         ) return
-        requestedQuality = quality
-        saveQualityPreference(quality)
         playRetryCount = 0
         lastPlaybackError = null
         val effective = effectiveQuality()
@@ -4248,16 +4014,7 @@ class VideoDetailActivity : Activity() {
         }
     }
 
-    private fun loadQualityPreference(): Int {
-        val stored = qualityPrefs.getInt(KEY_LAST_QUALITY, 0)
-        return if (stored in SUPPORTED_QUALITIES) stored else BiliPlayUrl.QUALITY_720
-    }
-
-    private fun saveQualityPreference(quality: Int) {
-        if (quality in SUPPORTED_QUALITIES) {
-            qualityPrefs.edit().putInt(KEY_LAST_QUALITY, quality).apply()
-        }
-    }
+    private fun loadQualityPreference(): Int = PreferredVideoQuality.initial(this)
 
     private fun recoverPlayback(
         stream: BiliPlayUrl.DashStream,
@@ -4441,6 +4198,9 @@ class VideoDetailActivity : Activity() {
             ?: playingStream?.durationMs ?: 0L
 
     private fun seekPlayerGlobal(player: ExoPlayer, positionMs: Long) {
+        stallMonitor.reset()
+        handler.removeCallbacks(stallWatchdog)
+        if (endedState && positionMs < playerGlobalDuration(player)) clearEndedState()
         if (segmentTimeline.durationMs == 0L) {
             player.seekTo(positionMs.coerceAtLeast(0L))
         } else {
@@ -4487,7 +4247,18 @@ class VideoDetailActivity : Activity() {
     private fun updatePlaybackProgress() {
         handler.removeCallbacks(progressUpdater)
         val player = exoPlayer ?: return
+        playerHost.keepScreenOn = activityResumed && playerListener != null && player.playWhenReady &&
+            (player.playbackState == Player.STATE_READY || player.playbackState == Player.STATE_BUFFERING)
         if (!activityResumed || playerListener == null) return
+        playbackDiagnostics.sample(player)
+        if (player.playbackState == Player.STATE_BUFFERING && player.playWhenReady && userWantsPlayback && !isSeeking && !retryScheduled) {
+            val newlyBuffering = !stallMonitor.started
+            stallMonitor.observe(SystemClock.elapsedRealtime(), playerGlobalBufferedPosition(player))
+            if (newlyBuffering) handler.postDelayed(stallWatchdog, STALL_TIMEOUT_MS)
+        } else {
+            stallMonitor.reset()
+            handler.removeCallbacks(stallWatchdog)
+        }
         val duration = playerGlobalDuration(player)
         val position = playerGlobalPosition(player)
         val speed = player.playbackParameters.speed.takeIf { it > 0f } ?: 1f
@@ -4498,7 +4269,7 @@ class VideoDetailActivity : Activity() {
             speed = speed
         )
         if (duration > 0L && !isSeeking) {
-            progressContainer.updateFromPlayer()
+            progressContainer.setProgress(position, playerGlobalBufferedPosition(player), duration)
             if (position / 1000L != lastPositionSecond) {
                 lastPositionSecond = position / 1000L
                 timeText.text = formatTime(position)
@@ -4518,7 +4289,6 @@ class VideoDetailActivity : Activity() {
         lastPositionSecond = pos / 1000L
         timeText.text = formatTime(pos)
         progressContainer.seekToFraction(pos.toFloat() / dur.toFloat())
-        if (endedState && pos < dur - 1500) clearEndedState()
     }
 
     private fun clearEndedState() {
@@ -4583,7 +4353,7 @@ class VideoDetailActivity : Activity() {
 
     private fun applyLongPressBoost() {
         val p = exoPlayer ?: return
-        if (!longPressDown || endedState || !p.isPlaying) return
+        if (!longPressDown || !longPressCandidate || endedState || !p.isPlaying) return
         longPressBoost = true
         normalSpeed = p.playbackParameters.speed.let { if (it > 0f) it else 1f }
         p.playbackParameters = PlaybackParameters(2.0f)
@@ -4631,8 +4401,17 @@ class VideoDetailActivity : Activity() {
         boostIndicator.scaleY = 1f
     }
 
+    private fun positionSeekHint() {
+        if (!::playerSeekHint.isInitialized) return
+        val lp = playerSeekHint.layoutParams as FrameLayout.LayoutParams
+        val progressLayout = progressRow.layoutParams as FrameLayout.LayoutParams
+        val bottom = progressLayout.bottomMargin + progressLayout.height + dp(6)
+        if (lp.bottomMargin != bottom) { lp.bottomMargin = bottom; playerSeekHint.layoutParams = lp }
+    }
+
     private fun showSeekHint(posMs: Long, durMs: Long) {
         if (!::playerSeekHint.isInitialized) return
+        positionSeekHint()
         playerSeekHint.text = "${formatTime(posMs)}  /  ${formatTime(durMs)}"
         playerSeekHint.animate().cancel()
         if (playerSeekHint.visibility != View.VISIBLE) {
@@ -4653,38 +4432,50 @@ class VideoDetailActivity : Activity() {
         }
     }
 
-    private fun showSpeedToast(text: String) {
-        val toast = TextView(this).apply {
-            this.text = text
-            textSize = 14.5f
-            setTextColor(Color.WHITE)
-            typeface = Ds.display(bold = true)
-            gravity = Gravity.CENTER
-            background = Ds.pill(this@VideoDetailActivity, 0xCC14161B.toInt(), 0x33FFFFFF)
-            setPadding(dp(18), dp(7), dp(18), dp(7))
-        }
-        val overlay = FrameLayout(this).apply {
-            isClickable = false
-            addView(toast, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
-        }
-        playerHost.addView(overlay, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        toast.alpha = 0f
-        toast.animate().alpha(1f).setDuration(120).start()
-        overlay.postDelayed({
-            toast.animate().alpha(0f).setDuration(160)
-                .withEndAction { playerHost.removeView(overlay) }.start()
-        }, 650)
+    private fun showSkipHint(text: String) {
+        handler.removeCallbacks(hideSkipHint)
+        playerSkipHint.text = text
+        playerSkipHint.visibility = View.VISIBLE
+        handler.postDelayed(hideSkipHint, 800L)
     }
 
-    private fun cycleSpeed() {
-        speedIndex = (speedIndex + 1) % speeds.size
-        val speed = speeds[speedIndex]
-        exoPlayer?.playbackParameters = PlaybackParameters(speed)
-        speedBtn.text = "${speed}x"
+    private fun clearPlayerFeedback() {
+        speedPopup?.dismiss()
+        speedPopup = null
+        handler.removeCallbacks(hideSkipHint)
+        hideSkipHint.run()
+        if (::playerSeekHint.isInitialized) {
+            playerSeekHint.animate().cancel()
+            playerSeekHint.visibility = View.GONE
+        }
+    }
+
+    private fun skipByDoubleTap(delta: Long) {
+        val p = exoPlayer ?: return
+        val duration = playerGlobalDuration(p)
+        if (duration <= 0 || playerListener == null || !p.isCurrentMediaItemSeekable) return
+        val target = (playerGlobalPosition(p) + delta).coerceIn(0L, duration)
+        seekPlayerGlobal(p, target)
+        danmakuController?.onSeeked(target)
+        onManualSeek(target, duration)
         updatePlaybackProgress()
-        showSpeedToast("${speed}x")
+        showSkipHint(if (delta < 0L) "后退 10 秒" else "前进 10 秒")
+    }
+
+    private fun showSpeedMenu() {
+        speedPopup?.dismiss()
+        controlsHideRunnable?.let(handler::removeCallbacks)
+        speedPopup = showPlayerSpeedMenu(speedBtn, playerHost, speeds, speedIndex, onDismiss = {
+            speedPopup = null
+            if (activityResumed && exoPlayer?.isPlaying == true) scheduleAutoHide()
+        }) { index ->
+            cancelLongPressBoost()
+            speedIndex = index
+            val speed = speeds[index]
+            exoPlayer?.playbackParameters = PlaybackParameters(speed)
+            speedBtn.text = "${speed}x"
+            updatePlaybackProgress()
+        }
     }
 
     private fun showQualityMenu(anchor: View) {
@@ -4693,7 +4484,7 @@ class VideoDetailActivity : Activity() {
             .distinct().sortedDescending()
         if (qualities.isEmpty()) return
         val loggedIn = BiliSessionStore.isLoggedIn()
-        val playingId = playingStream?.actualQuality ?: requestedQuality
+        val playingId = playingStream?.actualQuality ?: effectiveQuality()
         val availableIds = stream.videoTracks.map { it.id }.toSet()
 
         val menu = LinearLayout(this).apply {
@@ -4818,32 +4609,29 @@ class VideoDetailActivity : Activity() {
 
     private fun scheduleAutoHide() {
         controlsHideRunnable?.let { handler.removeCallbacks(it) }
-        controlsHideRunnable = Runnable { if (exoPlayer?.isPlaying == true) hideControls() }
+        controlsHideRunnable = Runnable { if (exoPlayer?.isPlaying == true && speedPopup?.isShowing != true) hideControls() }
         handler.postDelayed(controlsHideRunnable!!, 3500)
     }
 
     // ─────────────────────────────────────────────────
-    //  Fullscreen: re-parent into a dedicated overlay container.
-    //  Landscape videos rotate to landscape; portrait videos stay portrait.
+    //  全屏仅改变布局，保留视频表面和弹幕层的窗口绑定。
     // ─────────────────────────────────────────────────
 
-    private fun isPortraitVideo(): Boolean {
-        val track = playingStream?.videoTracks?.firstOrNull() ?: return false
-        return track.width > 0 && track.height > 0 && track.height > track.width
-    }
-
     private fun toggleFullscreen() {
-        if (!::fullscreenContainer.isInitialized || !::playerHost.isInitialized) return
+        if (!::infoArea.isInitialized || !::playerHost.isInitialized) return
         if (fsTransitioning) return
+        clearPlayerFeedback()
         isFullscreen = !isFullscreen
         fsBtn.setFullscreen(isFullscreen)
-        if (::danmakuView.isInitialized) danmakuView.setFullscreenMode(isFullscreen)
+        if (isFullscreen) danmakuView.setFullscreenMode(true)
         if (!isFullscreen) {
             closeSeasonDrawer(immediate = true)
             danmakuSettingsDrawer?.close(immediate = true)
         }
         controlsHideRunnable?.let { handler.removeCallbacks(it) }
-        if (isFullscreen) enterFullscreen() else exitFullscreen()
+        if (isFullscreen) enterFullscreen() else movePlayerBackToPage()
+        if (::commentScroll.isInitialized) commentScroll.setPageActive(activityResumed && !isFullscreen && currentTab == 1)
+        if (!isFullscreen && currentTab == 1) ensureCommentsStarted()
     }
 
     private fun isTabletSplitActive(): Boolean =
@@ -4868,7 +4656,7 @@ class VideoDetailActivity : Activity() {
         } else {
             page.orientation = LinearLayout.VERTICAL
             val raw16x9 = dm.widthPixels * 9 / 16
-            val playerHeight = if (LayoutMode.isTablet) {
+            val playerHeight = if (LayoutMode.isTablet || dm.widthPixels > dm.heightPixels) {
                 minOf(raw16x9, (dm.heightPixels * 0.45f).toInt())
             } else {
                 raw16x9
@@ -4883,41 +4671,28 @@ class VideoDetailActivity : Activity() {
 
     private fun enterFullscreen() {
         fsTransitioning = true
-        (playerHost.parent as? ViewGroup)?.removeView(playerHost)
-        fullscreenContainer.removeAllViews()
-        fullscreenContainer.addView(playerHost, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        fullscreenContainer.visibility = View.VISIBLE
-        page.visibility = View.GONE
+        LayoutMode.applyScreenOrientation(this, fullscreen = true)
+        infoArea.visibility = View.GONE
+        tabletSplitDivider?.visibility = View.GONE
+        playerHost.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT)
         hideSystemBars()
         adjustIndicator.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
-        if (!LayoutMode.isTablet && !isPortraitVideo() &&
-            resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) {
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-        }
         applyControlSizing()
         showControls()
         fsTransitioning = false
     }
 
-    private fun exitFullscreen() {
-        if (LayoutMode.isTablet || resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT) {
-            movePlayerBackToPage()
-        } else {
-            exitingFullscreen = true
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
-    }
-
     private fun movePlayerBackToPage() {
-        exitingFullscreen = false
         fsTransitioning = true
+        LayoutMode.applyScreenOrientation(this)
         showSystemBars()
-        fullscreenContainer.removeView(playerHost)
-        fullscreenContainer.visibility = View.GONE
-        page.addView(playerHost, 0)
+        infoArea.visibility = View.VISIBLE
         applyPageSplitLayout()
-        page.visibility = View.VISIBLE
+        pendingIntro?.let { item ->
+            pendingIntro = null
+            renderIntroduction(item)
+            if (currentTab == 1) ensureCommentsStarted()
+        }
         adjustIndicator.animate().scaleX(COMPACT_ADJUST_SCALE).scaleY(COMPACT_ADJUST_SCALE)
             .setDuration(200).start()
         applyControlSizing()
@@ -4983,19 +4758,19 @@ class VideoDetailActivity : Activity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        if (exitingFullscreen && newConfig.orientation == Configuration.ORIENTATION_PORTRAIT) {
-            handler.post { if (exitingFullscreen) movePlayerBackToPage() }
-        } else if (LayoutMode.isTablet && !isFullscreen) {
-            handler.post {
-                applyPageSplitLayout()
-                applyControlSizing()
-            }
+        speedPopup?.dismiss()
+        drawerModePopup?.dismiss()
+        if (!::activityRoot.isInitialized) return
+        activityRoot.post {
+            if (!isFullscreen) applyPageSplitLayout()
+            applyControlSizing()
         }
         updateFullscreenStatusVisibility()
     }
 
     private fun retryPlayer() {
-        exoPlayer?.let { pendingResumePositionMs = playerGlobalPosition(it) }
+        rememberPlaybackPosition()
+        stallRetries = 0
         playRetryCount = 0
         retryScheduled = false
         userWantsPlayback = true
@@ -5342,78 +5117,6 @@ class VideoDetailActivity : Activity() {
         }
     }
 
-    /** Custom drawn seek bar with rounded track and thumb */
-    private inner class SeekBarView(context: Context) : FrameLayout(context) {
-        init { setWillNotDraw(false) }
-
-        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0x40FFFFFF.toInt(); style = Paint.Style.FILL
-        }
-        // Buffered (prefetched) segment: white, drawn between played and unplayed.
-        private val bufferedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xB3FFFFFF.toInt(); style = Paint.Style.FILL
-        }
-        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Ds.colors.accent; style = Paint.Style.FILL
-        }
-        private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Ds.colors.accent; style = Paint.Style.FILL
-        }
-        private val thumbBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = dpf(2f)
-        }
-        var fillWidth = 0f
-            private set
-        var bufferedWidth = 0f
-            private set
-        var isDragging = false
-        private val barRect = RectF()
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            val h = height.toFloat()
-            val trackH = dpf(4f)
-            val trackY = (h - trackH) / 2f
-            val r = trackH / 2f
-
-            barRect.set(0f, trackY, width.toFloat(), trackY + trackH)
-            canvas.drawRoundRect(barRect, r, r, trackPaint)
-            val fw = fillWidth.coerceAtLeast(0f)
-            val bw = bufferedWidth.coerceAtLeast(fw)
-            if (bw > 0) {
-                barRect.set(fw, trackY, bw, trackY + trackH)
-                canvas.drawRoundRect(barRect, r, r, bufferedPaint)
-            }
-            if (fw > 0) {
-                barRect.set(0f, trackY, fw, trackY + trackH)
-                canvas.drawRoundRect(barRect, r, r, fillPaint)
-            }
-            val thumbR = dpf(5f)
-            val thumbX = fw.coerceIn(thumbR, width.toFloat() - thumbR)
-            canvas.drawCircle(thumbX, h / 2f, thumbR, thumbPaint)
-            canvas.drawCircle(thumbX, h / 2f, thumbR, thumbBorderPaint)
-        }
-
-        fun seekToFraction(fraction: Float) {
-            fillWidth = (fraction * width).coerceIn(0f, width.toFloat())
-            invalidate()
-        }
-
-        fun updateFromPlayer() {
-            val p = exoPlayer ?: return
-            val duration = playerGlobalDuration(p)
-            if (duration > 0L && width > 0 && !isDragging) {
-                val fill = (playerGlobalPosition(p).toFloat() / duration.toFloat()).coerceIn(0f, 1f) * width
-                val buffered = (playerGlobalBufferedPosition(p).toFloat() / duration.toFloat()).coerceIn(0f, 1f) * width
-                if (abs(fill - fillWidth) >= 0.5f || abs(buffered - bufferedWidth) >= 0.5f) {
-                    fillWidth = fill
-                    bufferedWidth = buffered
-                    invalidate()
-                }
-            }
-        }
-    }
-
     private inner /**
          * Circular avatar. Never draws a square background — that was the
          * "square shadow border" around comment avatars (COLOR_COVER square bg
@@ -5492,8 +5195,20 @@ class VideoDetailActivity : Activity() {
 
     private inner class PlayerGestureView(context: Context) : View(context) {
         init { isClickable = true }
+        private var touchGeneration = -1
 
         override fun onTouchEvent(ev: MotionEvent): Boolean {
+            if (ev.actionMasked == MotionEvent.ACTION_DOWN) touchGeneration = playbackGeneration
+            else if (ev.pointerCount > 1 || touchGeneration != playbackGeneration) {
+                if (touchGeneration != -1) {
+                    cancelTapDetector(gestureDetector, ev)
+                    cancelLongPressBoost()
+                    if (gestureSeeking) { gestureSeeking = false; isSeeking = false; hideSeekHint(); updatePlaybackProgress() }
+                    if (adjustMode != 0) { adjustMode = 0; hideAdjust() }
+                }
+                touchGeneration = -1
+                return true
+            }
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     gestureStartX = ev.x
@@ -5518,11 +5233,8 @@ class VideoDetailActivity : Activity() {
                         handler.removeCallbacks(longPressBoostRunnable)
                     }
                     if (gestureSeeking) {
-                        val p = exoPlayer ?: return true
                         val duration = gestureSeekDuration
-                        if (duration <= 0L) return true
-                        val seekDelta = ((dx / width.toFloat().coerceAtLeast(1f)) * duration * 0.65f).toLong()
-                        val newPos = (gestureSeekStartPos + seekDelta).coerceIn(0L, duration)
+                        val newPos = PlayerSeekPolicy.swipePosition(gestureSeekStartPos, duration, dx, width, dpf(20f))
                         gestureSeekTargetPos = newPos
                         onManualSeek(newPos, duration)
                         showSeekHint(newPos, duration)
@@ -5535,11 +5247,13 @@ class VideoDetailActivity : Activity() {
                             val p = exoPlayer
                             val dur = if (p != null) playerGlobalDuration(p) else 0L
                             if (p != null && dur > 0L) {
+                                cancelTapDetector(gestureDetector, ev)
                                 gestureSeeking = true
                                 isSeeking = true
                                 gestureSeekDuration = dur
                                 gestureSeekStartPos = playerGlobalPosition(p)
-                                gestureSeekTargetPos = gestureSeekStartPos
+                                gestureSeekTargetPos = PlayerSeekPolicy.swipePosition(gestureSeekStartPos, dur, dx, width, dpf(20f))
+                                showSeekHint(gestureSeekTargetPos, dur)
                                 gestureSeekWasPlaying = p.playWhenReady && userWantsPlayback
                                 controlsHideRunnable?.let(handler::removeCallbacks)
                             }
@@ -5550,6 +5264,7 @@ class VideoDetailActivity : Activity() {
                                 else -> 0
                             }
                             if (zone != 0) {
+                                cancelTapDetector(gestureDetector, ev)
                                 adjustMode = zone
                                 adjustStartValue = if (zone == 1) {
                                     val b = window.attributes.screenBrightness
@@ -5566,7 +5281,7 @@ class VideoDetailActivity : Activity() {
                     return true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    val boosted = longPressBoost
+                    val claimed = longPressBoost || gestureSeeking || adjustMode != 0
                     cancelLongPressBoost()
                     if (adjustMode != 0) {
                         adjustMode = 0
@@ -5583,15 +5298,10 @@ class VideoDetailActivity : Activity() {
                         }
                         isSeeking = false
                         hideSeekHint()
+                        updatePlaybackProgress()
                         if (p?.isPlaying == true || gestureSeekWasPlaying) scheduleAutoHide()
-                    } else if (boosted) {
-                        // A boost release must not also toggle the controls: feed a synthetic
-                        // CANCEL to the detector so it skips single-tap confirmation.
-                        val synthetic = MotionEvent.obtain(ev)
-                        synthetic.action = MotionEvent.ACTION_CANCEL
-                        gestureDetector.onTouchEvent(synthetic)
-                        synthetic.recycle()
-                    } else {
+                    }
+                    if (claimed) cancelTapDetector(gestureDetector, ev) else {
                         gestureDetector.onTouchEvent(ev)
                     }
                     gestureSeeking = false
@@ -5977,7 +5687,7 @@ class VideoDetailActivity : Activity() {
             aid = currentAid,
             referer = referer,
             durationMs = durationMs,
-            isLocalMode = false
+            startPositionMs = pendingResumePositionMs
         )
     }
 
@@ -6037,7 +5747,8 @@ class VideoDetailActivity : Activity() {
                         startExoPlayer(cached, beginPlaybackChange())
                     } else {
                         playRetryCount = 0
-                        loadPlayer(bypassCache = sessionChanged)
+                        loadPlayer(PreferredVideoQuality.resumeRequestQuality(requestedQuality, lastRequestedQuality,
+                            BiliSessionStore.isLoggedIn(), sessionChanged), bypassCache = sessionChanged)
                     }
                 }
             }
@@ -6055,15 +5766,18 @@ class VideoDetailActivity : Activity() {
         refreshBatteryState()
         if (userWantsPlayback && !endedState && playerListener != null) exoPlayer?.play()
         updatePlaybackProgress()
-        if (commentsLoaded && commentLoginHintShown && BiliSessionStore.isLoggedIn()) {
-            commentLoginHintShown = false
-            loadComments(reset = true)
-        }
+        if (::commentScroll.isInitialized) commentScroll.setPageActive(currentTab == 1 && !isFullscreen)
+        if (currentTab == 1 && !isFullscreen) ensureCommentsStarted()
     }
 
     override fun onPause() {
         reportPlayHistory(status = 2)
         activityResumed = false
+        if (::commentScroll.isInitialized) commentScroll.setPageActive(false)
+        handler.removeCallbacks(stallWatchdog)
+        stallMonitor.reset()
+        clearPlayerFeedback()
+        if (::playerHost.isInitialized) playerHost.keepScreenOn = false
         handler.removeCallbacks(historyTick)
         handler.removeCallbacks(progressUpdater)
         controlsHideRunnable?.let(handler::removeCallbacks)
@@ -6072,7 +5786,7 @@ class VideoDetailActivity : Activity() {
         closeSeasonDrawer(immediate = true)
         danmakuSettingsDrawer?.close(immediate = true)
         exoPlayer?.pause()
-        danmakuView.setPlaying(false)
+        danmakuController?.freezeClock()
         super.onPause()
     }
 
@@ -6108,12 +5822,19 @@ class VideoDetailActivity : Activity() {
         super.onStop()
     }
 
+    override fun onRetainNonConfigurationInstance(): Any? =
+        if (::commentScroll.isInitialized) commentScroll.retainState() else null
+
     override fun onSaveInstanceState(outState: Bundle) {
+        if (::commentScroll.isInitialized) outState.putBundle("comments", commentScroll.saveState())
         rememberPlaybackPosition()
         outState.putString(EXTRA_BVID, currentBvid)
         outState.putLong(EXTRA_AID, currentAid)
         outState.putLong(EXTRA_CID, currentCid)
         outState.putLong(STATE_PLAY_POSITION, pendingResumePositionMs)
+        outState.putBoolean(STATE_HISTORY_PENDING, pendingResumePositionMs > 0L &&
+            initialHistoryMedia?.samePart(HistoryMediaId(currentBvid, currentAid, currentCid)) == true)
+        outState.putLong(EXTRA_LOCAL_TASK_ID, localTaskId)
         outState.putInt(STATE_SEGMENT_INDEX, resumeSegmentIndex)
         outState.putInt(STATE_SPEED_INDEX, speedIndex)
         outState.putBoolean(STATE_PLAY_WHEN_READY, userWantsPlayback)
@@ -6122,8 +5843,7 @@ class VideoDetailActivity : Activity() {
     }
 
     override fun onDestroy() {
-        commentPrefetchHandle?.cancel()
-        commentPrefetchHandle = null
+        if (::commentScroll.isInitialized) commentScroll.dispose()
         DanmakuSettingsStore.removeListener(danmakuUiSettingsListener)
         danmakuController?.onDestroy()
         danmakuController = null
@@ -6146,6 +5866,7 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun releasePlayer() {
+        playerHost.keepScreenOn = false
         val player = exoPlayer ?: return
         playerListener?.let(player::removeListener)
         playerListener = null
@@ -6164,11 +5885,32 @@ class VideoDetailActivity : Activity() {
     }
 
     private fun reportPlayHistory(status: Int) {
-        if (isLocalMode || playerListener == null || currentAid <= 0L || currentCid <= 0L) return
+        if (isLocalMode || playerListener == null || currentCid <= 0L || streamSession != BiliSessionStore.cookie()) return
         val player = exoPlayer ?: return
-        val progress = playerGlobalPosition(player) / 1000L
-        val duration = playerGlobalDuration(player) / 1000L
-        BiliApi.reportHistory(currentAid, currentCid, progress, duration, status)
+        val ended = player.playbackState == Player.STATE_ENDED
+        val positionMs = playerGlobalPosition(player)
+        if (!ended && (player.mediaItemCount == 0 || player.playbackState == Player.STATE_IDLE ||
+                player.playbackState != Player.STATE_READY && positionMs < 1000L)) return
+        // 分段长度不明时拿到的是当前段内位置，不能作为整集的观看秒数。
+        if (player.mediaItemCount > 1 && segmentTimeline.durationMs == 0L && !ended) return
+        val media = HistoryMediaId(currentBvid, currentAid, currentCid)
+        val detail = currentDetail?.takeIf { media.samePart(it.historyMedia) }
+        val durationMs = if (player.mediaItemCount > 1 && segmentTimeline.durationMs == 0L) playingStream?.durationMs ?: 0L
+            else playerGlobalDuration(player)
+        val (progress, duration) = historySample(positionMs, durationMs.takeIf { it > 0L } ?: (detail?.duration ?: 0) * 1000L, ended)
+        val sample = media to progress
+        val now = SystemClock.elapsedRealtime()
+        if (progress != 0L && sample != lastHistorySample && (status == 2 || lastHistorySample?.first != media ||
+                now - lastHistoryWriteAtMs >= 10_000L)) {
+            val video = detail ?: VideoItem(currentBvid, "", "", "", 0L, duration, "", cid = currentCid, aid = currentAid)
+            HistoryStore.record(applicationContext, video.copy(duration = duration), progress)
+            lastHistorySample = sample
+            lastHistoryWriteAtMs = now
+        }
+        if (currentAid > 0L) {
+            val reported = if (progress == -1L && duration > 0) duration.toLong() else progress
+            BiliApi.reportHistory(currentAid, currentCid, reported, duration.toLong(), status)
+        }
     }
 
     companion object {
@@ -6177,6 +5919,8 @@ class VideoDetailActivity : Activity() {
         const val EXTRA_CID = "cid"
         const val EXTRA_LOCAL_TASK_ID = "local_task_id"
         const val EXTRA_LOCAL_SORT_ORDER = "local_sort_order"
+        private const val EXTRA_HISTORY_POSITION_MS = "history_position_ms"
+        private const val STATE_HISTORY_PENDING = "history_pending"
         private const val STATE_PLAY_POSITION = "play_position"
         private const val STATE_PLAY_WHEN_READY = "play_when_ready"
         private const val STATE_PLAY_ENDED = "play_ended"
@@ -6191,14 +5935,8 @@ class VideoDetailActivity : Activity() {
         private const val COMMENT_COLLAPSE_LINES = 4
         /** Brightness/volume indicator scale when the player is NOT fullscreen. */
         private const val COMPACT_ADJUST_SCALE = 0.68f
-        private const val KEY_LAST_QUALITY = "last_quality"
         private const val KEY_LOCAL_SORT_ORDER = "local_sort_order"
         private const val KEY_LOCAL_PLAY_MODE = "local_play_mode"
-        private val SUPPORTED_QUALITIES = setOf(
-            BiliPlayUrl.QUALITY_360, BiliPlayUrl.QUALITY_480, BiliPlayUrl.QUALITY_720,
-            BiliPlayUrl.QUALITY_1080, BiliPlayUrl.QUALITY_1080_PLUS, BiliPlayUrl.QUALITY_4K,
-            116, 125, 126, 127
-        )
         // Action bar icon kinds.
         const val KIND_LIKE = 0
         const val KIND_FAVORITE = 1
@@ -6212,6 +5950,16 @@ class VideoDetailActivity : Activity() {
                 .putExtra(EXTRA_CID, cid))
         }
 
+        internal fun openHistory(context: Context, row: VideoItem) {
+            val item = HistoryStore.forPlayback(context, row)
+            if (item.bvid.isBlank() && item.aid <= 0L) return
+            context.startActivity(Intent(context, VideoDetailActivity::class.java)
+                .putExtra(EXTRA_BVID, item.bvid)
+                .putExtra(EXTRA_AID, item.aid)
+                .putExtra(EXTRA_CID, item.cid)
+                .putExtra(EXTRA_HISTORY_POSITION_MS, historyResumeMs(item.cid, item.watchProgressSec, item.duration)))
+        }
+
         /** 播放本地下载任务（复用同一播放器，本地模式只显示标题/大小/时长）。 */
         fun openLocal(context: Context, taskId: Long) {
             context.startActivity(Intent(context, VideoDetailActivity::class.java)
@@ -6219,6 +5967,29 @@ class VideoDetailActivity : Activity() {
         }
     }
 }
+
+internal data class HistorySample(val progressSec: Long, val durationSec: Int)
+
+internal fun historySample(positionMs: Long, durationMs: Long, ended: Boolean): HistorySample {
+    // 保留不足一秒的尾段：进度向下取整，时长向上取整。
+    val duration = if (durationMs > 0L) (1L + (durationMs - 1L) / 1000L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() else 0
+    val progress = if (ended || durationMs > 0L && positionMs >= durationMs) -1L else positionMs.coerceAtLeast(0L) / 1000L
+    return HistorySample(progress, duration)
+}
+
+internal data class HistoryPlaybackStart(val positionMs: Long, val validateHistory: Boolean = false)
+
+internal fun historyPlaybackStart(savedMs: Long?, savedHistoryPending: Boolean, favoriteMs: Long?, local: Boolean,
+                                 historyMs: Long): HistoryPlaybackStart = when {
+    savedMs != null -> HistoryPlaybackStart(savedMs.coerceAtLeast(0L), savedHistoryPending && savedMs > 0L && favoriteMs == null && !local)
+    local -> HistoryPlaybackStart(0L)
+    favoriteMs != null -> HistoryPlaybackStart(favoriteMs.coerceAtLeast(0L))
+    else -> HistoryPlaybackStart(historyMs.coerceAtLeast(0L), historyMs > 0L)
+}
+
+internal fun checkedHistoryStart(target: HistoryMediaId, actual: HistoryMediaId, positionMs: Long,
+                                 durationMs: Long, canMapPosition: Boolean): Long =
+    if (canMapPosition && target.samePart(actual) && positionMs > 0L && positionMs < durationMs) positionMs else 0L
 
 internal fun formatQualityButtonText(id: Int): String = when (id) {
     127 -> "8K"

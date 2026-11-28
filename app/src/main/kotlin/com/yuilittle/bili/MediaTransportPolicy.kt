@@ -15,6 +15,9 @@ internal data class ContentRangeHeader(
 ) {
     val isSatisfiableRange: Boolean get() = unit == "bytes" && start != null && end != null && end >= start
     val isUnsatisfiable: Boolean get() = unit == "bytes" && start == null && end == null && total != null && total >= 0L
+
+    fun completesOpenEndedRequest(offset: Long, bytesRead: Long): Boolean =
+        isSatisfiableRange && start == offset && total != null && end == total - 1L && bytesRead == total - offset
 }
 
 internal object MediaTransportPolicy {

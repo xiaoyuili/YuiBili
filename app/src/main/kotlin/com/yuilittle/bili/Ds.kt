@@ -109,7 +109,9 @@ internal object Ds {
     )
 
     val colors: Palette
-        get() = if (Theme.isDark) dark else light
+        get() = palette(Theme.isDark)
+
+    fun palette(darkMode: Boolean): Palette = if (darkMode) dark else light
 
     object Space {
         const val xs = 4

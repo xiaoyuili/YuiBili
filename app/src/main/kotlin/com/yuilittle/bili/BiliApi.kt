@@ -89,7 +89,9 @@ data class VideoComment(
     /** Whether this comment is pinned at the top by the UP主 (data.top.upper / data.top_replies). */
     val isPinned: Boolean = false,
     /** Whether this comment author is the video's UP主 (matched by data.upper.mid or reply.reply_control.is_up_flag). */
-    val isUp: Boolean = false
+    val isUp: Boolean = false,
+    val mentions: Map<String, Long> = emptyMap(),
+    val requestedAtNanos: Long = 0L
 )
 
 /** A user-uploaded comment image with its intrinsic width/height in pixels. */
@@ -97,6 +99,13 @@ data class CommentPicture(
     val url: String,
     val width: Int = 0,
     val height: Int = 0
+)
+
+internal data class CommentPage(
+    val items: List<VideoComment>,
+    val nextOffset: String?,
+    val hasMore: Boolean,
+    val failureReason: String? = null
 )
 
 /** A user-created favorite folder (from x/v3/fav/folder/created/list-all). */
@@ -226,40 +235,72 @@ internal object BiliHttp {
 }
 
 internal class BiliRequest {
+    private data class CancelState(val call: Call?, val task: Runnable?, val executor: ThreadPoolExecutor?, val hook: (() -> Unit)?)
+
     @Volatile var cancelled = false
         private set
     private var call: Call? = null
     private var cancelHook: (() -> Unit)? = null
+    private var queuedTask: Runnable? = null
+    private var queuedExecutor: ThreadPoolExecutor? = null
 
-    @Synchronized
     fun onCancel(hook: () -> Unit) {
-        if (cancelled) {
-            hook()
-        } else {
-            cancelHook = hook
+        val invoke = synchronized(this) {
+            if (cancelled) true else { cancelHook = hook; false }
+        }
+        if (invoke) hook()
+    }
+
+    fun enqueue(executor: ThreadPoolExecutor, task: Runnable): Boolean {
+        synchronized(this) {
+            if (cancelled) return false
+            queuedTask = task
+            queuedExecutor = executor
+        }
+        return try {
+            executor.execute(task)
+            synchronized(this) {
+                if (cancelled) { executor.remove(task); false } else true
+            }
+        } catch (_: RejectedExecutionException) {
+            synchronized(this) {
+                if (queuedTask === task) { queuedTask = null; queuedExecutor = null }
+            }
+            false
         }
     }
 
-    @Synchronized
-    fun attach(next: Call): Boolean {
-        if (cancelled) return false
-        call = next
-        return true
+    fun isActive(): Boolean = !cancelled
+
+    fun startTask(task: Runnable): Boolean = synchronized(this) {
+        if (queuedTask === task) { queuedTask = null; queuedExecutor = null }
+        !cancelled
     }
 
-    @Synchronized
-    fun detach(completed: Call) {
-        if (call === completed) call = null
+    fun ensureActive() {
+        if (cancelled || Thread.currentThread().isInterrupted) throw IOException("评论请求已取消")
     }
 
-    @Synchronized
+    fun attach(next: Call): Boolean = synchronized(this) {
+        if (cancelled) false else { call = next; true }
+    }
+
+    fun detach(completed: Call) = synchronized(this) { if (call === completed) call = null }
+
     fun cancel() {
-        cancelled = true
-        call?.cancel()
-        call = null
-        val hook = cancelHook
-        cancelHook = null
-        hook?.invoke()
+        val state = synchronized(this) {
+            if (cancelled) return
+            cancelled = true
+            CancelState(call, queuedTask, queuedExecutor, cancelHook).also {
+                call = null
+                queuedTask = null
+                queuedExecutor = null
+                cancelHook = null
+            }
+        }
+        if (state.task != null) state.executor?.remove(state.task)
+        state.call?.cancel()
+        state.hook?.invoke()
     }
 }
 
@@ -640,143 +681,145 @@ object BiliApi {
         }
     }
 
-    /** 加载一页评论；sort=0 按热度（高赞），sort=1 按最新时间。page 从 1 开始，返回下一页页码（-1 表示没有更多）。 */
-    /** 加载一页评论；sort=0 按热度（高赞），sort=1 按最新时间。
-     *  实测（2026-07）：旧接口 x/v2/reply 的 sort 参数已失效（sort=0 返回空、sort=1/2 同序），
-     *  必须用新接口 x/v2/reply/main 的 mode 参数：mode=0 热度 / mode=2 时间，
-     *  且分页用游标（pagination_str.offset），不能用 pn/ps。 */
-    private val commentCursors = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val anonSearchInitLock = Any()
 
-    fun fetchComments(aid: Long, page: Int, sort: Int = 0, callback: (List<VideoComment>, Int, String?) -> Unit) {
-        if (aid <= 0L) { callback(emptyList(), -1, null); return }
-        fetchCommentsForTarget(oid = aid.toString(), commentType = 1, page = page, sort = sort, callback = callback)
-    }
-
-    /** 通用评论主列表加载：支持视频（type=1, oid=aid）与动态/图文/专栏（type=11/12/17, oid=comment_id_str）。 */
-    fun fetchCommentsForTarget(
+    internal fun fetchCommentPage(
         oid: String,
         commentType: Int,
-        page: Int,
-        sort: Int = 0,
-        callback: (List<VideoComment>, Int, String?) -> Unit
-    ) {
+        sort: Int,
+        offset: String?,
+        session: BiliSessionStore.SessionSnapshot,
+        callback: (CommentPage?, String?) -> Unit
+    ): BiliRequest {
+        val request = BiliRequest()
+        val requestedAt = System.nanoTime()
         val cleanOid = oid.trim()
-        if (cleanOid.isEmpty() || commentType <= 0) { callback(emptyList(), -1, null); return }
-        executeNetwork(
-            onRejected = { mainHandler.post { callback(emptyList(), -1, "操作过快，请稍后再试") } }
-        ) {
+        if (cleanOid.isEmpty() || commentType <= 0) {
+            mainHandler.post { if (request.isActive()) callback(null, "评论信息无效") }
+            return request
+        }
+        executeNetwork(request, onRejected = {
+            mainHandler.post { if (request.isActive()) callback(null, "操作过快，请稍后再试") }
+        }) {
             try {
-                val cursorKey = "$commentType:$cleanOid:$sort"
-                if (page <= 1) commentCursors.remove(cursorKey)
-                val offset = commentCursors[cursorKey] ?: ""
+                request.ensureActive()
+                if (!BiliSessionStore.isCurrent(session)) throw IOException("账号已切换，请刷新评论")
                 val signed = BiliWbiSign.signParams(
                     mapOf(
                         "type" to commentType.toString(), "oid" to cleanOid,
                         "mode" to (if (sort == 0) "0" else "2"),
-                        "pagination_str" to """{"offset":"$offset"}""",
+                        "pagination_str" to encodeCommentOffsetJson(offset).let(::quoteCursorForWbi),
                         "plat" to "1", "web_location" to "333.788"
                     )
                 )
-                // Prefer the full playurl cookie (session + buvid). Extra headers override
-                // the default session cookie in getJson so reply.action is personalised.
-                val root = getJson(
-                    "https://api.bilibili.com/x/v2/reply/main?$signed",
-                    mapOf("Cookie" to BiliPlayUrl.cookieHeader())
-                )
-                ensureSuccess(root)
+                request.ensureActive()
+                val headers = mapOf("Cookie" to BiliPlayUrl.cookieHeader(session = session.cookie))
+                request.ensureActive()
+                if (!BiliSessionStore.isCurrent(session)) return@executeNetwork
+                val root = getCommentJson("https://api.bilibili.com/x/v2/reply/main?$signed", headers, request)
+                request.ensureActive()
+                if (!BiliSessionStore.isCurrent(session)) throw IOException("账号已切换，请刷新评论")
+                ensureCommentSuccess(root)
                 val data = root.optJSONObject("data") ?: throw IllegalStateException("未返回评论数据")
                 val upperMid = data.optJSONObject("upper")?.optLong("mid", 0L) ?: 0L
                 val list = ArrayList<VideoComment>()
-                val pinnedIds = HashSet<Long>()
-                if (page <= 1) {
-                    val topObj = data.optJSONObject("top")
-                    val topUpper = topObj?.optJSONObject("upper")
+                val seen = HashSet<Long>()
+                if (offset == null) {
+                    val topUpper = data.optJSONObject("top")?.optJSONObject("upper")
                     if (topUpper != null) {
-                        val pinned = parseComment(topUpper, isPinned = true, upperMid = upperMid)
-                        if (pinned.id <= 0L || pinnedIds.add(pinned.id)) list += pinned
+                        val pinned = parseComment(topUpper, isPinned = true, upperMid = upperMid, requestedAtNanos = requestedAt)
+                        if (pinned.id <= 0L || seen.add(pinned.id)) list += pinned
                     }
-                    val topReplies = data.optJSONArray("top_replies")
-                    if (topReplies != null) {
-                        for (index in 0 until topReplies.length()) {
-                            val reply = topReplies.optJSONObject(index) ?: continue
-                            val pinned = parseComment(reply, isPinned = true, upperMid = upperMid)
-                            if (pinned.id <= 0L || pinnedIds.add(pinned.id)) list += pinned
+                    data.optJSONArray("top_replies")?.let { pinnedArray ->
+                        for (index in 0 until pinnedArray.length()) {
+                            val reply = pinnedArray.optJSONObject(index) ?: continue
+                            val pinned = parseComment(reply, isPinned = true, upperMid = upperMid, requestedAtNanos = requestedAt)
+                            if (pinned.id <= 0L || seen.add(pinned.id)) list += pinned
                         }
                     }
                 }
                 val replies = data.optJSONArray("replies") ?: JSONArray()
                 for (index in 0 until replies.length()) {
                     val reply = replies.optJSONObject(index) ?: continue
-                    val parsed = parseComment(reply, upperMid = upperMid)
-                    if (parsed.id <= 0L || pinnedIds.add(parsed.id)) list += parsed
+                    val parsed = parseComment(reply, upperMid = upperMid, requestedAtNanos = requestedAt)
+                    if (parsed.id <= 0L || seen.add(parsed.id)) list += parsed
                 }
                 val cursor = data.optJSONObject("cursor")
-                // reply/main's real next-page token lives in
-                // cursor.pagination_reply.next_offset (a string); cursor.next
-                // is only an int page hint and passing it as offset silently
-                // returns page 1 again, which is why "load more" used to
-                // repeat the same comments forever.
                 val pagination = cursor?.optJSONObject("pagination_reply")
-                val next = pagination?.optString("next_offset").orEmpty()
-                    .ifEmpty { cursor?.optString("next", "").orEmpty() }
-                val isEnd = cursor?.optBoolean("is_end", true) ?: true
-                if (next.isNotBlank()) commentCursors[cursorKey] = next
-                val nextPage = if (isEnd || list.isEmpty()) -1 else page + 1
-                mainHandler.post { callback(list, nextPage, null) }
+                val rawOffset = (pagination?.opt("next_offset") as? String)?.takeIf { it.isNotBlank() }
+                val isEnd = cursor?.opt("is_end") as? Boolean
+                val decision = decideCommentCursor(CommentPageCursor(rawOffset, isEnd))
+                request.ensureActive()
+                if (!BiliSessionStore.isCurrent(session)) throw IOException("账号已切换，请刷新评论")
+                val pageResult = CommentPage(
+                    list, decision.nextOffset, decision.hasMore, decision.failureReason
+                )
+                mainHandler.post {
+                    if (request.isActive() && BiliSessionStore.isCurrent(session)) callback(pageResult, null)
+                }
             } catch (error: Exception) {
-                mainHandler.post { callback(emptyList(), -1, readableError(error)) }
+                if (!request.isActive()) return@executeNetwork
+                mainHandler.post {
+                    if (request.isActive() && BiliSessionStore.isCurrent(session)) callback(null, readableError(error))
+                }
             }
         }
+        return request
     }
 
-    /** 楼中楼（子评论）分页加载；root=主评论 rpid。page 从 1 开始，-1 表示没有更多。 */
-    fun fetchSubReplies(aid: Long, root: Long, page: Int, callback: (List<VideoComment>, Int, String?) -> Unit) {
-        if (aid <= 0L || root <= 0L) { callback(emptyList(), -1, null); return }
-        fetchSubRepliesForTarget(oid = aid.toString(), commentType = 1, root = root, page = page, callback = callback)
-    }
-
-    /** 通用楼中楼（子评论）分页加载；支持任意评论区 (oid, commentType)。 */
-    fun fetchSubRepliesForTarget(
+    internal fun fetchReplyPage(
         oid: String,
         commentType: Int,
         root: Long,
         page: Int,
+        session: BiliSessionStore.SessionSnapshot,
         callback: (List<VideoComment>, Int, String?) -> Unit
-    ) {
+    ): BiliRequest {
+        val request = BiliRequest()
+        val requestedAt = System.nanoTime()
+        fun deliver(items: List<VideoComment>, next: Int, error: String?) {
+            mainHandler.post {
+                if (request.isActive() && BiliSessionStore.isCurrent(session)) callback(items, next, error)
+            }
+        }
         val cleanOid = oid.trim()
-        if (cleanOid.isEmpty() || commentType <= 0 || root <= 0L) { callback(emptyList(), -1, null); return }
-        executeNetwork(
-            onRejected = { mainHandler.post { callback(emptyList(), -1, "操作过快，请稍后再试") } }
-        ) {
+        if (cleanOid.isEmpty() || commentType <= 0 || root <= 0L || page < 1) {
+            deliver(emptyList(), -1, "回复信息无效")
+            return request
+        }
+        executeNetwork(request, onRejected = { deliver(emptyList(), -1, "操作过快，请稍后再试") }) {
             try {
+                request.ensureActive()
+                if (!BiliSessionStore.isCurrent(session)) return@executeNetwork
                 val signed = BiliWbiSign.signParams(
                     mapOf(
                         "type" to commentType.toString(), "oid" to cleanOid, "root" to root.toString(),
                         "pn" to page.toString(), "ps" to "20", "plat" to "1"
                     )
                 )
-                val rootJson = getJson(
-                    "https://api.bilibili.com/x/v2/reply/reply?$signed",
-                    mapOf("Cookie" to BiliPlayUrl.cookieHeader())
-                )
-                ensureSuccess(rootJson)
-                val data = rootJson.optJSONObject("data") ?: throw IllegalStateException("未返回回复数据")
+                val headers = mapOf("Cookie" to BiliPlayUrl.cookieHeader(session = session.cookie))
+                request.ensureActive()
+                if (!BiliSessionStore.isCurrent(session)) return@executeNetwork
+                val result = getCommentJson("https://api.bilibili.com/x/v2/reply/reply?$signed", headers, request)
+                ensureCommentSuccess(result)
+                val data = result.optJSONObject("data") ?: error("未返回回复数据")
                 val upperMid = data.optJSONObject("upper")?.optLong("mid", 0L) ?: 0L
                 val replies = data.optJSONArray("replies") ?: JSONArray()
-                val list = ArrayList<VideoComment>(replies.length())
+                val items = ArrayList<VideoComment>(replies.length())
                 for (index in 0 until replies.length()) {
+                    request.ensureActive()
                     val reply = replies.optJSONObject(index) ?: continue
-                    list += parseComment(reply, upperMid = upperMid)
+                    val parsed = parseComment(reply, upperMid = upperMid, requestedAtNanos = requestedAt)
+                    if (parsed.id > 0L) items += parsed
                 }
-                val pageInfo = data.optJSONObject("page")
-                val total = pageInfo?.optLong("count", 0L) ?: 0L
-                val nextPage = if (list.isNotEmpty() && page * 20L < total) page + 1 else -1
-                mainHandler.post { callback(list, nextPage, null) }
+                val total = data.optJSONObject("page")?.optLong("count", -1L) ?: -1L
+                val more = if (total >= 0L) page * 20L < total else replies.length() >= 20
+                deliver(items, if (more) page + 1 else -1, null)
             } catch (error: Exception) {
-                mainHandler.post { callback(emptyList(), -1, readableError(error)) }
+                if (request.isActive()) deliver(emptyList(), -1, readableError(error))
             }
         }
+        return request
     }
 
     internal fun selectEmoteUrl(gifUrl: String, webpUrl: String, fallbackUrl: String): String {
@@ -788,11 +831,12 @@ object BiliApi {
     internal fun parseComment(
         reply: JSONObject,
         isPinned: Boolean = false,
-        upperMid: Long = 0L
+        upperMid: Long = 0L,
+        requestedAtNanos: Long = 0L
     ): VideoComment {
         val member = reply.optJSONObject("member")
         val content = reply.optJSONObject("content")
-        val message = cleanHtml(content?.optString("message").orEmpty())
+        val message = (content?.opt("message") as? String).orEmpty()
         // B 站富文本跳转链接（正片传送门 / 收藏集 / 搜索词等）
         val jumpLinks = HashMap<String, String>()
         content?.optJSONObject("jump_url")?.let { jump ->
@@ -849,7 +893,7 @@ object BiliApi {
         reply.optJSONArray("replies")?.let { array ->
             for (index in 0 until array.length()) {
                 val sub = array.optJSONObject(index) ?: continue
-                subs += parseComment(sub, upperMid = upperMid)
+                subs += parseComment(sub, upperMid = upperMid, requestedAtNanos = requestedAtNanos)
             }
         }
         val replyControl = reply.optJSONObject("reply_control")
@@ -867,7 +911,7 @@ object BiliApi {
             id = reply.optLong("rpid", 0L),
             user = member?.optString("uname").orEmpty().ifBlank { "哔哩哔哩用户" },
             avatar = normalizeUrl(member?.optString("avatar").orEmpty()),
-            content = message.ifBlank { "（评论已删除）" },
+            content = if (message.isBlank() && pictures.isEmpty()) "（评论内容暂不可用）" else message,
             likes = reply.optLong("like", 0L),
             publishedAt = reply.optLong("ctime", 0L),
             userMid = memberMid,
@@ -880,8 +924,31 @@ object BiliApi {
             liked = reply.optInt("action", 0) == 1,
             isPinned = isPinned,
             isUp = isUpFlag,
-            jumpLinks = jumpLinks
-        ).also { CommentMentionResolver.register(it) }
+            jumpLinks = jumpLinks,
+            mentions = parseCommentMentions(content),
+            requestedAtNanos = requestedAtNanos
+        )
+    }
+
+    private fun parseCommentMentions(content: JSONObject?): Map<String, Long> {
+        if (content == null) return emptyMap()
+        val entries = ArrayList<Pair<String, String>>()
+        content.optJSONArray("members")?.let { members ->
+            for (index in 0 until members.length()) {
+                val member = members.optJSONObject(index) ?: continue
+                entries += member.optString("uname") to member.optString("mid")
+            }
+        }
+        for (field in listOf("at_name_to_mid", "at_name_to_mid_str")) {
+            content.optJSONObject(field)?.let { names ->
+                val keys = names.keys()
+                while (keys.hasNext()) {
+                    val name = keys.next()
+                    entries += name to names.optString(name)
+                }
+            }
+        }
+        return CommentMentionResolver.fromEntries(entries)
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -922,39 +989,39 @@ object BiliApi {
         rpid: Long,
         like: Boolean,
         callback: (Boolean, String?) -> Unit
+    ) = postCommentLike(oid, commentType, rpid, like, BiliSessionStore.snapshot(), callback)
+
+    internal fun postCommentLike(
+        oid: String,
+        commentType: Int,
+        rpid: Long,
+        like: Boolean,
+        session: BiliSessionStore.SessionSnapshot,
+        callback: (Boolean, String?) -> Unit
     ) {
+        fun deliver(ok: Boolean, error: String?) { mainHandler.post { callback(ok, error) } }
         val cleanOid = oid.trim()
         if (cleanOid.isEmpty() || commentType <= 0 || rpid <= 0L) {
-            callback(false, "评论信息未就绪，请稍后再试")
+            deliver(false, "评论信息未就绪，请稍后再试")
             return
         }
-        if (!BiliSessionStore.isLoggedIn()) { callback(false, "请先登录后再点赞评论"); return }
-        val csrf = csrfToken()
-        if (csrf.isBlank()) { callback(false, "登录凭证不完整"); return }
-        executeNetwork(
-            onRejected = { mainHandler.post { callback(false, "操作过快，请稍后再试") } }
-        ) {
+        if (!BiliSessionStore.isLoggedIn(session.cookie)) { deliver(false, "请先登录后再点赞评论"); return }
+        val csrf = csrfToken(session.cookie)
+        if (csrf.isBlank()) { deliver(false, "登录凭证不完整"); return }
+        executeNetwork(onRejected = { deliver(false, "操作过快，请稍后再试") }) {
             try {
+                if (!BiliSessionStore.isCurrent(session)) { deliver(false, "账号已切换"); return@executeNetwork }
                 val root = postForm(
                     "https://api.bilibili.com/x/v2/reply/action",
                     mapOf(
-                        "type" to commentType.toString(),
-                        "oid" to cleanOid,
-                        "rpid" to rpid.toString(),
-                        "action" to (if (like) "1" else "0"),
-                        "csrf" to csrf
-                    )
+                        "type" to commentType.toString(), "oid" to cleanOid,
+                        "rpid" to rpid.toString(), "action" to if (like) "1" else "0", "csrf" to csrf
+                    ), session = session.cookie, expectedSession = session
                 )
-                val code = root.optInt("code", -1)
-                if (code != 0) {
-                    // Keep Bilibili's own message (e.g. 12004 禁止操作赞或踩).
-                    throw IllegalStateException(
-                        root.optString("message").ifBlank { "评论点赞失败($code)" }
-                    )
-                }
-                mainHandler.post { callback(true, null) }
+                ensureSuccess(root)
+                deliver(BiliSessionStore.isCurrent(session), if (BiliSessionStore.isCurrent(session)) null else "账号已切换")
             } catch (error: Exception) {
-                mainHandler.post { callback(false, readableError(error)) }
+                deliver(false, readableError(error))
             }
         }
     }
@@ -1416,30 +1483,32 @@ object BiliApi {
     ) {
         val q = keyword.trim()
         if (q.isBlank()) { callback(emptyList(), null); return }
-        if (!BiliSessionStore.isLoggedIn()) {
+        val session = BiliSessionStore.cookie()
+        if (!BiliSessionStore.isLoggedIn(session)) {
             callback(emptyList(), "请先登录后再搜索收藏"); return
         }
         executeNetwork(
             onRejected = { mainHandler.post { callback(emptyList(), "操作过快，请稍后再试") } }
         ) {
             try {
-                val mid = BiliSessionStore.cookie()
-                    .substringAfter("DedeUserID=", "").substringBefore(";").trim()
-                if (mid.isBlank()) throw IllegalStateException("登录凭证不完整")
+                val mid = session.substringAfter("DedeUserID=", "").substringBefore(";").trim().toLongOrNull()
+                    ?.takeIf { it > 0L } ?: throw IllegalStateException("登录凭证不完整")
                 val foldersRoot = getJson(
                     "https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=$mid",
-                    mapOf("Cookie" to BiliSessionStore.cookie())
+                    mapOf("Cookie" to session)
                 )
                 ensureSuccess(foldersRoot)
                 val folders = foldersRoot.optJSONObject("data")?.optJSONArray("list") ?: JSONArray()
                 val seen = HashSet<String>()
                 val merged = ArrayList<VideoItem>()
                 for (i in 0 until folders.length()) {
+                    if (session != BiliSessionStore.cookie()) throw IOException("登录状态已变化")
                     val folder = folders.optJSONObject(i) ?: continue
                     val mediaId = folder.optLong("id", 0L)
                     if (mediaId <= 0L) continue
                     // 每个收藏夹最多拉 2 页，避免搜索一次打爆网络
                     for (page in 1..2) {
+                        if (session != BiliSessionStore.cookie()) throw IOException("登录状态已变化")
                         val signed = BiliWbiSign.signParams(
                             mapOf(
                                 "media_id" to mediaId.toString(),
@@ -1452,7 +1521,7 @@ object BiliApi {
                         )
                         val root = getJson(
                             "https://api.bilibili.com/x/v3/fav/resource/list?$signed",
-                            mapOf("Cookie" to BiliPlayUrl.cookieHeader())
+                            mapOf("Cookie" to BiliPlayUrl.cookieHeader(session = session))
                         )
                         ensureSuccess(root)
                         val data = root.optJSONObject("data") ?: JSONObject()
@@ -1499,7 +1568,8 @@ object BiliApi {
         business: String = "archive",
         callback: (List<VideoItem>, String?, Long, Long, String, Boolean) -> Unit
     ) {
-        if (!BiliSessionStore.isLoggedIn()) {
+        val session = BiliSessionStore.cookie()
+        if (!BiliSessionStore.isLoggedIn(session)) {
             callback(emptyList(), "请先登录后再查看历史记录", 0L, 0L, business, true); return
         }
         executeNetwork(
@@ -1512,7 +1582,7 @@ object BiliApi {
                 val root = getJson(
                     "https://api.bilibili.com/x/web-interface/history/cursor" +
                         "?max=$max&view_at=$viewAt&business=${URLEncoder.encode(biz, "UTF-8")}&type=archive&ps=30",
-                    mapOf("Cookie" to BiliPlayUrl.cookieHeader())
+                    mapOf("Cookie" to BiliPlayUrl.cookieHeader(session = session))
                 )
                 ensureSuccess(root)
                 val data = root.optJSONObject("data") ?: JSONObject()
@@ -1524,30 +1594,7 @@ object BiliApi {
                 val videos = ArrayList<VideoItem>(list.length())
                 for (index in 0 until list.length()) {
                     val item = list.optJSONObject(index) ?: continue
-                    val history = item.optJSONObject("history") ?: continue
-                    // 只收视频稿件；跳过无 bvid 的项
-                    val bvid = history.optString("bvid")
-                    if (bvid.isBlank()) continue
-                    val progressSec = item.optLong("progress", 0L)
-                    val durationSec = item.optInt("duration", 0)
-                    val rawBusiness = history.optString("business").ifBlank { "archive" }
-                    val rawKid = item.optLong("kid", 0L)
-                    videos += VideoItem(
-                        bvid = bvid,
-                        title = item.optString("title").ifBlank { "（无标题）" },
-                        owner = item.optString("author_name").ifBlank { "未知UP主" },
-                        cover = normalizeUrl(item.optString("cover")),
-                        views = 0L,
-                        duration = durationSec,
-                        description = "",
-                        // 历史接口的 view_at 是观看时间（秒）
-                        publishedAt = item.optLong("view_at", 0L),
-                        cid = history.optLong("cid", 0L),
-                        aid = history.optLong("oid", 0L),
-                        ownerMid = item.optLong("author_mid", 0L),
-                        rcmdReason = buildHistoryKid(rawBusiness, rawKid),
-                        watchProgressSec = progressSec
-                    )
+                    parseArchiveHistoryRow(item)?.let(videos::add)
                 }
                 // 结束判定：本页原始 list 为空，或游标不再前进（避免重复分页死循环）
                 val ended = isHistoryCursorEnded(
@@ -1562,6 +1609,31 @@ object BiliApi {
                 mainHandler.post { callback(emptyList(), readableError(error), max, viewAt, business, false) }
             }
         }
+    }
+
+    private fun parseArchiveHistoryRow(item: JSONObject): VideoItem? {
+        val history = item.optJSONObject("history")
+        val media = archiveHistoryMedia(
+            business = history?.optString("business").orEmpty().ifBlank { item.optString("business") },
+            epId = maxOf(history?.optLong("epid") ?: 0L, item.optLong("epid"), item.optLong("ep_id")),
+            nested = HistoryMediaId(history?.optString("bvid").orEmpty(), history?.optLong("oid") ?: 0L, history?.optLong("cid") ?: 0L),
+            flat = HistoryMediaId(item.optString("bvid"), item.optLong("aid").takeIf { it > 0L } ?: item.optLong("oid"), item.optLong("cid"))
+        ) ?: return null
+        return VideoItem(
+            bvid = media.bvid,
+            aid = media.aid,
+            cid = media.cid,
+            title = item.optString("title").ifBlank { "（无标题）" },
+            owner = item.optString("author_name").ifBlank { item.optJSONObject("owner")?.optString("name").orEmpty().ifBlank { "未知UP主" } },
+            cover = normalizeUrl(item.optString("cover").ifBlank { item.optString("pic") }),
+            views = 0L,
+            duration = item.optLong("duration").takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt() ?: 0,
+            description = "",
+            publishedAt = item.optLong("view_at"),
+            ownerMid = item.optLong("author_mid"),
+            rcmdReason = buildHistoryKid("archive", item.optLong("kid")),
+            watchProgressSec = item.optLong("progress")
+        )
     }
 
     internal fun buildHistoryKid(business: String, kid: Long): String =
@@ -1634,7 +1706,8 @@ object BiliApi {
         if (q.isBlank()) {
             callback(emptyList(), null, true); return
         }
-        if (!BiliSessionStore.isLoggedIn()) {
+        val session = BiliSessionStore.cookie()
+        if (!BiliSessionStore.isLoggedIn(session)) {
             callback(emptyList(), "请先登录后再搜索历史", true); return
         }
         executeNetwork(
@@ -1644,7 +1717,7 @@ object BiliApi {
                 val root = getJson(
                     "https://api.bilibili.com/x/web-interface/history/search" +
                         "?keyword=${URLEncoder.encode(q, "UTF-8")}&pn=$page&business=archive",
-                    mapOf("Cookie" to BiliPlayUrl.cookieHeader())
+                    mapOf("Cookie" to BiliPlayUrl.cookieHeader(session = session))
                 )
                 ensureSuccess(root)
                 val data = root.optJSONObject("data") ?: JSONObject()
@@ -1655,32 +1728,10 @@ object BiliApi {
                 val videos = ArrayList<VideoItem>(list.length())
                 for (index in 0 until list.length()) {
                     val item = list.optJSONObject(index) ?: continue
-                    val history = item.optJSONObject("history")
-                    val bvid = history?.optString("bvid").orEmpty()
-                        .ifBlank { item.optString("bvid") }
-                    if (bvid.isBlank()) continue
-                    videos += VideoItem(
-                        bvid = bvid,
-                        title = item.optString("title").ifBlank { "（无标题）" },
-                        owner = item.optString("author_name").ifBlank {
-                            item.optJSONObject("owner")?.optString("name").orEmpty().ifBlank { "未知UP主" }
-                        },
-                        cover = normalizeUrl(
-                            item.optString("cover").ifBlank { item.optString("pic") }
-                        ),
-                        views = 0L,
-                        duration = item.optInt("duration", 0),
-                        description = "",
-                        publishedAt = item.optLong("view_at", 0L),
-                        cid = history?.optLong("cid", 0L) ?: 0L,
-                        aid = history?.optLong("oid", 0L)
-                            ?: item.optLong("aid", 0L),
-                        ownerMid = item.optLong("author_mid", 0L),
-                        watchProgressSec = item.optLong("progress", 0L)
-                    )
+                    parseArchiveHistoryRow(item)?.let(videos::add)
                 }
                 val hasMore = data.optBoolean("has_more", list.length() >= 20)
-                mainHandler.post { callback(videos, null, !hasMore && videos.isNotEmpty() || list.length() == 0) }
+                mainHandler.post { callback(videos, null, !hasMore || list.length() == 0) }
             } catch (error: Exception) {
                 mainHandler.post { callback(emptyList(), readableError(error), true) }
             }
@@ -1847,13 +1898,15 @@ object BiliApi {
             .substringAfter("bili_jct=", "").substringBefore(";").trim()
 
     private fun postForm(address: String, form: Map<String, String>,
-                         session: String = BiliSessionStore.cookie()): JSONObject {
+                         session: String = BiliSessionStore.cookie(),
+                         expectedSession: BiliSessionStore.SessionSnapshot? = null): JSONObject {
         val body = okhttp3.FormBody.Builder().apply { form.forEach { (name, value) -> add(name, value) } }.build()
         val request = BiliHttp.request(address)
             .header("Origin", "https://www.bilibili.com")
             .header("Cookie", BiliPlayUrl.cookieHeader(session = session))
             .post(body)
             .build()
+        if (expectedSession != null && !BiliSessionStore.isCurrent(expectedSession)) throw IOException("账号已切换")
         return BiliHttp.client.newCall(request).execute().use(BiliHttp::json)
     }
 
@@ -1903,6 +1956,35 @@ object BiliApi {
         } catch (_: RejectedExecutionException) {
             onRejected()
         }
+    }
+
+    private fun executeNetwork(request: BiliRequest, onRejected: () -> Unit, task: () -> Unit) {
+        lateinit var work: Runnable
+        work = Runnable { if (request.startTask(work)) task() }
+        if (!request.enqueue(networkWorkers, work) && request.isActive()) onRejected()
+    }
+
+    private fun getCommentJson(address: String, extraHeaders: Map<String, String>, request: BiliRequest): JSONObject {
+        val call = jsonCall(address, extraHeaders, session = "")
+        if (!request.attach(call)) throw IOException("评论请求已取消")
+        try {
+            return call.execute().use { response ->
+                request.ensureActive()
+                if (!response.isSuccessful) throw IOException("评论接口暂不可用（HTTP ${response.code}）")
+                try {
+                    BiliHttp.json(response)
+                } catch (error: org.json.JSONException) {
+                    throw IOException("评论接口返回格式异常（HTTP ${response.code}）", error)
+                }
+            }
+        } finally {
+            request.detach(call)
+        }
+    }
+
+    private fun ensureCommentSuccess(root: JSONObject) {
+        val code = root.optInt("code", -1)
+        if (code != 0) throw BiliProtocolException(code, "${root.optString("message").ifBlank { "评论接口暂不可用" }}（错误码 $code）")
     }
 
     private fun executeSearch(onRejected: () -> Unit, task: () -> Unit) {

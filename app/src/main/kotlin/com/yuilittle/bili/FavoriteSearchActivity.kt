@@ -47,7 +47,7 @@ class FavoriteSearchActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        LayoutMode.applyScreenOrientation(this)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

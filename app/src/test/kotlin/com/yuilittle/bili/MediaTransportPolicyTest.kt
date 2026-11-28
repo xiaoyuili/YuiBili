@@ -41,6 +41,15 @@ class MediaTransportPolicyTest {
     }
 
     @Test
+    fun aPartialOrUnknownLength206MustNotBePublishedAsTheWholeFile() {
+        fun complete(raw: String, bytes: Long) = MediaTransportPolicy.parseContentRange(raw)!!.completesOpenEndedRequest(1024L, bytes)
+        assertTrue(complete("bytes 1024-2047/2048", 1024L))
+        assertFalse(complete("bytes 1024-2047/*", 1024L))
+        assertFalse(complete("bytes 1024-2047/4096", 1024L))
+        assertFalse(complete("bytes 1024-2047/2048", 999L))
+    }
+
+    @Test
     fun parsesContentRangeAndByteRangesStrictly() {
         val satisfiable = MediaTransportPolicy.parseContentRange("bytes 1024-2047/4096")
         assertNotNull(satisfiable)

@@ -18,6 +18,7 @@ import kotlin.math.abs
  * GridView 重新布局并回收卡片，封面被清空重载，整页会闪一下。
  */
 class RootPager(context: Context) : FrameLayout(context) {
+    var prioritizeHorizontalGestures = false
     private val density = resources.displayMetrics.density
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     private val dragSlop = (touchSlop * 0.75f).coerceAtLeast(1f)
@@ -80,8 +81,29 @@ class RootPager(context: Context) : FrameLayout(context) {
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        if (dragging || animating) return
+        if (prioritizeHorizontalGestures && w == oldw) return
+        if (prioritizeHorizontalGestures && (dragging || animating)) {
+            dragging = false
+            tracking = false
+            activePointerId = MotionEvent.INVALID_POINTER_ID
+            recycleVelocityTracker()
+            parent?.requestDisallowInterceptTouchEvent(false)
+        } else if (dragging || animating) return
         settleImmediately(current)
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (prioritizeHorizontalGestures && event.actionMasked == MotionEvent.ACTION_DOWN) {
+            // 首页内层分页先接收方向判断，外层“首页/我的”不能提前抢走横滑。
+            parent?.requestDisallowInterceptTouchEvent(true)
+        }
+        return try {
+            super.dispatchTouchEvent(event)
+        } finally {
+            if (prioritizeHorizontalGestures && (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL)) {
+                parent?.requestDisallowInterceptTouchEvent(false)
+            }
+        }
     }
 
     private fun maxOffset(): Float = ((childCount - 1).coerceAtLeast(0) * width).toFloat()
@@ -408,6 +430,7 @@ class RootPager(context: Context) : FrameLayout(context) {
     }
 
     override fun onDetachedFromWindow() {
+        if (prioritizeHorizontalGestures) parent?.requestDisallowInterceptTouchEvent(false)
         cancelSpring()
         recycleVelocityTracker()
         super.onDetachedFromWindow()

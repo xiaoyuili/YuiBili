@@ -5,23 +5,21 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
-import android.graphics.RectF
 import android.view.Gravity
 import android.view.View
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 
 /**
  * 平板端左侧固定导航栏（Navigation Rail，78dp 宽）：
  * - 顶部：粉色 YuiBili 品牌 Logo；
- * - 主导航区：首页 / 搜索 / 下载 / 我的收藏 / 历史记录（全部在右侧主舞台内嵌垂直平滑滚动切换，绝不跳走）；
- * - 底部锚定区：「我的」+ 夜间模式快捷切换图标（支持原圆形揭示转场）。
+ * - 主导航区：首页 / 下载 / 收藏 / 历史记录；
+ * - 底部锚定区：日夜切换与「我的」。
  */
 internal class TabletRailNav(
     context: Context,
     private val onSelectDestination: (Int) -> Unit,
-    private val onToggleTheme: (View) -> Unit
+    private val onToggleTheme: (View, Boolean) -> Unit
 ) : LinearLayout(context) {
 
     companion object {
@@ -32,20 +30,26 @@ internal class TabletRailNav(
         const val DEST_FAVORITES = 3
         const val DEST_HISTORY = 4
         const val DEST_PROFILE = 5
-        const val DEST_COUNT = 6
+        const val DEST_HISTORY_SEARCH = 6
+        const val DEST_FAVORITES_SEARCH = 7
+        const val DEST_COUNT = 8
     }
 
     private var selectedDest = DEST_HOME
     private val items = arrayOfNulls<RailItemView>(DEST_COUNT)
+    private val themeButton = HorizonThemeToggle(context, onToggleTheme)
 
     init {
         orientation = VERTICAL
         gravity = Gravity.CENTER_HORIZONTAL
         val c = Ds.colors
-        setBackgroundColor(c.surface)
+        setBackgroundColor(c.bg)
         setPadding(dp(8), dp(14), dp(8), dp(14))
 
-        // 顶部品牌徽标
+        val primary = LinearLayout(context).apply {
+            orientation = VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
         val brand = Ds.brandMark(context, COLOR_ROSE, Color.WHITE).apply {
             isClickable = true
             isFocusable = true
@@ -53,52 +57,63 @@ internal class TabletRailNav(
             Ds.bindPressFeedback(this, 0.90f)
             setOnClickListener { onSelectDestination(DEST_HOME) }
         }
-        addView(brand, LayoutParams(dp(38), dp(38)))
-        addView(View(context), LayoutParams(0, dp(16)))
+        primary.addView(brand, LayoutParams(dp(38), dp(38)))
+        primary.addView(View(context), LayoutParams(0, dp(16)))
 
-        fun addNavItem(dest: Int, kind: Int, label: String, topDp: Int = 6) {
+        fun addNavItem(dest: Int, kind: Int, label: String, topDp: Int = 6, host: LinearLayout = this) {
             val view = RailItemView(context, kind, label).apply {
                 setOnClickListener { onSelectDestination(dest) }
             }
             items[dest] = view
-            addView(view, LayoutParams(LayoutParams.MATCH_PARENT, dp(52)).apply {
+            host.addView(view, LayoutParams(LayoutParams.MATCH_PARENT, dp(52)).apply {
                 if (topDp > 0) topMargin = dp(topDp)
             })
         }
 
-        addNavItem(DEST_HOME, RailItemView.KIND_HOME, "首页", topDp = 0)
-        addNavItem(DEST_SEARCH, RailItemView.KIND_SEARCH, "搜索")
-        addNavItem(DEST_DOWNLOADS, RailItemView.KIND_DOWNLOAD, "下载")
-        addNavItem(DEST_FAVORITES, RailItemView.KIND_FAVORITE, "收藏")
-        addNavItem(DEST_HISTORY, RailItemView.KIND_HISTORY, "历史")
+        addNavItem(DEST_HOME, RailItemView.KIND_HOME, "首页", topDp = 0, host = primary)
+        addNavItem(DEST_DOWNLOADS, RailItemView.KIND_DOWNLOAD, "下载", host = primary)
+        addNavItem(DEST_FAVORITES, RailItemView.KIND_FAVORITE, "收藏", host = primary)
+        addNavItem(DEST_HISTORY, RailItemView.KIND_HISTORY, "历史", host = primary)
 
-        // 弹性留白：将「我的」置于「夜间模式」正上方
-        addView(View(context), LayoutParams(0, 0, 1f))
-
+        addView(android.widget.ScrollView(context).apply {
+            isVerticalScrollBarEnabled = false
+            addView(primary)
+        }, LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
+        addView(themeButton, LayoutParams(dp(48), dp(48)).apply { bottomMargin = dp(8) })
         addNavItem(DEST_PROFILE, RailItemView.KIND_PROFILE, "我的", topDp = 0)
-
-        val themeBtn = FrameLayout(context).apply {
-            background = Ds.card(context, c.surfaceRaised, c.lineSoft, Ds.Radius.control, Ds.hairline(context))
-            isClickable = true
-            isFocusable = true
-            contentDescription = if (Theme.isDark) "切换浅色模式" else "切换夜间模式"
-            Ds.bindPressFeedback(this, 0.90f)
-            addView(ThemeQuickIcon(context, Theme.isDark), FrameLayout.LayoutParams(dp(19), dp(19), Gravity.CENTER))
-            setOnClickListener { onToggleTheme(this) }
-        }
-        addView(themeBtn, LayoutParams(dp(44), dp(42)).apply {
-            topMargin = dp(8)
-        })
 
         setSelectedDestination(DEST_HOME)
     }
 
     fun setSelectedDestination(dest: Int) {
-        selectedDest = dest
+        selectedDest = when (dest) {
+            DEST_SEARCH -> DEST_HOME
+            DEST_HISTORY_SEARCH -> DEST_HISTORY
+            DEST_FAVORITES_SEARCH -> DEST_FAVORITES
+            else -> dest
+        }
         for (i in items.indices) {
-            items[i]?.setActive(i == dest)
+            items[i]?.setActive(i == selectedDest)
         }
     }
+
+    fun setThemeSymbolsHidden(hidden: Boolean) {
+        themeButton.symbolsHidden = hidden
+        themeButton.invalidate()
+    }
+
+    fun drawThemeTransition(canvas: Canvas, root: View, fromDark: Boolean, progress: Float) {
+        val origin = IntArray(2)
+        val location = IntArray(2)
+        root.getLocationOnScreen(origin)
+        themeButton.getLocationOnScreen(location)
+        val save = canvas.save()
+        canvas.translate((location[0] - origin[0]).toFloat(), (location[1] - origin[1]).toFloat())
+        themeButton.drawSymbols(canvas, fromDark, progress)
+        canvas.restoreToCount(save)
+    }
+
+    fun setThemeTransitionLocked(locked: Boolean) { themeButton.isEnabled = !locked }
 
     private class RailItemView(
         context: Context,
@@ -108,7 +123,6 @@ internal class TabletRailNav(
 
         companion object {
             const val KIND_HOME = 0
-            const val KIND_SEARCH = 1
             const val KIND_DOWNLOAD = 2
             const val KIND_FAVORITE = 3
             const val KIND_HISTORY = 4
@@ -196,13 +210,6 @@ internal class TabletRailNav(
                     canvas.drawPath(path, paint)
                     canvas.drawLine(cx, floor - 3.2f * d, cx, floor, paint)
                 }
-                RailItemView.KIND_SEARCH -> {
-                    val r = 5.0f * d
-                    val ccx = cx - 1.1f * d
-                    val ccy = cy - 1.1f * d
-                    canvas.drawCircle(ccx, ccy, r, paint)
-                    canvas.drawLine(ccx + r * 0.72f, ccy + r * 0.72f, cx + 6.2f * d, cy + 6.2f * d, paint)
-                }
                 RailItemView.KIND_DOWNLOAD -> {
                     canvas.drawLine(cx, cy - 6.0f * d, cx, cy + 2.4f * d, paint)
                     path.rewind()
@@ -258,39 +265,81 @@ internal class TabletRailNav(
         }
     }
 
-    private class ThemeQuickIcon(context: Context, private val dark: Boolean) : View(context) {
+    private class HorizonThemeToggle(context: Context, private val onCommit: (View, Boolean) -> Unit) : View(context) {
         private val d = resources.displayMetrics.density
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = if (dark) COLOR_ROSE else Ds.colors.muted
             style = Paint.Style.STROKE
             strokeWidth = 1.6f * d
             strokeCap = Paint.Cap.ROUND
             strokeJoin = Paint.Join.ROUND
         }
         private val path = Path()
+        var symbolsHidden = false
+
+        init {
+            isFocusable = true
+            contentDescription = if (Theme.isDark) "切换日间模式" else "切换夜间模式"
+            setOnClickListener {
+                if (isAttachedToWindow) onCommit(this, !Theme.isDark)
+            }
+        }
+
         override fun onDraw(canvas: Canvas) {
+            if (!symbolsHidden) drawSymbols(canvas, Theme.isDark, 0f)
+        }
+
+        fun drawSymbols(canvas: Canvas, fromDark: Boolean, progress: Float) {
+            val from = Ds.palette(fromDark)
+            val to = Ds.palette(!fromDark)
             val cx = width * 0.5f
-            val cy = height * 0.5f
-            if (dark) {
+            val horizon = height * 0.73f
+            val saved = canvas.save()
+            canvas.clipRect(0f, 0f, width.toFloat(), horizon - d)
+            paint.color = themeBlendColor(from.accent, to.accent, progress)
+            val outgoing = horizonOrbit(progress, incoming = false)
+            val incoming = horizonOrbit(progress, incoming = true)
+            drawBody(canvas, fromDark, cx + outgoing.first * 18f * d, horizon + outgoing.second * 14f * d)
+            drawBody(canvas, !fromDark, cx + incoming.first * 18f * d, horizon + incoming.second * 14f * d)
+            canvas.restoreToCount(saved)
+            paint.color = themeBlendColor(from.muted, to.muted, progress)
+            canvas.drawLine(cx - 15f * d, horizon, cx + 15f * d, horizon, paint)
+        }
+
+        private fun drawBody(canvas: Canvas, moon: Boolean, cx: Float, cy: Float) {
+            if (moon) {
+                val r = 6f * d
+                path.rewind()
+                path.addArc(cx - r, cy - r, cx + r, cy + r, 50f, 235f)
+                path.cubicTo(cx - 2f * d, cy - 2f * d, cx + 2f * d, cy + 2f * d,
+                    cx + r * 0.643f, cy + r * 0.766f)
+                path.close()
+                canvas.drawPath(path, paint)
+            } else {
                 canvas.drawCircle(cx, cy, 3.4f * d, paint)
                 for (i in 0 until 8) {
                     val rad = Math.toRadians(i * 45.0)
-                    val c = kotlin.math.cos(rad).toFloat()
-                    val s = kotlin.math.sin(rad).toFloat()
-                    canvas.drawLine(cx + c * 5.2f * d, cy + s * 5.2f * d, cx + c * 7.0f * d, cy + s * 7.0f * d, paint)
+                    val x = kotlin.math.cos(rad).toFloat()
+                    val y = kotlin.math.sin(rad).toFloat()
+                    canvas.drawLine(cx + x * 5.2f * d, cy + y * 5.2f * d,
+                        cx + x * 7f * d, cy + y * 7f * d, paint)
                 }
-            } else {
-                val r = 6.0f * d
-                path.rewind()
-                path.addArc(RectF(cx - r, cy - r, cx + r, cy + r), 50f, 235f)
-                path.cubicTo(
-                    cx - 1.5f * d, cy - 2.1f * d,
-                    cx + 1.9f * d, cy + 2.1f * d,
-                    cx + r * kotlin.math.cos(Math.toRadians(50.0)).toFloat(),
-                    cy + r * kotlin.math.sin(Math.toRadians(50.0)).toFloat()
-                )
-                canvas.drawPath(path, paint)
             }
         }
     }
+}
+
+internal fun themeBlendColor(from: Int, to: Int, progress: Float): Int {
+    val p = progress.coerceIn(0f, 1f)
+    var result = 0
+    for (shift in intArrayOf(24, 16, 8, 0)) {
+        val start = (from ushr shift) and 255
+        val end = (to ushr shift) and 255
+        result = result or ((start + (end - start) * p).toInt() shl shift)
+    }
+    return result
+}
+
+internal fun horizonOrbit(progress: Float, incoming: Boolean): Pair<Float, Float> {
+    val angle = -Math.PI / 2 + Math.PI * progress.coerceIn(0f, 1f) + if (incoming) Math.PI else 0.0
+    return kotlin.math.cos(angle).toFloat() to kotlin.math.sin(angle).toFloat()
 }

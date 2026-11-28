@@ -98,7 +98,7 @@ class SpaceActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        LayoutMode.applyScreenOrientation(this)
         isTabletSplit = LayoutMode.isWideScreen(this)
 
         mid = intent.getLongExtra(EXTRA_MID, 0L)

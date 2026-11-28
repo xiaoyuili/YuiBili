@@ -34,6 +34,7 @@ internal class TabletVerticalStage(context: Context) : FrameLayout(context) {
         }
         val prevIndex = currentIndex
         if (prevIndex == index) {
+            if (transitionAnim != null) return
             target.visibility = View.VISIBLE
             target.translationY = 0f
             target.alpha = 1f
@@ -96,7 +97,8 @@ internal class TabletVerticalStage(context: Context) : FrameLayout(context) {
                 target.translationY = direction * travel * (1f - p)
                 target.alpha = p.coerceIn(0f, 1f)
             }
-            addEndListener { _, _, _, _ ->
+            addEndListener { _, canceled, _, _ ->
+                if (canceled) return@addEndListener
                 fromView.visibility = View.GONE
                 fromView.translationY = 0f
                 fromView.alpha = 1f
@@ -108,5 +110,18 @@ internal class TabletVerticalStage(context: Context) : FrameLayout(context) {
             }
             start()
         }
+    }
+
+    override fun onDetachedFromWindow() {
+        transitionAnim?.cancel()
+        transitionAnim = null
+        outgoingView = null
+        incomingView = null
+        pageMap.forEach { (index, page) ->
+            page.visibility = if (index == currentIndex) View.VISIBLE else View.GONE
+            page.translationY = 0f
+            page.alpha = 1f
+        }
+        super.onDetachedFromWindow()
     }
 }

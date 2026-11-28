@@ -47,6 +47,8 @@ import java.util.Locale
 class AccountPageView(context: Context) : LinearLayout(context) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val appearanceUpdates = ArrayList<() -> Unit>()
+    private var appearancePopup: android.widget.PopupWindow? = null
 
     // ── 页面容器 ──────────────────────────────────────────────────
     private val loginPage = LinearLayout(context)
@@ -112,9 +114,7 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
     }
 
-    /** 构造「外观适配」选择行：左侧图标与标题，右侧为可点击下拉胶囊（默认手机端，可切换平板端）。 */
     private fun buildLayoutAdaptRow(): LinearLayout {
-        val c = Ds.colors
         val valueLabel = TextView(context).apply {
             text = LayoutMode.current.label
             textSize = 13f
@@ -125,11 +125,8 @@ class AccountPageView(context: Context) : LinearLayout(context) {
         val dropdownAnchor = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = Ds.pill(context, c.surfaceRaised, c.lineSoft, Ds.hairline(context))
             setPadding(dp(12), dp(6), dp(10), dp(6))
-            isClickable = true
-            isFocusable = true
-            Ds.bindPressFeedback(this, 0.94f)
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
             addView(valueLabel, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
             addView(
                 LayoutMode.dropdownChevronIcon(context, COLOR_MUTED),
@@ -137,7 +134,8 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             )
         }
         val openDropdown = View.OnClickListener {
-            LayoutMode.showModeDropdown(context, dropdownAnchor) { picked ->
+            appearancePopup?.dismiss()
+            appearancePopup = LayoutMode.showModeDropdown(context, dropdownAnchor) { picked ->
                 if (LayoutMode.setMode(context, picked)) {
                     valueLabel.text = picked.label
                     Toast.makeText(context, "已切换为${picked.label}外观", Toast.LENGTH_SHORT).show()
@@ -148,9 +146,8 @@ class AccountPageView(context: Context) : LinearLayout(context) {
                     }
                 }
             }
+            appearancePopup?.setOnDismissListener { appearancePopup = null }
         }
-        dropdownAnchor.setOnClickListener(openDropdown)
-
         val row = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -158,6 +155,7 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             isClickable = true
             isFocusable = true
             setOnClickListener(openDropdown)
+            contentDescription = "外观适配：${LayoutMode.current.label}"
             val iconHost = FrameLayout(context).apply {
                 background = Ds.card(context, COLOR_ROSE_SOFT, null, Ds.Radius.chip, 0)
                 addView(
@@ -180,82 +178,154 @@ class AccountPageView(context: Context) : LinearLayout(context) {
 
     /** 构造包含「夜间模式」与「外观适配」的统一外观卡片（登录态与游客态均可用）。 */
     private fun buildAppearanceCard(): LinearLayout {
-        val darkSwitch = PillSwitch(context, Theme.isDark)
         val appearanceCard = LinearLayout(context).apply {
             orientation = VERTICAL
             background = Ds.card(context, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card)
             setPadding(0, dp(2), 0, dp(2))
         }
-        val darkRow = LinearLayout(context).apply {
-            orientation = HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(Ds.Space.lg), 0, dp(Ds.Space.lg), 0)
-            isClickable = true
-            isFocusable = true
-            addView(
-                iconChip(MenuIconView.MOON),
-                LayoutParams(dp(34), dp(34)).apply { rightMargin = dp(Ds.Space.md) }
-            )
-            addView(TextView(context).apply {
-                text = "夜间模式"
+        if (!LayoutMode.isTablet) {
+            val darkSwitch = PillSwitch(context, Theme.isDark)
+            val darkRow = LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(Ds.Space.lg), 0, dp(Ds.Space.lg), 0)
+                isClickable = true
+                isFocusable = true
+                addView(iconChip(MenuIconView.MOON),
+                    LayoutParams(dp(34), dp(34)).apply { rightMargin = dp(Ds.Space.md) })
+                addView(TextView(context).apply {
+                    text = "夜间模式"
+                    textSize = 15f
+                    typeface = Ds.body(true)
+                    setTextColor(COLOR_INK)
+                }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+                addView(darkSwitch, LayoutParams(dp(48), dp(28)))
+                setOnClickListener { toggleDarkMode(darkSwitch, darkSwitch) }
+                darkSwitch.setOnClickListener { toggleDarkMode(darkSwitch, darkSwitch) }
+            }
+            bindRowPress(darkRow)
+            appearanceCard.addView(darkRow, LayoutParams(LayoutParams.MATCH_PARENT, dp(56)))
+            appearanceCard.addView(View(context).apply { setBackgroundColor(Ds.colors.lineSoft) },
+                LayoutParams(LayoutParams.MATCH_PARENT, Ds.hairline(context)).apply {
+                    leftMargin = dp(Ds.Space.lg + 34 + Ds.Space.md)
+                    rightMargin = dp(Ds.Space.lg)
+                })
+        }
+        appearanceCard.addView(buildLayoutAdaptRow(), LayoutParams(LayoutParams.MATCH_PARENT, dp(56)))
+        fun addChoice(title: String, icon: Int, labels: List<String>, current: () -> Int, select: (Int) -> Unit) {
+            appearanceCard.addView(View(context).apply { setBackgroundColor(Ds.colors.lineSoft) },
+                LayoutParams(LayoutParams.MATCH_PARENT, Ds.hairline(context)).apply {
+                    leftMargin = dp(Ds.Space.lg + 34 + Ds.Space.md)
+                    rightMargin = dp(Ds.Space.lg)
+                })
+            val row = LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = dp(56)
+                setPadding(dp(Ds.Space.lg), dp(6), dp(Ds.Space.lg), dp(6))
+                isFocusable = true
+            }
+            row.addView(iconChip(icon), LayoutParams(dp(34), dp(34)).apply { rightMargin = dp(Ds.Space.md) })
+            row.addView(TextView(context).apply {
+                text = title
                 textSize = 15f
                 typeface = Ds.body(true)
                 setTextColor(COLOR_INK)
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
-            addView(darkSwitch, LayoutParams(dp(48), dp(28)))
-            setOnClickListener { toggleDarkMode(darkSwitch, darkSwitch) }
-            darkSwitch.setOnClickListener { toggleDarkMode(darkSwitch, darkSwitch) }
-        }
-        bindRowPress(darkRow)
-        appearanceCard.addView(darkRow, LayoutParams(LayoutParams.MATCH_PARENT, dp(56)))
-
-        // 细分割线 + 外观适配（手机端 / 平板端下拉切换）
-        appearanceCard.addView(
-            View(context).apply { setBackgroundColor(Ds.colors.lineSoft) },
-            LayoutParams(LayoutParams.MATCH_PARENT, Ds.hairline(context)).apply {
-                leftMargin = dp(Ds.Space.lg + 34 + Ds.Space.md)
-                rightMargin = dp(Ds.Space.lg)
+            val value = TextView(context).apply {
+                textSize = 13f
+                typeface = Ds.body(true)
+                includeFontPadding = false
+                setTextColor(COLOR_INK)
+                maxLines = 1
+                maxWidth = dp(130)
+                ellipsize = TextUtils.TruncateAt.END
             }
-        )
-        appearanceCard.addView(buildLayoutAdaptRow(), LayoutParams(LayoutParams.MATCH_PARENT, dp(56)))
+            val anchor = LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(6), dp(10), dp(6))
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                addView(value)
+                addView(LayoutMode.dropdownChevronIcon(context, COLOR_MUTED), LayoutParams(dp(14), dp(14)).apply { leftMargin = dp(4) })
+            }
+            row.addView(anchor, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(8) })
+            val update = {
+                value.text = labels[current()]
+                row.contentDescription = "$title：${value.text}"
+            }
+            appearanceUpdates.add(update)
+            update()
+            row.setOnClickListener {
+                showAppearanceChoices(anchor, title, labels, current()) { index ->
+                    select(index)
+                    appearanceUpdates.forEach { it() }
+                }
+            }
+            bindRowPress(row)
+            appearanceCard.addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        }
+        val directions = LayoutMode.ScreenDirection.entries
+        addChoice("屏幕方向", MenuIconView.DIRECTION, directions.map { it.label }, { directions.indexOf(LayoutMode.screenDirection(context)) }) { i ->
+            (context as? Activity)?.let { LayoutMode.setScreenDirection(it, directions[i]) }
+        }
+        val qualities = PreferredVideoQuality.choices
+        addChoice("默认画质", MenuIconView.QUALITY, qualities.map(PreferredVideoQuality::label), { qualities.indexOf(PreferredVideoQuality.setting(context)) }) { i ->
+            PreferredVideoQuality.set(context, qualities[i])
+        }
         return appearanceCard
+    }
+
+    private fun showAppearanceChoices(anchor: View, title: String, labels: List<String>, selected: Int, onPick: (Int) -> Unit) {
+        appearancePopup?.dismiss()
+        val c = Ds.colors
+        val column = LinearLayout(context).apply {
+            orientation = VERTICAL
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+        }
+        val scroll = ScrollView(context).apply {
+            isVerticalScrollBarEnabled = false
+            background = Ds.card(context, c.surface, c.line, Ds.Radius.control)
+            addView(column)
+        }
+        val popup = android.widget.PopupWindow(scroll, dp(192), LayoutParams.WRAP_CONTENT, true).apply {
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            isOutsideTouchable = true
+            elevation = dp(8).toFloat()
+            inputMethodMode = android.widget.PopupWindow.INPUT_METHOD_NOT_NEEDED
+        }
+        labels.forEachIndexed { index, label ->
+            column.addView(TextView(context).apply {
+                text = label
+                textSize = 13f
+                typeface = Ds.body(index == selected)
+                setTextColor(if (index == selected) c.accent else c.text)
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                minimumHeight = dp(44)
+                gravity = Gravity.CENTER_VERTICAL
+                isSelected = index == selected
+                isFocusable = true
+                contentDescription = "$title：$label"
+                if (isSelected) background = Ds.card(context, c.accentSoft, null, Ds.Radius.chip, 0)
+                setOnClickListener { popup.dismiss(); onPick(index) }
+                Ds.bindPressFeedback(this, 0.97f)
+            }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        }
+        val visible = android.graphics.Rect()
+        anchor.getWindowVisibleDisplayFrame(visible)
+        popup.width = minOf(dp(192), (visible.width() - dp(24)).coerceAtLeast(dp(120)))
+        column.measure(View.MeasureSpec.makeMeasureSpec(popup.width, View.MeasureSpec.EXACTLY), View.MeasureSpec.UNSPECIFIED)
+        popup.height = minOf(column.measuredHeight, (visible.height() * .55f).toInt())
+        popup.setOnDismissListener { appearancePopup = null }
+        appearancePopup = popup
+        popup.showAsDropDown(anchor, anchor.width - popup.width, dp(6))
+        scroll.post { scroll.scrollTo(0, (column.getChildAt(selected).top - popup.height / 2).coerceAtLeast(0)) }
     }
 
     private fun buildLoginPage() {
         loginPage.orientation = VERTICAL
         loginPage.setPadding(dp(Ds.Space.lg), dp(Ds.Space.xl), dp(Ds.Space.lg), dp(96))
-
-        // 顶部主题开关小条，方便未登录时同样能切换夜间模式
-        val topAction = LinearLayout(context).apply {
-            orientation = HORIZONTAL
-            gravity = Gravity.END or Gravity.CENTER_VERTICAL
-        }
-        val guestDarkSwitch = PillSwitch(context, Theme.isDark)
-        val guestToggleChip = LinearLayout(context).apply {
-            orientation = HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            background = Ds.pill(context, COLOR_CARD, Ds.colors.lineSoft)
-            setPadding(dp(12), dp(6), dp(8), dp(6))
-            isClickable = true
-            isFocusable = true
-            Ds.bindPressFeedback(this, 0.96f)
-            addView(
-                MenuIconView(context, MenuIconView.MOON, COLOR_ROSE),
-                LayoutParams(dp(16), dp(16)).apply { rightMargin = dp(6) }
-            )
-            addView(TextView(context).apply {
-                text = "夜间"
-                textSize = 12f
-                typeface = Ds.body(true)
-                setTextColor(COLOR_INK)
-            }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
-                rightMargin = dp(8)
-            })
-            addView(guestDarkSwitch, LayoutParams(dp(40), dp(22)))
-            setOnClickListener { toggleDarkMode(guestDarkSwitch, guestDarkSwitch) }
-        }
-        topAction.addView(guestToggleChip)
-        loginPage.addView(topAction, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
 
         val heroCard = LinearLayout(context).apply {
             orientation = VERTICAL
@@ -384,9 +454,7 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             })
             loginPage.addView(split, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         } else {
-            loginPage.addView(heroCard, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(Ds.Space.md)
-            })
+            loginPage.addView(heroCard, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
             loginPage.addView(sectionLabel("外观"), sectionParams(Ds.Space.lg))
             loginPage.addView(guestAppearance, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(Ds.Space.sm)
@@ -723,6 +791,7 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             refresh(soft = true)
             playEntrance()
         } else {
+            appearancePopup?.dismiss()
             qrRequestGeneration++
             stopQrPolling()
             profileGeneration++
@@ -734,9 +803,11 @@ class AccountPageView(context: Context) : LinearLayout(context) {
 
     private fun refresh(soft: Boolean = false) {
         if (!active) return
+        appearanceUpdates.forEach { it() }
         BiliSessionStore.init(context)
         if (BiliSessionStore.isLoggedIn()) {
             stopQrPolling()
+            if (loginPage.visibility == View.VISIBLE) appearancePopup?.dismiss()
             loginPage.visibility = View.GONE
             profilePage.visibility = View.VISIBLE
             loadProfile(soft = soft && profileBound)
@@ -744,6 +815,7 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             profileBound = false
             lastBoundProfile = null
             lastProfileFace = ""
+            if (profilePage.visibility == View.VISIBLE) appearancePopup?.dismiss()
             loginPage.visibility = View.VISIBLE
             profilePage.visibility = View.GONE
             if (qrKey.isBlank()) startQrLogin() else startPolling()
@@ -952,6 +1024,8 @@ class AccountPageView(context: Context) : LinearLayout(context) {
 
     fun syncCachedProfile(info: BiliLoginApi.UserInfo) {
         if (!BiliSessionStore.isLoggedIn()) return
+        if (loginPage.visibility == View.VISIBLE) appearancePopup?.dismiss()
+        appearanceUpdates.forEach { it() }
         loginPage.visibility = View.GONE
         profilePage.visibility = View.VISIBLE
         lastProfileFetchAt = System.currentTimeMillis()
@@ -1235,6 +1309,8 @@ class AccountPageView(context: Context) : LinearLayout(context) {
             const val ABOUT = 4
             const val DOWNLOADS = 5
             const val MOON = 6
+            const val DIRECTION = 7
+            const val QUALITY = 8
         }
 
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -1308,6 +1384,20 @@ class AccountPageView(context: Context) : LinearLayout(context) {
                     canvas.drawLine(cx - dpf(7.0f), cy + dpf(3.0f), cx - dpf(7.0f), cy + dpf(6.8f), paint)
                     canvas.drawLine(cx + dpf(7.0f), cy + dpf(3.0f), cx + dpf(7.0f), cy + dpf(6.8f), paint)
                     canvas.drawLine(cx - dpf(7.0f), cy + dpf(6.8f), cx + dpf(7.0f), cy + dpf(6.8f), paint)
+                }
+                DIRECTION -> {
+                    canvas.drawRoundRect(cx - dpf(3.5f), cy - dpf(6.5f), cx + dpf(3.5f), cy + dpf(6.5f), dpf(1.2f), dpf(1.2f), paint)
+                    canvas.drawLine(cx + dpf(6f), cy - dpf(3f), cx + dpf(6f), cy + dpf(3f), paint)
+                    canvas.drawLine(cx + dpf(6f), cy + dpf(3f), cx + dpf(8f), cy + dpf(1f), paint)
+                    canvas.drawLine(cx - dpf(6f), cy + dpf(3f), cx - dpf(6f), cy - dpf(3f), paint)
+                    canvas.drawLine(cx - dpf(6f), cy - dpf(3f), cx - dpf(8f), cy - dpf(1f), paint)
+                }
+                QUALITY -> {
+                    canvas.drawRoundRect(cx - dpf(8f), cy - dpf(5.7f), cx + dpf(8f), cy + dpf(5.7f), dpf(1.7f), dpf(1.7f), paint)
+                    fill.textSize = dpf(6.5f)
+                    fill.typeface = Ds.body(true)
+                    fill.textAlign = Paint.Align.CENTER
+                    canvas.drawText("HD", cx, cy - (fill.ascent() + fill.descent()) / 2f, fill)
                 }
                 MOON -> {
                     val path = Path()

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img alt="版本" src="https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v1.0.0-ff8fb1?style=flat-square"/>
+  <img alt="版本" src="https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v1.1.0-ff8fb1?style=flat-square"/>
   <img alt="架构" src="https://img.shields.io/badge/ABI-arm64--v8a-4c9aff?style=flat-square"/>
   <img alt="系统" src="https://img.shields.io/badge/Android-6.0%2B-6cc24a?style=flat-square"/>
 </p>
@@ -60,7 +60,7 @@ YuiBili 追求简单、安静、顺手的看视频体验：没有广告、没有
 
 ## 下载与安装
 
-前往本仓库右侧的 **[Releases](../../releases)** 页面，下载最新版 `arm64-v8a` 安装包（适用于绝大多数近几年的 Android 手机与平板），直接安装即可。
+前往本仓库右侧的 **[Releases](../../releases)** 页面，下载最新版 `arm64-v8a` 安装包（适用于绝大多数近几年的 Android 手机与平板），直接安装即可。版本变化请查看 [更新日志](CHANGELOG.md)。
 
 > 如需在手机或平板上开启平板布局：打开软件进入「我的 → 外观 → 外观适配 → 平板端」。
 

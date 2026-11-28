@@ -5,22 +5,15 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
-import android.media.MediaCodec
-import android.media.MediaExtractor
-import android.media.MediaFormat
-import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.provider.MediaStore
 import android.util.Log
-import android.webkit.MimeTypeMap
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -161,7 +154,16 @@ object DownloadManager {
         var audioPath: String = ""
         /** 单文件流(durl)任务：各分片本地路径（多于1个时用 ConcatenatingMediaSource）。 */
         val singlePaths = CopyOnWriteArrayList<String>()
-        val galleryExports = CopyOnWriteArrayList<String>()
+        val galleryExports = CopyOnWriteArrayList<String>() // 旧版导出记录，不作为播放源。
+        var destination = DownloadDestination.PRIVATE
+            internal set
+        @Volatile internal var stage: DownloadStage? = null
+        @Volatile internal var libraryNames: List<String> = emptyList()
+        @Volatile internal var libraryLengths: List<Long> = emptyList()
+        internal var libraryVersion: String = ""
+        @Volatile var publicUris: List<String> = emptyList()
+            internal set
+        internal var cleanupPending = false
         /** 下载中置 true；暂停/删除时置 true 让 worker 快速退出。 */
         @Volatile var cancelRequested: Boolean = false
         /** 是否正在被 worker 执行。 */
@@ -170,6 +172,11 @@ object DownloadManager {
 
         fun playable(): Boolean {
             if (state != STATE_COMPLETED) return false
+            if (destination == DownloadDestination.LIBRARY) {
+                // 构建离线队列时不逐集访问 MediaProvider；真正打开时校验对应文件。
+                return publicUris.isNotEmpty() && publicUris.size == libraryNames.size &&
+                    libraryLengths.size == libraryNames.size && libraryLengths.all { it > 0L }
+            }
             return when {
                 mpdPath.isNotBlank() -> File(mpdPath).exists()
                 audioPath.isNotBlank() -> File(audioPath).exists()
@@ -182,9 +189,8 @@ object DownloadManager {
     private var appContext: Context? = null
     @Volatile private var initialized = false
 
-    /** 相册导出（mp4 合并/MediaStore 写入）专用线程，避免阻塞下载 worker。 */
-    private val galleryIo = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "YuiBiliGalleryExport").apply { isDaemon = true }
+    private val cleanupIo = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "YuiBiliDownloadCleanup").apply { isDaemon = true }
     }
     private val taskIo = java.util.concurrent.ThreadPoolExecutor(
         1, 1, 15L, java.util.concurrent.TimeUnit.SECONDS, java.util.concurrent.LinkedBlockingQueue()
@@ -194,6 +200,8 @@ object DownloadManager {
 
     private val lock = java.lang.Object()
     private val tasks = LinkedHashMap<Long, Task>()
+    // 删除意图与任务记录原子落盘，进程中断后依然能按精确 URI 收尾。
+    private val removedTasks = LinkedHashMap<Long, Task>()
     private val queue = LinkedHashSet<Long>()
     private val listeners = CopyOnWriteArrayList<(List<Task>) -> Unit>()
     private val main: Handler by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { Handler(Looper.getMainLooper()) }
@@ -212,7 +220,7 @@ object DownloadManager {
     private var workersStarted = false
 
     private val lastNotifyAt = AtomicLong(0L)
-    private val galleryWork = AtomicInteger()
+    private val cleanupWork = AtomicInteger()
     private var downloadDir: File? = null
     private var notificationManager: NotificationManager? = null
 
@@ -221,17 +229,24 @@ object DownloadManager {
     /** 下载目录（供 UI 统计占用、清理残留等）。 */
     fun downloadDir(): File? = downloadDir
 
-    fun init(context: Context) {
-        if (initialized) return
+    fun init(context: Context): Boolean {
+        if (initialized) return true
         val hasPendingTransfers = synchronized(lock) {
-            if (initialized) return
+            if (initialized) return true
             val application = context.applicationContext
             BiliSessionStore.init(application)
             appContext = application
             downloadDir = File(application.filesDir, "downloads").apply { mkdirs() }
             notificationManager = application.getSystemService(NotificationManager::class.java)
             createNotificationChannel()
-            load()
+            if (!load()) return false
+            idSeq.set(maxOf(idSeq.get(), tasks.keys.maxOrNull() ?: 0L, removedTasks.keys.maxOrNull() ?: 0L))
+            if (removedTasks.isNotEmpty()) cleanRemovedTasks(removedTasks.values.toList())
+            for (t in tasks.values) {
+                if (t.cleanupPending && t.destination == DownloadDestination.LIBRARY && t.state == STATE_COMPLETED) {
+                    scheduleCleanup { cleanCommittedStage(t) }
+                }
+            }
             initialized = true
             queue.isNotEmpty()
         }
@@ -239,6 +254,7 @@ object DownloadManager {
             if (context !is DownloadService) startDownloadService(context)
             kick()
         }
+        return true
     }
 
     // ── 对外 API ────────────────────────────────────────────────
@@ -250,6 +266,15 @@ object DownloadManager {
 
     fun task(id: Long): Task? = synchronized(lock) { tasks[id] }
 
+    fun defaultDestination(context: Context): DownloadDestination = DownloadDestination.fromKey(
+        context.getSharedPreferences("download_storage", Context.MODE_PRIVATE).getString("destination", null)
+    )
+
+    fun setDefaultDestination(context: Context, destination: DownloadDestination) {
+        context.getSharedPreferences("download_storage", Context.MODE_PRIVATE).edit()
+            .putString("destination", destination.key).apply()
+    }
+
     fun enqueueVideo(
         context: Context,
         item: VideoItem,
@@ -260,8 +285,7 @@ object DownloadManager {
         groupCoverUrl: String = "",
         episodeNo: Int = 0
     ) {
-        init(context)
-        if (item.charge) return
+        if (!init(context) || item.charge) return
         synchronized(lock) {
             val existing = tasks.values.firstOrNull {
                 it.type == TYPE_VIDEO && it.bvid == item.bvid && it.cid == item.cid &&
@@ -270,7 +294,7 @@ object DownloadManager {
             if (existing != null) return
             val t = Task().apply {
                 id = idSeq.incrementAndGet()
-                type = TYPE_VIDEO
+                type = TYPE_VIDEO; destination = defaultDestination(context)
                 bvid = item.bvid; cid = item.cid; aid = item.aid
                 title = item.title; owner = item.owner; coverUrl = item.cover
                 this.quality = quality; qualityLabel = label
@@ -295,8 +319,7 @@ object DownloadManager {
         groupCoverUrl: String = "",
         episodeNo: Int = 0
     ) {
-        init(context)
-        if (item.charge) return
+        if (!init(context) || item.charge) return
         synchronized(lock) {
             val existing = tasks.values.firstOrNull {
                 it.type == TYPE_AUDIO && it.bvid == item.bvid && it.cid == item.cid && it.state != STATE_COMPLETED
@@ -304,7 +327,7 @@ object DownloadManager {
             if (existing != null) return
             val t = Task().apply {
                 id = idSeq.incrementAndGet()
-                type = TYPE_AUDIO
+                type = TYPE_AUDIO; destination = defaultDestination(context)
                 bvid = item.bvid; cid = item.cid; aid = item.aid
                 title = item.title; owner = item.owner; coverUrl = item.cover
                 qualityLabel = "仅音频"
@@ -329,7 +352,7 @@ object DownloadManager {
         groupCoverUrl: String = "",
         episodeNo: Int = 0
     ) {
-        init(context)
+        if (!init(context)) return
         synchronized(lock) {
             val existing = tasks.values.firstOrNull {
                 it.type == TYPE_COVER && it.bvid == item.bvid && it.cid == item.cid && it.state != STATE_COMPLETED
@@ -354,8 +377,7 @@ object DownloadManager {
 
     /** 评论图片（评论区图片直链）下载任务。 */
     fun enqueueComment(context: Context, title: String, url: String, owner: String = "") {
-        init(context)
-        if (url.isBlank()) return
+        if (!init(context) || url.isBlank()) return
         synchronized(lock) {
             val existing = tasks.values.firstOrNull {
                 it.type == TYPE_COMMENT && it.coverUrl == url && it.state != STATE_COMPLETED
@@ -378,8 +400,7 @@ object DownloadManager {
 
     /** 按直链下载封面图片（合集封面等非主视频封面场景）。 */
     fun enqueueCoverUrl(context: Context, title: String, url: String) {
-        init(context)
-        if (url.isBlank()) return
+        if (!init(context) || url.isBlank()) return
         synchronized(lock) {
             val existing = tasks.values.firstOrNull {
                 it.type == TYPE_COVER && it.coverUrl == url && it.state != STATE_COMPLETED
@@ -475,6 +496,7 @@ object DownloadManager {
             var changed = false
             for (id in ids) {
                 val task = tasks.remove(id) ?: continue
+                removedTasks[id] = task
                 queue.remove(id)
                 synchronized(task) {
                     task.cancelRequested = true
@@ -491,22 +513,29 @@ object DownloadManager {
         notifyListeners()
     }
 
-    private fun cleanRemovedTasks(removed: List<Task>) {
-        galleryWork.incrementAndGet()
-        taskIo.execute {
-            galleryIo.execute {
-                try {
-                    val ids = removed.mapTo(HashSet()) { it.id }
-                    downloadDir?.listFiles()?.forEach { file ->
-                        val id = file.name.substringBefore('_').removeSuffix(".mpd").toLongOrNull()
-                        if (id != null && id in ids) file.delete()
-                    }
-                    removed.forEach(::deleteGalleryExports)
-                } finally {
-                    galleryWork.decrementAndGet()
-                    notifyListeners()
+    private fun cleanRemovedTasks(removed: List<Task>) = scheduleCleanup {
+        val ctx = checkNotNull(appContext)
+        val dir = checkNotNull(downloadDir)
+        persistCheckpoint()
+        for (t in removed) {
+            try {
+                // 旧记录没有按任务生成的公共文件标识；用户自己的同名文件不得随缓存删除。
+                t.libraryNames.forEach { name -> DownloadMediaLibrary.delete(ctx, t.type == TYPE_AUDIO, t.id, name) }
+                if (DownloadPrivateFiles.clean(dir, t.id, includeCover = true)) synchronized(lock) {
+                    removedTasks.remove(t.id)
+                    saveLocked()
                 }
+            } catch (e: Exception) {
+                Log.w("Downloads", "Unable to finish deleting task ${t.id}", e)
             }
+        }
+    }
+
+    private fun scheduleCleanup(work: () -> Unit) {
+        cleanupWork.incrementAndGet()
+        cleanupIo.execute {
+            try { work() } catch (e: Exception) { Log.w("Downloads", "Download cleanup deferred", e) }
+            finally { cleanupWork.decrementAndGet(); notifyListeners() }
         }
     }
 
@@ -581,6 +610,7 @@ object DownloadManager {
 
     /** 读取单任务实际磁盘占用（O(1) 命中后台聚合缓存，零主线程目录遍历）。 */
     fun taskDiskBytes(task: Task): Long {
+        if (task.destination == DownloadDestination.LIBRARY && task.state == STATE_COMPLETED) return task.bytesTotal
         cachedTaskDiskMap[task.id]?.takeIf { it > 0L }?.let { return it }
         return when {
             task.bytesTotal > 0L && task.state == STATE_COMPLETED -> task.bytesTotal
@@ -737,6 +767,7 @@ object DownloadManager {
                 execute(task)
             } finally {
                 synchronized(lock) {
+                    task.activeCall = null
                     task.running = false
                     if (task.state != STATE_QUEUED) queue.remove(task.id)
                     if (queue.isNotEmpty()) lock.notifyAll()
@@ -768,20 +799,23 @@ object DownloadManager {
     private fun execute(t: Task) {
         val dir = downloadDir ?: run { fail(t, "存储不可用"); return }
         try {
+            if (t.destination == DownloadDestination.LIBRARY) {
+                checkNotCancelled(t)
+                if (DownloadMediaLibrary.needsPermission(checkNotNull(appContext))) throw IOException("请授予存储权限后重试")
+                val staged = t.stage
+                if (staged != null && adoptLibraryBatch(t, staged)) return
+                if (staged != null && staged.isIntact(dir, t.id)) {
+                    saveToLibrary(t, staged, dir)
+                    return
+                }
+                t.stage = null
+            }
             when (t.type) {
                 TYPE_COVER -> runCover(t, dir)
                 TYPE_AUDIO -> runAudio(t, dir)
                 TYPE_COMMENT -> runComment(t, dir)
                 else -> runVideo(t, dir)
             }
-        } catch (c: CancelledException) {
-            synchronized(t) {
-                if (t.state == STATE_RUNNING) t.state = STATE_PAUSED
-            }
-            t.resetSpeed()
-            t.cancelRequested = false
-            save()
-            notifyListeners()
         } catch (e: Exception) {
             fail(t, e.message?.takeIf { it.isNotBlank() } ?: "下载失败")
         }
@@ -861,7 +895,7 @@ object DownloadManager {
         t.bytesDone = out.length()
         t.bytesTotal = out.length()
         t.resumeOffset = 0L
-        complete(t)
+        complete(t, DownloadStage(DownloadLayout.AUDIO, listOf(out.length())))
     }
 
     private fun runVideo(t: Task, dir: File) {
@@ -890,13 +924,14 @@ object DownloadManager {
                     stream.durationMs, 0L
                 ))
             }
+            t.mpdPath = ""
             t.singlePaths.clear()
             var segIndex = 0
             var segDone = 0L
             for (segment in segments) {
                 checkNotCancelled(t)
                 val urls = segment.urls.filter { it.isNotBlank() }
-                if (urls.isEmpty()) continue
+                if (urls.isEmpty()) throw IOException("第 ${segIndex + 1} 个视频分片缺少下载地址")
                 val segFile = File(dir, "${t.id}_seg${segIndex++}.mp4")
                 t.singlePaths.add(segFile.absolutePath)
                 t.bytesTotal = -1L
@@ -907,12 +942,13 @@ object DownloadManager {
                     t.sampleSpeed()
                     maybeNotify()
                 }
+                if (segment.sizeBytes > 0L && segFile.length() != segment.sizeBytes) throw IOException("第 $segIndex 个视频分片长度不符")
                 segDone += segFile.length()
             }
             t.bytesTotal = t.singlePaths.sumOf { File(it).length() }
             t.bytesDone = t.bytesTotal
             t.resumeOffset = 0L
-            complete(t)
+            complete(t, DownloadStage(DownloadLayout.SEGMENTS, t.singlePaths.map { File(it).length() }))
             return
         }
 
@@ -949,6 +985,12 @@ object DownloadManager {
         t.bytesDone = videoFile.length() + (if (audio != null) audioFile.length() else 0L)
         t.bytesTotal = t.bytesDone
         t.resumeOffset = 0L
+        t.qualityLabel = BiliPlayUrl.qualityLabel(video.id).replace("P", "p")
+        val stage = DownloadStage(DownloadLayout.DASH, listOfNotNull(videoFile.length(), audio?.let { audioFile.length() }))
+        if (t.destination == DownloadDestination.LIBRARY) {
+            complete(t, stage)
+            return
+        }
 
         // 生成本地 MPD：BaseURL 指向本地文件，区间与原始布局一致
         val mpdFile = File(dir, "${t.id}.mpd")
@@ -976,8 +1018,7 @@ object DownloadManager {
         )
         mpdFile.writeText(BiliDashManifest.build(streamForMpd))
         t.mpdPath = mpdFile.absolutePath
-        t.qualityLabel = BiliPlayUrl.qualityLabel(video.id).replace("P", "p")
-        complete(t)
+        complete(t, stage)
     }
 
     // ── 内部：流获取与轨道选择 ─────────────────────────────────
@@ -1114,29 +1155,15 @@ object DownloadManager {
                     }
                     requireMediaResponse(response, code)
                     val body = response.body ?: throw IOException("媒体响应体为空")
-                    val append = if (code == 206 && start > 0L) {
-                        val contentRange = MediaTransportPolicy.parseContentRange(response.header("Content-Range"))
-                            ?: throw IllegalStateException("206 续传缺少合法 Content-Range")
-                        if (!contentRange.isSatisfiableRange || contentRange.start != start) {
-                            throw IllegalStateException("206 续传偏移不匹配（期待 $start，实际 ${contentRange.start}）")
-                        }
-                        if (contentRange.total != null && contentRange.total < start) {
-                            throw IllegalStateException("206 总长度小于本地已写偏移")
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                    val contentRange = if (append) {
-                        MediaTransportPolicy.parseContentRange(response.header("Content-Range"))
+                    val contentRange = if (code == 206) {
+                        val range = MediaTransportPolicy.parseContentRange(response.header("Content-Range"))
+                            ?: throw IOException("206 续传缺少合法 Content-Range")
+                        if (!range.isSatisfiableRange || range.start != start) throw IOException("206 续传偏移不匹配")
+                        range
                     } else null
+                    val append = contentRange != null && start > 0L
                     val bodyLength = body.contentLength()
-                    val fullLength = when {
-                        append && contentRange?.total != null -> contentRange.total
-                        append && bodyLength >= 0L -> start + bodyLength
-                        !append && bodyLength >= 0L -> bodyLength
-                        else -> -1L
-                    }
+                    val fullLength = if (contentRange == null) bodyLength else contentRange.total ?: -1L
                     if (fullLength > 0L) {
                         val absolute = base + fullLength
                         if (absolute != t.bytesTotal) {
@@ -1163,9 +1190,10 @@ object DownloadManager {
                         if (bodyLength >= 0L && written < bodyLength) {
                             throw IllegalStateException("响应被截断（$written/$bodyLength 字节）")
                         }
-                        if (append && contentRange?.total != null && start + written != contentRange.total) {
-                            throw IllegalStateException("续传总字节不一致（${start + written}/${contentRange.total}）")
+                        if (contentRange != null && !contentRange.completesOpenEndedRequest(start, written)) {
+                            throw IOException("分片尚未确认完整，已保留断点（${start + written}/${contentRange.total ?: "未知"}）")
                         }
+                        if (t.destination == DownloadDestination.LIBRARY) fos.fd.sync()
                         return
                     } finally {
                         fos.close()
@@ -1174,6 +1202,7 @@ object DownloadManager {
             } catch (c: CancelledException) {
                 throw c
             } catch (e: Exception) {
+                checkNotCancelled(t)
                 lastError = e
             }
         }
@@ -1258,7 +1287,12 @@ object DownloadManager {
 
     // ── 内部：状态落库 ──────────────────────────────────────────
 
-    private fun complete(t: Task) {
+    private fun complete(t: Task, stage: DownloadStage? = null) {
+        if (t.destination == DownloadDestination.LIBRARY) {
+            t.stage = checkNotNull(stage)
+            saveToLibrary(t, stage, checkNotNull(downloadDir))
+            return
+        }
         synchronized(t) {
             checkNotCancelled(t)
             if (t.state != STATE_RUNNING) return
@@ -1269,287 +1303,103 @@ object DownloadManager {
         }
         t.resetSpeed()
         save()
-        if (t.type == TYPE_VIDEO) scheduleGalleryWork { exportToGallery(t) }
         notifyListeners()
     }
 
-    private fun scheduleGalleryWork(work: () -> Unit) {
-        galleryWork.incrementAndGet()
-        galleryIo.execute {
-            try {
-                work()
-            } finally {
-                galleryWork.decrementAndGet()
-                notifyListeners()
-            }
-        }
-    }
-
     private fun fail(t: Task, message: String) {
-        synchronized(t) {
-            if (t.state == STATE_RUNNING) {
+        synchronized(lock) {
+            if (tasks[t.id] !== t || t.state != STATE_RUNNING) return
+            if (t.cancelRequested) {
+                t.state = STATE_PAUSED
+                t.cancelRequested = false
+            } else {
                 t.state = STATE_FAILED
                 t.error = message
                 t.finishedAt = System.currentTimeMillis()
             }
+            t.resetSpeed()
+            saveLocked()
         }
-        t.resetSpeed()
-        save()
         notifyListeners()
     }
 
-    // ─────────────────────────────────────────────────
-    //  相册导出：下载产物复制到公共媒体库（Pictures/YuiBili、Movies/YuiBili），
-    //  让系统相册 / 文件管理器能看到。应用私有目录不会被媒体扫描。
-    //  Android 10+ 走 MediaStore（免权限）；旧系统回退公共目录 + MediaScanner。
-    //  任何失败都静默跳过，绝不影响下载主流程。
-    // ─────────────────────────────────────────────────
-
-    private fun exportToGallery(t: Task) {
-        val ctx = appContext ?: return
-        if (t.state != STATE_COMPLETED) return
-        // 任务已被删除时不再导出，避免删除后相册里又冒出副本
-        if (synchronized(lock) { !tasks.containsKey(t.id) }) return
-        // 封面导出：只由独立封面任务(TYPE_COVER)负责，且仅在用户开启「封面图片」时才会创建；
-        // 视频/音频任务内部的封面(coverPath)仅用于列表缩略图，不导出到相册，
-        // 避免用户没开封面开关时相册里也自动出现一张封面。
-        if (t.type == TYPE_COVER && t.coverPath.isNotBlank()) {
-            val cover = File(t.coverPath)
-            if (cover.exists() && cover.length() > 0L) {
-                exportToMediaStore(ctx, t, cover, "Pictures/YuiBili", false)
+    private fun saveToLibrary(t: Task, stage: DownloadStage, dir: File) {
+        val ctx = checkNotNull(appContext)
+        val audio = t.type == TYPE_AUDIO
+        val inputs = stage.inputs(dir, t.id)
+        checkNotCancelled(t)
+        if (DownloadMediaLibrary.needsPermission(ctx)) throw IOException("请授予存储权限后重试")
+        require(stage.isIntact(dir, t.id)) { "下载分片不完整，已保留可恢复文件" }
+        if (t.libraryNames.isEmpty()) {
+            val token = java.util.UUID.randomUUID().toString().replace("-", "").take(12)
+            t.libraryNames = LibraryBatch.names(t.title, t.id, token, stage.outputCount, audio)
+        }
+        val names = t.libraryNames
+        require(names.size == stage.outputCount) { "媒体分片结构已变化，已保留原下载" }
+        t.libraryLengths = emptyList()
+        // 创建目标前记录稳定身份。中断后找到原条目，不重复创建公共成品。
+        persistCheckpoint()
+        val targets = names.mapIndexed { i, name ->
+            checkNotCancelled(t)
+            DownloadMediaLibrary.find(ctx, audio, t.id, name) ?: run {
+                if (t.publicUris.getOrNull(i) != null) throw IOException("已登记的公共文件不在原位置，已保留下载分片")
+                DownloadMediaLibrary.reserve(ctx, audio, t.id, name)
             }
         }
-        if (t.type == TYPE_AUDIO || t.type == TYPE_COVER || t.type == TYPE_COMMENT) return
-        // 视频 → 相册视频
-        if (t.mpdPath.isNotBlank()) {
-            // DASH：视频轨(.m4s)+音频轨(.m4s) 合并为有声 mp4 再导出
-            val dir = downloadDir ?: return
-            val v = File(dir, "${t.id}_video.m4s")
-            val a = File(dir, "${t.id}_audio.m4s")
-            if (v.exists() && v.length() > 0L) {
-                val merged = File(dir, "${t.id}_merged.mp4")
-                try {
-                    if (mergeDashToMp4(v, a.takeIf { it.length() > 0L }, merged)) {
-                        exportToMediaStore(ctx, t, merged, "Movies/YuiBili", true)
-                    }
-                } finally {
-                    merged.delete()
-                }
+        t.publicUris = targets.map { it.toString() }
+        persistCheckpoint()
+        val sizes = try {
+            targets.mapIndexed { i, uri ->
+                DownloadMediaLibrary.write(ctx, uri, audio, names[i], stage, inputs, i) { checkNotCancelled(t) }
             }
-        } else {
-            // 单文件 / 分段流：整段 mp4 直接导出
-            val single = t.singlePaths.firstOrNull { it.endsWith(".mp4") && File(it).exists() }
-            if (single != null) {
-                exportToMediaStore(ctx, t, File(single), "Movies/YuiBili", true)
-            }
+        } catch (e: Exception) {
+            // 写入未成功时释放半成品，保留可直接重试的原始分片。
+            if (stage.isIntact(dir, t.id)) try {
+                names.forEach { DownloadMediaLibrary.delete(ctx, audio, t.id, it) }
+                t.publicUris = emptyList()
+                persistCheckpoint()
+            } catch (cleanup: Exception) { e.addSuppressed(cleanup) }
+            throw e
         }
+        t.libraryLengths = sizes
+        persistCheckpoint()
+        if (!adoptLibraryBatch(t, stage)) throw IOException("公共文件校验失败，已保留下载分片")
     }
 
-    private fun exportToMediaStore(ctx: Context, task: Task, src: File, relativeDir: String, isVideo: Boolean) {
-        if (task.cancelRequested || src.length() == 0L) return
-        try {
-            val ext = src.extension.lowercase(Locale.ROOT).ifBlank { if (isVideo) "mp4" else "jpg" }
-            val mime = if (isVideo) {
-                "video/mp4"
-            } else {
-                MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "image/jpeg"
-            }
-            val display = sanitizeFileName(task.title.ifBlank { src.nameWithoutExtension }) + ".$ext"
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val collection = if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                                 else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-                val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, display)
-                    put(MediaStore.MediaColumns.MIME_TYPE, mime)
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, relativeDir)
-                    put(MediaStore.MediaColumns.IS_PENDING, 1)
-                }
-                val resolver = ctx.contentResolver
-                val uri = resolver.insert(collection, values) ?: return
-                var published = false
-                try {
-                    val output = resolver.openOutputStream(uri) ?: return
-                    output.use { out -> src.inputStream().use { it.copyTo(out) } }
-                    if (task.cancelRequested) return
-                    values.clear()
-                    values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                    published = resolver.update(uri, values, null, null) > 0
-                    if (published) task.galleryExports.addIfAbsent(uri.toString())
-                } finally {
-                    if (!published) resolver.delete(uri, null, null)
-                }
-            } else {
-                val pubDir = Environment.getExternalStoragePublicDirectory(
-                    if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES)
-                val folder = File(pubDir, "YuiBili").apply { mkdirs() }
-                val base = display.substringBeforeLast('.')
-                var target = File(folder, display)
-                var suffix = 1
-                while (true) {
-                    if (task.cancelRequested) return
-                    if (target.createNewFile()) break
-                    target = File(folder, "$base (${suffix++}).$ext")
-                }
-                var published = false
-                try {
-                    src.inputStream().use { input -> target.outputStream().use { input.copyTo(it) } }
-                    if (task.cancelRequested) return
-                    android.media.MediaScannerConnection.scanFile(ctx, arrayOf(target.absolutePath), arrayOf(mime), null)
-                    task.galleryExports.addIfAbsent(Uri.fromFile(target).toString())
-                    published = true
-                } finally {
-                    if (!published) target.delete()
-                }
-            }
-            save()
-        } catch (error: java.io.IOException) {
-            Log.w("Downloads", "Unable to export downloaded media", error)
-        } catch (error: SecurityException) {
-            Log.w("Downloads", "Export permission denied", error)
-        }
+    /** 也用于进程恢复：只接管一整批已写完且与持久化长度一致的、不混属其它任务的公共产物。 */
+    private fun adoptLibraryBatch(t: Task, stage: DownloadStage): Boolean {
+        val names = t.libraryNames
+        val lengths = t.libraryLengths
+        if (names.size != stage.outputCount || lengths.size != names.size) return false
+        val ctx = checkNotNull(appContext)
+        val audio = t.type == TYPE_AUDIO
+        val uris = names.map { DownloadMediaLibrary.find(ctx, audio, t.id, it) ?: return false }
+        if (!LibraryBatch.canAdopt(lengths, uris.mapIndexed { i, uri ->
+                DownloadMediaLibrary.stagedLength(ctx, uri, audio, names[i])
+            })) return false
+        checkNotCancelled(t)
+        val published = DownloadMediaLibrary.publish(ctx, uris, audio, t.id, names)
+        published.forEachIndexed { i, uri -> DownloadMediaLibrary.verifyLength(ctx, uri, lengths[i]) }
+        t.libraryVersion = android.provider.MediaStore.getVersion(ctx).orEmpty()
+        commitLibraryResult(t, published.map { it.toString() }, lengths.sum())
+        cleanCommittedStage(t)
+        notifyListeners()
+        return true
     }
 
-    private fun sanitizeFileName(name: String): String =
-        name.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().take(80).ifBlank { "video" }
-
-    /** 按导出记录清理相册副本。 */
-    private fun deleteGalleryExports(t: Task) {
-        val ctx = appContext ?: return
-        for (entry in t.galleryExports) {
-            try {
-                when {
-                    entry.startsWith("content://media/") -> ctx.contentResolver.delete(Uri.parse(entry), null, null)
-                    entry.startsWith("file://") -> Uri.parse(entry).path?.let { File(it).delete() }
-                    '|' in entry -> deleteMediaEntry(ctx, entry.substringBefore('|'), entry.substringAfter('|'))
-                }
-            } catch (error: SecurityException) {
-                Log.w("Downloads", "Unable to delete the exported media", error)
-            }
+    private fun cleanCommittedStage(t: Task) {
+        // 也用于重启收尾：若用户已移走文件/撤销权限，不删除仅存的可恢复输入。
+        if (!t.playable()) return
+        val ctx = checkNotNull(appContext)
+        val lengths = t.libraryNames.map { name -> DownloadMediaLibrary.find(ctx, t.type == TYPE_AUDIO, t.id, name)?.let { DownloadMediaLibrary.length(ctx, it) } }
+        if (!LibraryBatch.canAdopt(t.libraryLengths, lengths)) return
+        // 即使目录 fsync 失败，也不能回滚已经 rename 成功的公共结果：保留临时轨，重启再收尾。
+        syncDownloadDirectory()
+        if (DownloadPrivateFiles.clean(checkNotNull(downloadDir), t.id, includeCover = false)) synchronized(lock) {
+            t.cleanupPending = false
+            t.stage = null
+            saveLocked()
         }
-    }
-
-    /** 按相对目录 + 文件名删除公共媒体库条目（MediaStore）或旧系统公共目录文件。 */
-    private fun deleteMediaEntry(ctx: Context, relativeDir: String, display: String) {
-        runCatching {
-            val isVideo = relativeDir.startsWith("Movies")
-            val base = display.substringBeforeLast('.', display)
-            val ext = display.substringAfterLast('.', "")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val collection = if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                                 else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-                // 转义 LIKE 通配符，只匹配「原名」与「原名 (n).ext」两种形态
-                val escapedBase = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                // RELATIVE_PATH 在不同系统上可能带/不带尾部斜杠，两种都匹配
-                val sel = "(${MediaStore.MediaColumns.RELATIVE_PATH}=? OR ${MediaStore.MediaColumns.RELATIVE_PATH}=?) AND (" +
-                    "${MediaStore.MediaColumns.DISPLAY_NAME}=? OR " +
-                    "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ? ESCAPE '\\')"
-                val args = arrayOf("$relativeDir/", relativeDir, display, "$escapedBase (%.$ext")
-                val ids = ArrayList<Long>()
-                ctx.contentResolver.query(
-                    collection, arrayOf(MediaStore.MediaColumns._ID), sel, args, null
-                )?.use { c ->
-                    while (c.moveToNext()) ids.add(c.getLong(0))
-                }
-                ids.forEach { id ->
-                    val uri = android.content.ContentUris.withAppendedId(collection, id)
-                    // 不带 recycle 参数直接删条目（部分 ROM 不识别 recycle token 会抛异常，runCatching 兜住）
-                    runCatching { ctx.contentResolver.delete(uri, null, null) }
-                }
-            } else {
-                // 旧系统：公共目录直接删文件
-                val pubDir = Environment.getExternalStoragePublicDirectory(
-                    if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES)
-                val parent = File(pubDir, "YuiBili")
-                parent.listFiles()?.filter {
-                    it.name.startsWith(base + " (") && it.name.endsWith(".$ext")
-                }?.forEach { runCatching { it.delete() } }
-                File(File(pubDir, "YuiBili"), display).delete()
-            }
-        }
-        // 物理删除（旧系统公共目录或有权限时）已移除 MANAGE_EXTERNAL_STORAGE 依赖。
-    }
-
-    /** 用 MediaMuxer 把 DASH 的视频轨/音频轨混流成单个有声 mp4（B 站整段 m4s 是完整 MP4）。 */
-    private fun mergeDashToMp4(video: File, audio: File?, out: File): Boolean {
-        var extractorV: MediaExtractor? = null
-        var extractorA: MediaExtractor? = null
-        var muxer: MediaMuxer? = null
-        return try {
-            val ev = MediaExtractor().apply { setDataSource(video.absolutePath) }
-            extractorV = ev
-            val vi = (0 until ev.trackCount).firstOrNull {
-                ev.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
-            } ?: return false
-            ev.selectTrack(vi)
-            val mux = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            muxer = mux
-            val mv = mux.addTrack(ev.getTrackFormat(vi))
-            var ea: MediaExtractor? = null
-            var ma = -1
-            if (audio != null) {
-                runCatching {
-                    val e = MediaExtractor().apply { setDataSource(audio.absolutePath) }
-                    val ai = (0 until e.trackCount).firstOrNull {
-                        e.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
-                    }
-                    if (ai != null) {
-                        e.selectTrack(ai)
-                        ma = mux.addTrack(e.getTrackFormat(ai))
-                        ea = e
-                        extractorA = e
-                    }
-                }
-            }
-            mux.start()
-            val vBuf = java.nio.ByteBuffer.allocate(2 * 1024 * 1024)
-            val aBuf = java.nio.ByteBuffer.allocate(2 * 1024 * 1024)
-            val vInfo = MediaCodec.BufferInfo()
-            val aInfo = MediaCodec.BufferInfo()
-            var vPending = true
-            var aPending = ea != null
-            while (vPending || aPending) {
-                if (vPending && (!aPending || ev.sampleTime <= ea!!.sampleTime)) {
-                    vInfo.offset = 0
-                    vInfo.size = ev.readSampleData(vBuf, 0)
-                    if (vInfo.size < 0) { vPending = false } else {
-                        vInfo.presentationTimeUs = ev.sampleTime
-                        vInfo.flags = muxSampleFlags(ev.sampleFlags)
-                        mux.writeSampleData(mv, vBuf, vInfo)
-                        ev.advance()
-                    }
-                } else if (aPending) {
-                    aInfo.offset = 0
-                    aInfo.size = ea!!.readSampleData(aBuf, 0)
-                    if (aInfo.size < 0) { aPending = false } else {
-                        aInfo.presentationTimeUs = ea!!.sampleTime
-                        aInfo.flags = muxSampleFlags(ea!!.sampleFlags)
-                        mux.writeSampleData(ma, aBuf, aInfo)
-                        ea!!.advance()
-                    }
-                }
-            }
-            mux.stop()
-            ev.release(); ea?.release(); mux.release()
-            true
-        } catch (_: Throwable) {
-            runCatching { muxer?.stop() }
-            runCatching { extractorV?.release() }
-            runCatching { extractorA?.release() }
-            runCatching { muxer?.release() }
-            runCatching { out.delete() }
-            false
-        }
-    }
-
-    private fun muxSampleFlags(extractorFlags: Int): Int {
-        var flags = 0
-        if ((extractorFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
-            flags = flags or MediaCodec.BUFFER_FLAG_KEY_FRAME
-        }
-        if ((extractorFlags and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME) != 0) {
-            flags = flags or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME
-        }
-        return flags
     }
 
     private fun maybeNotify() {
@@ -1590,7 +1440,7 @@ object DownloadManager {
             if (!observing || lastStartId == 0) return@Runnable
             val active = snapshot().filter { it.running || it.state == STATE_QUEUED }
             val writing = synchronized(lock) { writerScheduled }
-            if (active.isEmpty() && galleryWork.get() == 0 && !writing) {
+            if (active.isEmpty() && cleanupWork.get() == 0 && !writing) {
                 if (stopSelfResult(lastStartId)) {
                     if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE)
                     else @Suppress("DEPRECATION") stopForeground(true)
@@ -1736,61 +1586,102 @@ object DownloadManager {
     }
 
     private fun persistTaskChanges() {
-        while (true) {
-            val snapshot = synchronized(lock) {
-                if (writePending) {
-                    writePending = false
-                    JSONArray().apply { tasks.values.forEach { put(toJson(it)) } }
-                } else {
-                    writerScheduled = false
-                    null
-                }
-            }
-            if (snapshot == null) break
+        try {
+            val snapshot = synchronized(lock) { writePending = false; snapshotJsonLocked() }
             persistTaskSnapshot(snapshot)
-        }
-        notifyListeners()
-    }
-
-    private fun persistTaskSnapshot(snapshot: JSONArray) {
-        val dir = downloadDir ?: return
-        val file = android.util.AtomicFile(File(dir, "tasks.json"))
-        try {
-            val output = file.startWrite()
-            try {
-                output.write(JSONObject().put("tasks", snapshot).toString().toByteArray(Charsets.UTF_8))
-                file.finishWrite(output)
-            } catch (error: java.io.IOException) {
-                file.failWrite(output)
-                throw error
+        } catch (e: Exception) {
+            Log.w("Downloads", "Unable to persist downloads", e)
+        } finally {
+            synchronized(lock) {
+                if (writePending) taskIo.execute(::persistTaskChanges) else writerScheduled = false
             }
-        } catch (error: java.io.IOException) {
-            Log.w("Downloads", "Unable to persist downloads", error)
+            notifyListeners()
         }
     }
 
-    private fun load() {
-        val dir = downloadDir ?: return
-        val file = android.util.AtomicFile(File(dir, "tasks.json"))
+    private fun snapshotJsonLocked(replacement: Task? = null): JSONObject = JSONObject().apply {
+        put("tasks", JSONArray().apply { tasks.values.forEach { put(toJson(if (replacement != null && it.id == replacement.id) replacement else it)) } })
+        put("removing", JSONArray().apply { removedTasks.values.forEach { put(toJson(it)) } })
+    }
+
+    // 与异步进度保存共用一个写线程，旧快照无法在提交后覆盖新的 URI/删除记录。
+    private fun onTaskWriter(work: () -> Unit) {
+        try { taskIo.submit { work() }.get() }
+        catch (e: java.util.concurrent.ExecutionException) { throw (e.cause as? Exception ?: e) }
+    }
+
+    private fun persistCheckpoint() = onTaskWriter {
+        persistTaskSnapshot(synchronized(lock) { snapshotJsonLocked() })
+        syncDownloadDirectory()
+    }
+
+    private fun commitLibraryResult(t: Task, result: List<String>, bytes: Long) = onTaskWriter {
+        synchronized(lock) {
+            checkNotCancelled(t)
+            if (tasks[t.id] !== t || t.state != STATE_RUNNING) throw CancelledException()
+            val finished = System.currentTimeMillis()
+            check(result.isNotEmpty() && result.size == t.stage?.outputCount && result.distinct().size == result.size)
+            fun markComplete(task: Task) {
+                task.publicUris = result
+                task.cleanupPending = true
+                task.mpdPath = ""; task.audioPath = ""; task.singlePaths.clear()
+                task.bytesDone = bytes; task.bytesTotal = bytes; task.resumeOffset = 0L
+                task.finishedAt = finished; task.error = ""; task.resetSpeed()
+                task.state = STATE_COMPLETED
+            }
+            // 只投影完成记录；写入失败时 UI 和 worker 仍持有原始的可恢复任务。
+            val projected = fromJson(toJson(t)).also(::markComplete)
+            persistTaskSnapshot(snapshotJsonLocked(projected))
+            markComplete(t)
+        }
+    }
+
+    private fun persistTaskSnapshot(snapshot: JSONObject) {
+        val dir = checkNotNull(downloadDir)
+        val tmp = File(dir, "tasks.json.tmp")
+        // AtomicFile.finishWrite 在部分系统上仅记录 rename 失败，不向调用方报错。
+        FileOutputStream(tmp).use { out ->
+            out.write(snapshot.toString().toByteArray(Charsets.UTF_8))
+            out.fd.sync()
+        }
+        android.system.Os.rename(tmp.absolutePath, File(dir, "tasks.json").absolutePath)
+    }
+
+    private fun syncDownloadDirectory() {
+        val fd = android.system.Os.open(checkNotNull(downloadDir).absolutePath, android.system.OsConstants.O_RDONLY, 0)
+        try { android.system.Os.fsync(fd) } finally { android.system.Os.close(fd) }
+    }
+
+    private fun load(): Boolean {
+        val dir = downloadDir ?: return false
+        val base = File(dir, "tasks.json")
         try {
-            val arr = JSONObject(file.readFully().toString(Charsets.UTF_8)).optJSONArray("tasks") ?: return
-            for (i in 0 until arr.length()) {
-                val t = fromJson(arr.getJSONObject(i))
-                tasks[t.id] = t
-                if (t.state == STATE_RUNNING || t.state == STATE_QUEUED) {
-                    // 进程重启后未完成任务回到排队/暂停，断点保留
-                    t.state = if (t.cancelRequested || t.resumeOffset > 0L) STATE_PAUSED else STATE_QUEUED
-                    t.running = false
-                    t.cancelRequested = false
-                    if (t.state == STATE_QUEUED) queue.add(t.id)
+            val root = JSONObject(android.util.AtomicFile(base).readFully().toString(Charsets.UTF_8))
+            fun records(array: JSONArray): Map<Long, Task> = buildMap {
+                for (i in 0 until array.length()) {
+                    val t = fromJson(array.getJSONObject(i))
+                    require(t.id > 0 && put(t.id, t) == null) { "无效的下载记录" }
                 }
             }
+            val active = records(root.getJSONArray("tasks"))
+            val removed = if (root.has("removing")) records(root.getJSONArray("removing")) else emptyMap()
+            require(removed.keys.none(active::containsKey)) { "任务同时存在于下载和删除列表" }
+            // 读到半份清单时绝不能启动 worker 或以空表覆盖原下载记录。
+            tasks.putAll(active)
+            removedTasks.putAll(removed)
+            for (t in active.values) {
+                if (t.state != STATE_RUNNING && t.state != STATE_QUEUED) continue
+                t.state = if (t.cancelRequested || t.resumeOffset > 0L) STATE_PAUSED else STATE_QUEUED
+                t.running = false
+                t.cancelRequested = false
+                if (t.state == STATE_QUEUED) queue.add(t.id)
+            }
+            return true
         } catch (_: java.io.FileNotFoundException) {
-            return
-        } catch (error: java.io.IOException) {
-            Log.w("Downloads", "Unable to read downloads", error)
-        } catch (error: org.json.JSONException) {
-            Log.w("Downloads", "Invalid download tasks", error)
+            return dir.isDirectory && dir.canWrite() && !base.exists() && !File(dir, "tasks.json.bak").exists()
+        } catch (error: Exception) {
+            Log.w("Downloads", "Unable to restore download index; keeping original files", error)
+            return false
         }
     }
 
@@ -1813,10 +1704,25 @@ object DownloadManager {
         put("mpdPath", t.mpdPath); put("audioPath", t.audioPath)
         put("singlePaths", JSONArray(t.singlePaths))
         put("galleryExports", JSONArray(t.galleryExports))
+        put("destination", t.destination.key)
+        put("publicUris", JSONArray(t.publicUris))
+        put("libraryNames", JSONArray(t.libraryNames)); put("libraryLengths", JSONArray(t.libraryLengths)); put("libraryVersion", t.libraryVersion)
+        put("cleanupPending", t.cleanupPending)
+        t.stage?.let { stage ->
+            put("layout", stage.layout.name); put("stageLengths", JSONArray(stage.lengths))
+        }
     }
 
     private fun fromJson(o: JSONObject): Task = Task().apply {
         id = o.optLong("id"); type = o.optInt("type")
+        destination = DownloadDestination.fromKey(o.optString("destination"))
+        fun strings(key: String) = o.optJSONArray(key)?.let { a -> List(a.length()) { a.optString(it) } }.orEmpty()
+        publicUris = strings("publicUris"); libraryNames = strings("libraryNames"); libraryVersion = o.optString("libraryVersion")
+        libraryLengths = o.optJSONArray("libraryLengths")?.let { a -> List(a.length()) { a.optLong(it) } }.orEmpty()
+        cleanupPending = o.optBoolean("cleanupPending")
+        o.optJSONArray("stageLengths")?.let { a ->
+            stage = runCatching { DownloadStage(DownloadLayout.valueOf(o.optString("layout")), List(a.length()) { a.getLong(it) }) }.getOrNull()
+        }
         bvid = o.optString("bvid"); cid = o.optLong("cid"); aid = o.optLong("aid")
         title = o.optString("title"); owner = o.optString("owner")
         coverUrl = o.optString("coverUrl"); coverPath = o.optString("coverPath")

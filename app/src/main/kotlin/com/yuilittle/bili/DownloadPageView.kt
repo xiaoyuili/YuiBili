@@ -16,7 +16,7 @@ import android.widget.Toast
 
 /**
  * 「我的 → 离线缓存 / 下载管理」页面：
- * - 无任何文件访问权限弹窗或引导；
+ * - 保存位置仅影响新任务；旧系统在用户选择公共库时申请写权限；
  * - 顶部真实空间占用统计卡片（通过 `DownloadManager.measureStorageBreakdown` 计算真实目录与设备存储）；
  * - 下方仅「视频」「音频」双标签，支持点击与左右滑动无缝切换（复用 `RootPager`）；
  * - 支持全选/取消全选批量删除（二次确认）以及长按条目的选项弹窗（重命名 / 删除，二次确认）；
@@ -70,11 +70,13 @@ class DownloadPageView(
     private var pendingRefreshRunnable: Runnable? = null
     private var lastRefreshAtMs = 0L
 
-    private lateinit var manageBtn: TextView
+    private lateinit var manageBtn: FrameLayout
+    private lateinit var manageIcon: ToolbarIcon
     private lateinit var selectAllBtn: TextView
     private lateinit var storagePrimaryText: TextView
     private lateinit var storageDetailText: TextView
     private lateinit var storageBar: StorageSegmentBar
+    private lateinit var destinationButton: FrameLayout
 
     private lateinit var tabVideoLabel: TextView
     private lateinit var tabAudioLabel: TextView
@@ -102,7 +104,9 @@ class DownloadPageView(
     }
 
     init {
-        DownloadManager.init(context)
+        if (!DownloadManager.init(context)) {
+            Toast.makeText(context, "暂时无法读取下载记录，原文件已保留，请稍后重新打开", Toast.LENGTH_LONG).show()
+        }
         setBackgroundColor(Ds.colors.bg)
         buildLayout()
         refreshAll(DownloadManager.snapshot(), remeasureStorage = true, forceRebuild = true)
@@ -217,8 +221,18 @@ class DownloadPageView(
             textSize = 20f
             typeface = Ds.display(bold = true)
             setTextColor(c.text)
-        })
-        topBar.addView(View(context), LinearLayout.LayoutParams(0, 0, 1f))
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        destinationButton = FrameLayout(context).apply {
+            isFocusable = true
+            addView(ToolbarIcon(context, storage = true), LayoutParams(dp(20), dp(20), Gravity.CENTER))
+            Ds.bindPressFeedback(this, 0.94f)
+            setOnClickListener { DownloadUiShared.showStorageChoice(context, ::updateDestinationLabel) }
+        }
+        updateDestinationLabel()
+        topBar.addView(destinationButton, LinearLayout.LayoutParams(dp(48), dp(48)))
 
         selectAllBtn = TextView(context).apply {
             text = "全选"
@@ -237,18 +251,15 @@ class DownloadPageView(
             rightMargin = dp(8)
         })
 
-        manageBtn = TextView(context).apply {
-            text = "批量管理"
-            textSize = 12.5f
-            typeface = Ds.body(bold = true)
-            setTextColor(c.muted)
-            background = Ds.pill(context, c.surfaceRaised, c.lineSoft)
-            setPadding(dp(12), dp(6), dp(12), dp(6))
-            isClickable = true
+        manageIcon = ToolbarIcon(context, storage = false)
+        manageBtn = FrameLayout(context).apply {
+            isFocusable = true
+            contentDescription = "批量管理"
+            addView(manageIcon, LayoutParams(dp(20), dp(20), Gravity.CENTER))
             Ds.bindPressFeedback(this, 0.94f)
             setOnClickListener { toggleSelectionMode(!selectionMode) }
         }
-        topBar.addView(manageBtn)
+        topBar.addView(manageBtn, LinearLayout.LayoutParams(dp(48), dp(48)))
         root.addView(topBar, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
@@ -443,6 +454,7 @@ class DownloadPageView(
         forceRebuild: Boolean = false
     ) {
         lastRefreshAtMs = android.os.SystemClock.elapsedRealtime()
+        if (remeasureStorage) updateDestinationLabel()
         val sig = buildStructureSignature(allTasks)
         val structureChanged = sig != lastStructureSignature
         lastStructureSignature = sig
@@ -506,13 +518,20 @@ class DownloadPageView(
         return combined.sortedByDescending { it.latestTime }
     }
 
+    private fun updateDestinationLabel() {
+        val library = DownloadManager.defaultDestination(context) == DownloadDestination.LIBRARY
+        val label = "新下载保存位置：${if (library) "系统媒体库" else "应用内"}"
+        destinationButton.contentDescription = label
+        if (android.os.Build.VERSION.SDK_INT >= 26) destinationButton.tooltipText = label
+    }
+
     private fun renderStorageCard(stats: DownloadManager.StorageBreakdown) {
         val appUsed = stats.appTotalBytes
         val cacheUsed = stats.downloadsBytes
         val avail = stats.deviceFreeBytes
         val total = stats.deviceTotalBytes.coerceAtLeast(1L)
 
-        storagePrimaryText.text = "本应用已占 ${DownloadUiShared.formatBytes(appUsed)}（含缓存 ${DownloadUiShared.formatBytes(cacheUsed)}）"
+        storagePrimaryText.text = "应用占用 ${DownloadUiShared.formatBytes(appUsed)} · 私有下载 ${DownloadUiShared.formatBytes(cacheUsed)}"
         storageDetailText.text = "本机已用 ${DownloadUiShared.formatBytes(stats.deviceUsedBytes)} · 剩余可用 ${DownloadUiShared.formatBytes(avail)} / 共 ${DownloadUiShared.formatBytes(total)}"
         storageBar.setData(
             deviceTotal = total,
@@ -684,10 +703,12 @@ class DownloadPageView(
         val c = Ds.colors
         val entries = currentTabEntries()
         val count = selectedEntryKeys.size
+        manageBtn.isSelected = selectionMode
+        manageIcon.isSelected = selectionMode
+        manageIcon.invalidate()
+        manageBtn.contentDescription = if (selectionMode) "完成批量管理" else "批量管理"
+        if (android.os.Build.VERSION.SDK_INT >= 26) manageBtn.tooltipText = manageBtn.contentDescription
         if (selectionMode) {
-            manageBtn.text = "完成"
-            manageBtn.setTextColor(c.onAccent)
-            manageBtn.background = Ds.pill(context, c.accent)
             selectAllBtn.visibility = if (entries.isNotEmpty()) View.VISIBLE else View.GONE
             val allSelected = entries.isNotEmpty() && entries.all { it.entryKey in selectedEntryKeys }
             selectAllBtn.text = if (allSelected) "取消全选" else "全选"
@@ -696,9 +717,6 @@ class DownloadPageView(
             batchDeleteBtn.alpha = if (count > 0) 1f else 0.45f
             batchDeleteBtn.isEnabled = count > 0
         } else {
-            manageBtn.text = "批量管理"
-            manageBtn.setTextColor(c.muted)
-            manageBtn.background = Ds.pill(context, c.surfaceRaised, c.lineSoft)
             selectAllBtn.visibility = View.GONE
             batchBar.visibility = View.GONE
         }
@@ -718,7 +736,7 @@ class DownloadPageView(
                 msg = "确定要删除合集「$gTitle」下的全部 ${entry.tasks.size} 个本地缓存文件吗？删除后无法恢复。"
             }
         }
-        DownloadUiShared.showConfirmDeleteDialog(context, title, msg) {
+        DownloadUiShared.showConfirmDeleteDialog(context, title, msg, entry.taskIds) {
             DownloadManager.deleteMany(entry.taskIds)
             Toast.makeText(context, "已删除", Toast.LENGTH_SHORT).show()
         }
@@ -733,7 +751,8 @@ class DownloadPageView(
         DownloadUiShared.showConfirmDeleteDialog(
             context,
             "确认批量删除",
-            "确定要删除所选 ${chosen.size} 项（共 ${ids.size} 个本地文件）的缓存吗？删除后无法恢复。"
+            "确定要删除所选 ${chosen.size} 项（共 ${ids.size} 个下载任务）吗？删除后无法恢复。",
+            ids
         ) {
             DownloadManager.deleteMany(ids)
             selectedEntryKeys.clear()
@@ -744,13 +763,7 @@ class DownloadPageView(
 
     // ── 任务交互 ───────────────────────────────────────────────
 
-    private fun handleTaskAction(task: DownloadManager.Task) {
-        when (task.state) {
-            DownloadManager.STATE_RUNNING, DownloadManager.STATE_QUEUED -> DownloadManager.pause(task.id)
-            DownloadManager.STATE_PAUSED -> DownloadManager.resume(task.id)
-            DownloadManager.STATE_FAILED -> DownloadManager.retry(task.id)
-        }
-    }
+    private fun handleTaskAction(task: DownloadManager.Task) = DownloadUiShared.taskAction(context, task)
 
     private fun openTask(task: DownloadManager.Task) {
         when (task.state) {
@@ -770,14 +783,45 @@ class DownloadPageView(
             DownloadManager.STATE_RUNNING, DownloadManager.STATE_QUEUED -> {
                 Toast.makeText(context, "正在下载中，完成后即可离线播放", Toast.LENGTH_SHORT).show()
             }
-            DownloadManager.STATE_PAUSED -> {
-                DownloadManager.resume(task.id)
-                Toast.makeText(context, "已继续下载", Toast.LENGTH_SHORT).show()
+            DownloadManager.STATE_PAUSED, DownloadManager.STATE_FAILED -> handleTaskAction(task)
+        }
+    }
+
+    private class ToolbarIcon(context: Context, private val storage: Boolean) : View(context) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = resources.displayMetrics.density * 1.7f
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        private val path = android.graphics.Path()
+        override fun onDraw(canvas: Canvas) {
+            paint.color = if (isSelected) Ds.colors.accent else Ds.colors.text
+            val w = width.toFloat()
+            val h = height.toFloat()
+            path.rewind()
+            if (storage) {
+                path.moveTo(w * .12f, h * .78f)
+                path.lineTo(w * .12f, h * .22f)
+                path.lineTo(w * .39f, h * .22f)
+                path.lineTo(w * .49f, h * .34f)
+                path.lineTo(w * .88f, h * .34f)
+                path.lineTo(w * .88f, h * .78f)
+                path.close()
+            } else if (isSelected) {
+                path.moveTo(w * .16f, h * .51f)
+                path.lineTo(w * .40f, h * .74f)
+                path.lineTo(w * .85f, h * .25f)
+            } else {
+                for (y in listOf(.25f, .5f, .75f)) {
+                    path.moveTo(w * .12f, h * (y - .01f))
+                    path.lineTo(w * .18f, h * (y + .05f))
+                    path.lineTo(w * .29f, h * (y - .07f))
+                    path.moveTo(w * .44f, h * y)
+                    path.lineTo(w * .88f, h * y)
+                }
             }
-            DownloadManager.STATE_FAILED -> {
-                DownloadManager.retry(task.id)
-                Toast.makeText(context, "已重试下载", Toast.LENGTH_SHORT).show()
-            }
+            canvas.drawPath(path, paint)
         }
     }
 

@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Paint.FontMetricsInt
 import android.graphics.Path
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.drawable.ColorDrawable
 import android.text.SpannableStringBuilder
@@ -31,6 +32,119 @@ import java.util.Date
 import java.util.Locale
 
 internal object DownloadUiShared {
+
+    fun showStorageChoice(context: Context, onChanged: () -> Unit) {
+        val current = DownloadManager.defaultDestination(context)
+        val c = Ds.colors
+        val dialog = Dialog(context).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+            window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            setCanceledOnTouchOutside(true)
+        }
+        val root = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Ds.card(context, c.surface, c.lineSoft, Ds.Radius.dialog)
+            setPadding(context.dp(20), context.dp(18), context.dp(20), context.dp(16))
+        }
+        root.addView(TextView(context).apply {
+            text = "新下载保存位置"
+            textSize = 17f
+            typeface = Ds.display(true)
+            setTextColor(c.text)
+        })
+        root.addView(TextView(context).apply {
+            text = "仅影响新任务，已有下载保持原位置"
+            textSize = 12.5f
+            setTextColor(c.muted)
+            setLineSpacing(context.dp(2).toFloat(), 1f)
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = context.dp(8); bottomMargin = context.dp(14) })
+        for (destination in listOf(DownloadDestination.PRIVATE, DownloadDestination.LIBRARY)) {
+            val selected = current == destination
+            val title = if (destination == DownloadDestination.PRIVATE) "应用内" else "系统媒体库"
+            val subtitle = if (destination == DownloadDestination.PRIVATE) "在离线缓存中播放和管理" else "视频保存到相册，音频保存到音乐库"
+            val option = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = context.dp(64)
+                setPadding(context.dp(14), context.dp(12), context.dp(14), context.dp(12))
+                background = Ds.card(context, if (selected) c.accentSoft else c.surfaceRaised,
+                    if (selected) c.accent else c.lineSoft, Ds.Radius.control)
+                isSelected = selected
+                isFocusable = true
+                contentDescription = "$title，$subtitle"
+                setOnClickListener {
+                    dialog.dismiss()
+                    val select = {
+                        DownloadManager.setDefaultDestination(context, destination)
+                        onChanged()
+                    }
+                    if (destination == DownloadDestination.LIBRARY) DownloadStoragePermission.withAccess(context, select) else select()
+                }
+                Ds.bindPressFeedback(this, 0.97f)
+            }
+            val text = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                addView(TextView(context).apply {
+                    this.text = title
+                    textSize = 14.5f
+                    typeface = Ds.body(true)
+                    setTextColor(if (selected) c.accent else c.text)
+                })
+                addView(TextView(context).apply {
+                    this.text = subtitle
+                    textSize = 12f
+                    setTextColor(c.muted)
+                    setLineSpacing(context.dp(2).toFloat(), 1f)
+                }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = context.dp(4) })
+            }
+            option.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+            option.addView(Ds.checkIcon(context, c.accent).apply {
+                visibility = if (selected) View.VISIBLE else View.INVISIBLE
+            }, LinearLayout.LayoutParams(context.dp(18), context.dp(18)).apply { leftMargin = context.dp(12) })
+            root.addView(option, LinearLayout.LayoutParams(-1, -2).apply {
+                bottomMargin = context.dp(8)
+            })
+        }
+        root.addView(TextView(context).apply {
+            text = "取消"
+            textSize = 13.5f
+            typeface = Ds.body(true)
+            setTextColor(c.muted)
+            gravity = Gravity.CENTER
+            minimumHeight = context.dp(48)
+            setPadding(context.dp(14), context.dp(8), context.dp(14), context.dp(8))
+            isFocusable = true
+            setOnClickListener { dialog.dismiss() }
+            Ds.bindPressFeedback(this, 0.96f)
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = context.dp(4) })
+        val scroll = android.widget.ScrollView(context).apply {
+            isVerticalScrollBarEnabled = false
+            addView(root)
+        }
+        dialog.setContentView(scroll)
+        dialog.show()
+        val visible = Rect()
+        dialog.window?.decorView?.getWindowVisibleDisplayFrame(visible)
+        val width = minOf(LayoutMode.dialogWidthPx(context, maxTabletDp = 420),
+            (visible.width() - context.dp(24)).coerceAtLeast(1))
+        root.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
+        val availableHeight = (visible.height() - context.dp(32)).coerceAtLeast(1)
+        dialog.window?.setLayout(width, minOf(root.measuredHeight, availableHeight))
+    }
+
+    fun taskAction(context: Context, task: DownloadManager.Task) {
+        when (task.state) {
+            DownloadManager.STATE_RUNNING, DownloadManager.STATE_QUEUED -> DownloadManager.pause(task.id)
+            DownloadManager.STATE_PAUSED, DownloadManager.STATE_FAILED -> {
+                val resume = {
+                    if (task.state == DownloadManager.STATE_PAUSED) DownloadManager.resume(task.id) else DownloadManager.retry(task.id)
+                }
+                if (task.destination == DownloadDestination.LIBRARY) DownloadStoragePermission.withAccess(context, resume) else resume()
+            }
+        }
+    }
 
     fun formatBytes(bytes: Long): String {
         val safe = bytes.coerceAtLeast(0L)
@@ -230,6 +344,9 @@ internal object DownloadUiShared {
         val c = Ds.colors
         return when (task.state) {
             DownloadManager.STATE_RUNNING -> {
+                if (task.destination == DownloadDestination.LIBRARY && task.stage != null) {
+                    return (if (task.type == DownloadManager.TYPE_AUDIO) "正在保存到音乐库" else "正在保存到系统相册") to c.accent
+                }
                 val pct = if (task.bytesTotal > 0L) {
                     "${(DownloadManager.computeDownloadProgress(task.bytesDone, task.bytesTotal) * 100).toInt()}% · "
                 } else ""
@@ -242,7 +359,12 @@ internal object DownloadUiShared {
                 val err = task.error.takeIf { it.isNotBlank() }?.let { " · ${it.take(12)}" } ?: ""
                 "下载失败$err" to c.danger
             }
-            else -> "$dateText · $sizeText" to c.muted
+            else -> {
+                val location = if (task.destination == DownloadDestination.LIBRARY) {
+                    if (task.type == DownloadManager.TYPE_AUDIO) "音乐库" else "相册"
+                } else "应用内"
+                "$location · $sizeText · $dateText" to c.muted
+            }
         }
     }
 
@@ -403,8 +525,12 @@ internal object DownloadUiShared {
         context: Context,
         title: String,
         message: String,
+        ids: List<Long>,
         onConfirm: () -> Unit
     ) {
+        val records = ids.mapNotNull(DownloadManager::task)
+        val hasLibrary = records.any { it.destination == DownloadDestination.LIBRARY }
+        val hasLegacyCopies = records.any { it.galleryExports.isNotEmpty() }
         val c = Ds.colors
         val dialog = Dialog(context)
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -433,7 +559,11 @@ internal object DownloadUiShared {
         root.addView(titleRow)
 
         root.addView(TextView(context).apply {
-            text = message
+            text = buildString {
+                append(message)
+                if (hasLibrary) append("\n这些任务保存到系统相册或音乐库、仍可确认归属的成品也会删除。")
+                if (hasLegacyCopies) append("\n旧版已导出的相册副本会保留。")
+            }
             textSize = 13.5f
             setTextColor(c.muted)
             setLineSpacing(context.dp(4).toFloat(), 1f)
@@ -467,7 +597,7 @@ internal object DownloadUiShared {
             Ds.bindPressFeedback(this, 0.95f)
             setOnClickListener {
                 dialog.dismiss()
-                onConfirm()
+                if (hasLibrary) DownloadStoragePermission.withAccess(context, onConfirm) else onConfirm()
             }
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
@@ -540,7 +670,7 @@ internal object DownloadUiShared {
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
                 bottomMargin = dp(context, 8)
             })
-        root.addView(actionRow("删除本地缓存", c.danger, c.dangerSoft, onDelete),
+        root.addView(actionRow("删除下载文件", c.danger, c.dangerSoft, onDelete),
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         dialog.setContentView(root)

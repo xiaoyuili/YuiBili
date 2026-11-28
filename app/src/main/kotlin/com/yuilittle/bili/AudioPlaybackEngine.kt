@@ -7,19 +7,14 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
-import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
-import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.AudioSink
-import androidx.media3.exoplayer.source.ProgressiveMediaSource
-import java.io.File
 
 /** 当前生效的曲目标识：本地下载任务或在线分集。 */
 internal sealed class TrackKey {
@@ -203,9 +198,8 @@ internal class AudioPlaybackEngine(private val context: Context) {
         sortOrder = runCatching { DownloadManager.SeasonSortOrder.valueOf(sortOrderName) }
             .getOrDefault(DownloadManager.SeasonSortOrder.DEFAULT)
         val snap = DownloadManager.snapshot()
-        // 只要目标文件真实存在就能播，不依赖 state 字段（避免刚完成/恢复态误判）
         val entry = snap.firstOrNull { it.id == taskId && it.type == DownloadManager.TYPE_AUDIO }
-            ?.takeIf { localSourceExists(it) }
+            ?.takeIf { it.playable() }
             ?: run {
                 lastError = "本地音频文件不存在"
                 notifySnapshot()
@@ -216,7 +210,7 @@ internal class AudioPlaybackEngine(private val context: Context) {
         if (entry.groupId.isNotBlank()) {
             val siblings = snap.filter {
                 it.groupId == entry.groupId && it.type == DownloadManager.TYPE_AUDIO &&
-                    localSourceExists(it)
+                    it.playable()
             }
             localQueue.addAll(
                 DownloadManager.sortTasks(siblings, sortOrder).ifEmpty { listOf(entry) }
@@ -226,14 +220,6 @@ internal class AudioPlaybackEngine(private val context: Context) {
         }
         pendingStartMs = 0L
         prepareLocal(entry)
-    }
-
-    /** 本地任务是否有可播的实际文件（不依赖 state）。 */
-    private fun localSourceExists(task: DownloadManager.Task): Boolean = when {
-        task.mpdPath.isNotBlank() -> File(task.mpdPath).exists()
-        task.audioPath.isNotBlank() -> File(task.audioPath).exists()
-        task.singlePaths.isNotEmpty() -> task.singlePaths.all { File(it).exists() }
-        else -> false
     }
 
     /** 在线入口：视频交接过来，从指定毫秒继续。 */
@@ -275,49 +261,19 @@ internal class AudioPlaybackEngine(private val context: Context) {
             .setArtist(task.owner)
             .setArtworkUri(task.coverUrl.takeIf { it.isNotBlank() }?.let { android.net.Uri.parse(it) })
             .build()
-        // 按实际存在的文件类型选源：DASH(MPD) / 纯音频 / 多段单文件
-        val source: androidx.media3.exoplayer.source.MediaSource = when {
-            task.mpdPath.isNotBlank() && File(task.mpdPath).exists() -> {
-                val item = MediaItem.Builder()
-                    .setUri(android.net.Uri.fromFile(File(task.mpdPath)))
-                    .setMimeType(MimeTypes.APPLICATION_MPD)
-                    .setMediaId("local:${task.id}")
-                    .setMediaMetadata(metadata)
-                    .build()
-                androidx.media3.exoplayer.dash.DashMediaSource.Factory(DefaultDataSource.Factory(context))
-                    .createMediaSource(item)
-            }
-            task.audioPath.isNotBlank() && File(task.audioPath).exists() -> {
-                val item = MediaItem.Builder()
-                    .setUri(android.net.Uri.fromFile(File(task.audioPath)))
-                    .setMimeType(MimeTypes.APPLICATION_MP4)
-                    .setMediaId("local:${task.id}")
-                    .setMediaMetadata(metadata)
-                    .build()
-                ProgressiveMediaSource.Factory(DefaultDataSource.Factory(context)).createMediaSource(item)
-            }
-            else -> {
-                val paths = task.singlePaths.filter { File(it).exists() }
-                if (paths.isEmpty()) {
-                    lastError = "本地音频文件不存在"
-                    loading = false
-                    notifySnapshot()
-                    return
-                }
-                val factory = ProgressiveMediaSource.Factory(DefaultDataSource.Factory(context))
-                val first = paths.first()
-                val item = MediaItem.Builder()
-                    .setUri(android.net.Uri.fromFile(File(first)))
-                    .setMimeType(MimeTypes.APPLICATION_MP4)
-                    .setMediaId("local:${task.id}")
-                    .setMediaMetadata(metadata)
-                    .build()
-                factory.createMediaSource(item)
-            }
+        val sources = try {
+            task.localMediaSources(context, metadata)
+        } catch (_: Exception) { emptyList() }
+        if (sources.isEmpty()) {
+            player.stop()
+            lastError = "本地音频不可用，请检查文件位置和存储权限"
+            loading = false
+            notifySnapshot()
+            return
         }
         loading = false
         lastError = ""
-        player.setMediaSource(source, 0L)
+        player.setMediaSources(sources, true)
         player.playWhenReady = true
         player.prepare()
         notifySnapshot()

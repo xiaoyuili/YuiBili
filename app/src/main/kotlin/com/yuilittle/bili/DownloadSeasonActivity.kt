@@ -59,7 +59,7 @@ class DownloadSeasonActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Ds.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        LayoutMode.applyScreenOrientation(this)
         window.setBackgroundDrawable(ColorDrawable(Ds.colors.bg))
         DownloadManager.init(this)
 
@@ -418,7 +418,8 @@ class DownloadSeasonActivity : Activity() {
         DownloadUiShared.showConfirmDeleteDialog(
             this,
             "确认删除分集",
-            "确定要删除「${task.title}」的本地缓存文件吗？删除后无法恢复。"
+            "确定要删除「${task.title}」的下载文件吗？删除后无法恢复。",
+            listOf(task.id)
         ) {
             DownloadManager.delete(task.id)
             Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
@@ -431,7 +432,8 @@ class DownloadSeasonActivity : Activity() {
         DownloadUiShared.showConfirmDeleteDialog(
             this,
             "确认批量删除",
-            "确定要删除所选 ${ids.size} 集的本地缓存文件吗？删除后无法恢复。"
+            "确定要删除所选 ${ids.size} 集的下载文件吗？删除后无法恢复。",
+            ids
         ) {
             DownloadManager.deleteMany(ids)
             selectedTaskIds.clear()
@@ -520,13 +522,7 @@ class DownloadSeasonActivity : Activity() {
             Ds.pill(this, Ds.colors.accentSoft, Ds.colors.accent)
         }
 
-    private fun handleTaskAction(task: DownloadManager.Task) {
-        when (task.state) {
-            DownloadManager.STATE_RUNNING, DownloadManager.STATE_QUEUED -> DownloadManager.pause(task.id)
-            DownloadManager.STATE_PAUSED -> DownloadManager.resume(task.id)
-            DownloadManager.STATE_FAILED -> DownloadManager.retry(task.id)
-        }
-    }
+    private fun handleTaskAction(task: DownloadManager.Task) = DownloadUiShared.taskAction(this, task)
 
     private fun openTask(task: DownloadManager.Task) {
         when (task.state) {
@@ -547,14 +543,7 @@ class DownloadSeasonActivity : Activity() {
             DownloadManager.STATE_RUNNING, DownloadManager.STATE_QUEUED -> {
                 Toast.makeText(this, "正在下载中，完成后即可离线播放", Toast.LENGTH_SHORT).show()
             }
-            DownloadManager.STATE_PAUSED -> {
-                DownloadManager.resume(task.id)
-                Toast.makeText(this, "已继续下载", Toast.LENGTH_SHORT).show()
-            }
-            DownloadManager.STATE_FAILED -> {
-                DownloadManager.retry(task.id)
-                Toast.makeText(this, "已重试下载", Toast.LENGTH_SHORT).show()
-            }
+            DownloadManager.STATE_PAUSED, DownloadManager.STATE_FAILED -> handleTaskAction(task)
         }
     }
 

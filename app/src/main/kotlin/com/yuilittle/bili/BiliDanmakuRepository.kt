@@ -172,10 +172,12 @@ internal object BiliDanmakuRepository {
         val key = CacheKey(cid, segmentIndex, authEpoch)
         val now = SystemClock.elapsedRealtime()
         synchronized(cacheLock) {
-            val hit = segmentCache[key] ?: return null
+            val poolKey = key.copy(segmentIndex = 0)
+            val hitKey = if (segmentCache.containsKey(poolKey)) poolKey else key
+            val hit = segmentCache[hitKey] ?: return null
             val ttl = if (hit.items.isEmpty() && !hit.closed) EMPTY_TTL_MS else NON_EMPTY_TTL_MS
             if (now - hit.fetchedAtMs > ttl) {
-                removeSegmentLocked(key)
+                removeSegmentLocked(hitKey)
                 return null
             }
             return hit
@@ -274,6 +276,7 @@ internal object BiliDanmakuRepository {
             }
             if (result != null) {
                 synchronized(cacheLock) {
+                    if (handle.cancelled || authEpoch != authEpochSeq.get()) return@Runnable
                     if (metaCache.size >= 12) {
                         val firstKey = metaCache.entries.firstOrNull()?.key
                         if (firstKey != null) metaCache.remove(firstKey)
@@ -283,6 +286,7 @@ internal object BiliDanmakuRepository {
             }
             postMain { if (!handle.cancelled) callback(result) }
         }
+        handle.onCancel { workers.remove(task) }
         try {
             workers.execute(task)
         } catch (_: RejectedExecutionException) {
@@ -385,6 +389,7 @@ internal object BiliDanmakuRepository {
             }
         }
 
+        entry.request.onCancel { workers.remove(runnable) }
         try {
             workers.execute(runnable)
         } catch (_: RejectedExecutionException) {
@@ -440,6 +445,7 @@ internal object BiliDanmakuRepository {
                 request = request,
                 useLegacyEndpoint = useLegacy
             )
+            if (request.cancelled && step !is AttemptResult.RiskLimited) return FetchOutcome.Failed("已取消", false)
             when (step) {
                 is AttemptResult.Success -> {
                     consecutiveRiskHits = 0
@@ -454,10 +460,10 @@ internal object BiliDanmakuRepository {
                         estimatedBytes = parsed.estimatedBytes
                     )
                     if (parsed.closed) {
-                        putCache(key, seg, pinCurrentSegment)
+                        putCache(key, seg, pinCurrentSegment, request)
                         return FetchOutcome.Closed
                     }
-                    putCache(key, seg, pinCurrentSegment)
+                    putCache(key, seg, pinCurrentSegment, request)
                     Log.d(
                         TAG,
                         "seg ok cid=${key.cid} idx=${key.segmentIndex} items=${parsed.items.size} " +
@@ -473,7 +479,7 @@ internal object BiliDanmakuRepository {
                         lastOutcome = FetchOutcome.Failed("签名失效", true)
                         continue
                     }
-                    markFailedCooldown(key)
+                    markFailedCooldown(key, request)
                     return FetchOutcome.Failed("弹幕签名校验失败", false)
                 }
                 is AttemptResult.EndpointIncompatible -> {
@@ -485,7 +491,7 @@ internal object BiliDanmakuRepository {
                     // 仅在两个 protobuf 分段路径都明确协议不兼容时，对该 (cid, authEpoch) 最多尝试一次 XML 兜底
                     val xml = tryXmlFallbackOnce(key, referer, cookie, request, pinCurrentSegment)
                     if (xml != null) return xml
-                    markFailedCooldown(key)
+                    markFailedCooldown(key, request)
                     return FetchOutcome.Failed(step.reason, false)
                 }
                 is AttemptResult.RiskLimited -> {
@@ -493,7 +499,7 @@ internal object BiliDanmakuRepository {
                     return FetchOutcome.RiskLimited(until, step.httpCode, step.biliCode)
                 }
                 is AttemptResult.AuthOrPermission -> {
-                    markFailedCooldown(key)
+                    markFailedCooldown(key, request)
                     return FetchOutcome.AuthOrPermission(step.httpCode, step.biliCode)
                 }
                 is AttemptResult.RetryableError -> {
@@ -501,12 +507,12 @@ internal object BiliDanmakuRepository {
                     continue
                 }
                 is AttemptResult.FatalError -> {
-                    markFailedCooldown(key)
+                    markFailedCooldown(key, request)
                     return FetchOutcome.Failed(step.reason, retryable = false)
                 }
             }
         }
-        markFailedCooldown(key)
+        markFailedCooldown(key, request)
         return lastOutcome
     }
 
@@ -654,7 +660,7 @@ internal object BiliDanmakuRepository {
                     fetchedAtMs = SystemClock.elapsedRealtime(),
                     estimatedBytes = parsed.estimatedBytes
                 )
-                putCache(key, seg, pinCurrentSegment)
+                putCache(key, seg, pinCurrentSegment, request)
                 if (seg.items.isEmpty()) FetchOutcome.Empty(seg) else FetchOutcome.Ready(seg)
             }
         } catch (e: Exception) {
@@ -718,17 +724,20 @@ internal object BiliDanmakuRepository {
         return riskCooldownUntilMs
     }
 
-    private fun markFailedCooldown(key: CacheKey) {
+    private fun markFailedCooldown(key: CacheKey, request: BiliRequest) {
         synchronized(cacheLock) {
+            if (request.cancelled || key.authEpoch != authEpochSeq.get() || inFlight[key]?.request !== request) return
             if (failedUntil.size > 64) failedUntil.clear()
             failedUntil[key] = SystemClock.elapsedRealtime() + FAILURE_COOLDOWN_MS
         }
     }
 
-    private fun putCache(key: CacheKey, seg: SegmentData, pinCurrentSegment: Int) {
+    private fun putCache(key: CacheKey, seg: SegmentData, pinCurrentSegment: Int, request: BiliRequest) {
         synchronized(cacheLock) {
-            removeSegmentLocked(key)
-            segmentCache[key] = seg
+            if (request.cancelled || key.authEpoch != authEpochSeq.get() || inFlight[key]?.request !== request) return
+            val cacheKey = if (seg.source == SourceKind.XML_FALLBACK) key.copy(segmentIndex = 0) else key
+            removeSegmentLocked(cacheKey)
+            segmentCache[cacheKey] = seg
             cachedBytes += seg.estimatedBytes
             cachedItems += seg.items.size
             evictCacheLocked(pinCid = key.cid, pinSegment = pinCurrentSegment)
@@ -781,7 +790,7 @@ internal object BiliDanmakuRepository {
     }
 
     private fun postMain(block: () -> Unit) {
-        if (Looper.myLooper() == Looper.getMainLooper()) block()
-        else mainHandler.post(block)
+        // 缓存命中/队列拒绝也须在调用方登记请求句柄之后交付。
+        mainHandler.post(block)
     }
 }

@@ -35,9 +35,39 @@ import java.util.Locale
  * - 未搜索态：历史搜索流式标签卡 + 实时搜索建议；
  * - 结果态：上方横向番剧/影视卡带 + 下方 4 列视频卡片网格 + 自动翻页 + 右下角悬浮回顶按钮。
  */
+internal enum class TabletSearchScope(val hint: String, val returnLabel: String) {
+    PUBLIC("搜索公开视频、番剧、UP主…", "返回首页"),
+    HISTORY("搜索历史记录标题", "返回历史记录"),
+    FAVORITES("搜索全部收藏夹内视频", "返回我的收藏");
+
+    val parentDestination: Int get() = when (this) {
+        PUBLIC -> TabletRailNav.DEST_HOME
+        HISTORY -> TabletRailNav.DEST_HISTORY
+        FAVORITES -> TabletRailNav.DEST_FAVORITES
+    }
+    fun rowKey(video: VideoItem): String = if (this == HISTORY) video.historyMedia.rowKey else video.bvid
+}
+
+internal fun tabletSearchScope(destination: Int): TabletSearchScope? = when (destination) {
+    TabletRailNav.DEST_SEARCH -> TabletSearchScope.PUBLIC
+    TabletRailNav.DEST_HISTORY_SEARCH -> TabletSearchScope.HISTORY
+    TabletRailNav.DEST_FAVORITES_SEARCH -> TabletSearchScope.FAVORITES
+    else -> null
+}
+
 internal class TabletSearchPageView(
-    private val activity: Activity
+    private val activity: Activity,
+    private val scope: TabletSearchScope = TabletSearchScope.PUBLIC,
+    restored: Snapshot? = null,
+    private val onReturn: () -> Unit
 ) : FrameLayout(activity) {
+
+    data class Snapshot(
+        val session: String, val input: String, val keyword: String, val showingResults: Boolean,
+        val videos: List<VideoItem>, val pgc: List<PgcMedia>, val page: Int, val ended: Boolean,
+        val sort: Int, val duration: Int, val reload: Boolean, val resumePage: Boolean,
+        val failed: Boolean, val pendingQuery: Boolean, val pendingPgc: Boolean, val firstVisible: Int, val offset: Int
+    )
 
     private enum class SortMode(val label: String, val orderParam: String) {
         DEFAULT("综合", ""),
@@ -67,6 +97,16 @@ internal class TabletSearchPageView(
     private lateinit var topButton: ScrollToTopButton
     private var topScroller: AbsListSmoothTopScroller? = null
     private lateinit var adapter: GridAdapter
+    private lateinit var retryRow: TextView
+    private lateinit var scopeHint: TextView
+    private val pgcItems = ArrayList<PgcMedia>()
+    private var pgcPending = false
+    private var session = BiliSessionStore.cookie()
+    private var resumeFirst = false
+    private var resumeMore = false
+    private var pageError = false
+    private var restoring = false
+    private var pendingScopedQuery = false
 
     private var sortMode = SortMode.DEFAULT
     private var filterDuration = 0
@@ -78,6 +118,7 @@ internal class TabletSearchPageView(
     private var loadingMore = false
     private var endReached = false
     private var pendingSuggest: Runnable? = null
+    private var active = false
 
     private val availableWidthPx: Int
         get() = (resources.displayMetrics.widthPixels - dp(TabletRailNav.RAIL_WIDTH_DP + 36)).coerceAtLeast(dp(480))
@@ -88,11 +129,90 @@ internal class TabletSearchPageView(
         setBackgroundColor(COLOR_BACKGROUND)
         buildUi()
         refreshHistory()
+        restored?.takeIf { it.session == session }?.let { state ->
+            restoring = true
+            input.setText(state.input)
+            restoring = false
+            currentKeyword = state.keyword
+            showingResults = state.showingResults
+            searchPage = state.page
+            endReached = state.ended
+            sortMode = SortMode.entries.getOrElse(state.sort) { SortMode.DEFAULT }
+            filterDuration = state.duration.coerceIn(durationLabels.indices)
+            updateFilterUi()
+            adapter.replace(state.videos)
+            bindPgcCards(state.pgc)
+            pgcPending = state.pendingPgc
+            filterRow.visibility = if (showingResults && scope == TabletSearchScope.PUBLIC) View.VISIBLE else View.GONE
+            resultsHost.visibility = if (showingResults) View.VISIBLE else View.GONE
+            idleScroll.visibility = if (showingResults) View.GONE else View.VISIBLE
+            resumeFirst = state.reload
+            resumeMore = state.resumePage
+            pageError = state.failed
+            pendingScopedQuery = state.pendingQuery
+            if (pageError && searchPage > 0) {
+                retryRow.text = "点此继续加载搜索结果"
+                retryRow.visibility = View.VISIBLE
+            }
+            if (!resumeFirst && showingResults && state.videos.isEmpty() && state.pgc.isEmpty() && endReached) {
+                stateView.text = if (scope != TabletSearchScope.PUBLIC && !BiliSessionStore.isLoggedIn(session)) {
+                    if (scope == TabletSearchScope.HISTORY) "请先登录后再搜索历史" else "请先登录后再搜索收藏"
+                } else "没有找到相关结果"
+                stateView.visibility = View.VISIBLE
+            }
+            resultsList.post { resultsList.setSelectionFromTop(state.firstVisible, state.offset) }
+        }
     }
 
-    fun onPageActivated() {
-        refreshHistory()
+    fun snapshot(): Snapshot = Snapshot(session, input.text.toString(), currentKeyword, showingResults,
+        adapter.snapshot(), pgcItems.toList(), searchPage, endReached, sortMode.ordinal, filterDuration,
+        resumeFirst || searching || pageError && searchPage == 0, resumeMore || loadingMore, pageError, pendingScopedQuery, pgcPending, resultsList.firstVisiblePosition,
+        (resultsList.getChildAt(0)?.top ?: resultsList.paddingTop) - resultsList.paddingTop)
+
+    fun setActive(value: Boolean) {
+        val sessionChanged = session != BiliSessionStore.cookie()
+        if (active == value && !sessionChanged) return
+        if (sessionChanged) {
+            session = BiliSessionStore.cookie()
+            restoring = true
+            input.setText("")
+            restoring = false
+            adapter.replace(emptyList())
+            bindPgcCards(emptyList())
+            resetToIdle()
+        }
+        active = value
+        if (value) {
+            refreshHistory()
+            if (resumeFirst && currentKeyword.isNotBlank()) {
+                resumeFirst = false
+                runSearch(currentKeyword, keepPgc = false)
+            } else if (resumeMore) {
+                resumeMore = false
+                loadNextPage()
+            } else if (pendingScopedQuery) scheduleScopedQuery(input.text.toString())
+            else if (!showingResults && !input.text.isNullOrBlank()) scheduleSuggest(input.text.toString().trim())
+            if (scope == TabletSearchScope.HISTORY && showingResults && !searching) {
+                adapter.updateHistoryProgress()
+            }
+            if (scope == TabletSearchScope.PUBLIC && pgcPending && !searching && showingResults) requestPgcResults(currentKeyword)
+        } else {
+            resumeFirst = resumeFirst || searching
+            resumeMore = resumeMore || loadingMore
+            searchGen++
+            searching = false
+            loadingMore = false
+            pendingSuggest?.let(mainHandler::removeCallbacks)
+            pendingSuggest = null
+            pagingSpinner.visibility = View.GONE
+            VideoCardUi.toggleSkeleton(skeletonOverlay, false)
+            hideKeyboard()
+        }
     }
+
+    private fun accepts(gen: Int, expectedSession: String, keyword: String): Boolean =
+        active && !activity.isFinishing && !activity.isDestroyed && gen == searchGen &&
+            expectedSession == session && session == BiliSessionStore.cookie() && keyword == currentKeyword
 
     fun handleBack(): Boolean {
         if (showingResults) {
@@ -103,6 +223,8 @@ internal class TabletSearchPageView(
     }
 
     fun destroy() {
+        active = false
+        searchGen++
         pendingSuggest?.let(mainHandler::removeCallbacks)
         topScroller?.cancel()
         mainHandler.removeCallbacksAndMessages(null)
@@ -120,6 +242,10 @@ internal class TabletSearchPageView(
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
+        searchBarRow.addView(Ds.backIcon(activity, c.text) {
+            hideKeyboard()
+            onReturn()
+        }.apply { contentDescription = scope.returnLabel }, LinearLayout.LayoutParams(dp(48), dp(48)).apply { rightMargin = dp(8) })
         val field = FrameLayout(activity).apply {
             background = Ds.pill(activity, c.surface, c.lineSoft, Ds.hairline(activity))
         }
@@ -130,7 +256,7 @@ internal class TabletSearchPageView(
             }
         )
         input = EditText(activity).apply {
-            hint = "搜索公开视频、番剧、UP主…"
+            hint = scope.hint
             textSize = 14.5f
             typeface = Ds.body()
             gravity = Gravity.CENTER_VERTICAL
@@ -154,6 +280,14 @@ internal class TabletSearchPageView(
                 override fun afterTextChanged(s: Editable?) {
                     val q = s?.toString().orEmpty()
                     clearBtn.visibility = if (q.isEmpty()) View.GONE else View.VISIBLE
+                    if (restoring) return
+                    pendingSuggest?.let(mainHandler::removeCallbacks)
+                    pendingSuggest = null
+                    if (scope != TabletSearchScope.PUBLIC && q.isNotBlank()) {
+                        resetToIdle()
+                        scheduleScopedQuery(q)
+                        return
+                    }
                     if (q.isBlank()) {
                         suggestionBox.visibility = View.GONE
                         if (showingResults) resetToIdle()
@@ -337,12 +471,30 @@ internal class TabletSearchPageView(
         idleCol.addView(historyContainer, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ))
+        scopeHint = TextView(activity).apply {
+            text = if (scope == TabletSearchScope.HISTORY) "输入关键词搜索观看历史" else "输入关键词搜索全部收藏"
+            textSize = 13f
+            setTextColor(c.muted)
+            gravity = Gravity.CENTER
+            setPadding(dp(24), dp(40), dp(24), dp(24))
+            visibility = if (scope == TabletSearchScope.PUBLIC) View.GONE else View.VISIBLE
+        }
+        idleCol.addView(scopeHint, LinearLayout.LayoutParams(-1, -2))
         idleScroll.addView(idleCol)
         stage.addView(idleScroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
 
         resultsHost = FrameLayout(activity).apply { visibility = View.GONE }
         adapter = GridAdapter()
+        retryRow = TextView(activity).apply {
+            textSize = 12.5f
+            setTextColor(c.muted)
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            visibility = View.GONE
+            setOnClickListener { pageError = false; visibility = View.GONE; loadNextPage() }
+        }
         resultsList = ListView(activity).apply {
+            addFooterView(retryRow, null, true)
             divider = null
             dividerHeight = 0
             setSelector(android.R.color.transparent)
@@ -445,8 +597,10 @@ internal class TabletSearchPageView(
     }
 
     private fun bindPgcCards(list: List<PgcMedia>) {
+        pgcItems.clear()
+        if (scope == TabletSearchScope.PUBLIC) pgcItems.addAll(list)
         pgcRow.removeAllViews()
-        if (list.isEmpty()) {
+        if (list.isEmpty() || scope != TabletSearchScope.PUBLIC) {
             pgcHeader.visibility = View.GONE
             return
         }
@@ -532,6 +686,7 @@ internal class TabletSearchPageView(
     }
 
     private fun refreshHistory() {
+        if (scope != TabletSearchScope.PUBLIC) { historyContainer.visibility = View.GONE; return }
         val list = SearchHistoryStore.load(activity)
         historyFlow.removeAllViews()
         if (list.isEmpty()) {
@@ -563,11 +718,12 @@ internal class TabletSearchPageView(
     }
 
     private fun scheduleSuggest(keyword: String) {
+        if (!active || scope != TabletSearchScope.PUBLIC) return
         pendingSuggest?.let(mainHandler::removeCallbacks)
         val task = Runnable {
             BiliApi.suggest(keyword) { items, _ ->
                 val list = items.orEmpty()
-                if (showingResults || input.text?.toString()?.trim() != keyword) return@suggest
+                if (!active || showingResults || input.text?.toString()?.trim() != keyword) return@suggest
                 suggestionBox.removeAllViews()
                 if (list.isEmpty()) {
                     suggestionBox.visibility = View.GONE
@@ -604,23 +760,48 @@ internal class TabletSearchPageView(
         mainHandler.postDelayed(task, 240L)
     }
 
+    private fun scheduleScopedQuery(raw: String) {
+        pendingSuggest?.let(mainHandler::removeCallbacks)
+        pendingSuggest = null
+        pendingScopedQuery = raw.isNotBlank()
+        if (!active || !pendingScopedQuery) return
+        val task = Runnable {
+            pendingSuggest = null
+            pendingScopedQuery = false
+            if (active && input.text.toString() == raw) startScopedSearch(raw.trim())
+        }
+        pendingSuggest = task
+        mainHandler.postDelayed(task, 320L)
+    }
+
     private fun submitSearch(raw: String) {
+        if (session != BiliSessionStore.cookie()) { setActive(true); return }
         val kw = raw.trim()
-        if (kw.isEmpty()) return
+        if (!active || kw.isEmpty()) return
+        pendingSuggest?.let(mainHandler::removeCallbacks)
+        pendingSuggest = null
+        pendingScopedQuery = false
         hideKeyboard()
-        SearchHistoryStore.record(activity, kw)
-        refreshHistory()
+        if (scope == TabletSearchScope.PUBLIC) {
+            SearchHistoryStore.record(activity, kw)
+            refreshHistory()
+        }
         runSearch(kw, keepPgc = false)
     }
 
     private fun runSearch(keyword: String, keepPgc: Boolean) {
+        if (!active) return
+        if (scope != TabletSearchScope.PUBLIC) { startScopedSearch(keyword); return }
         currentKeyword = keyword
         showingResults = true
         searching = true
         loadingMore = false
         endReached = false
-        searchPage = 1
+        searchPage = 0
         val gen = ++searchGen
+        val expectedSession = session
+        pageError = false
+        retryRow.visibility = View.GONE
         suggestionBox.visibility = View.GONE
         idleScroll.visibility = View.GONE
         filterRow.visibility = View.VISIBLE
@@ -628,29 +809,17 @@ internal class TabletSearchPageView(
         stateView.visibility = View.GONE
         topButton.setShown(false, animate = false)
         topScroller?.cancel()
-        if (!keepPgc) pgcHeader.visibility = View.GONE
         adapter.replace(emptyList())
         VideoCardUi.toggleSkeleton(skeletonOverlay, true)
-
-        if (!keepPgc) {
-            val collectedPgc = ArrayList<PgcMedia>()
-            var pendingPgc = 2
-            fun finishPgcBranch(items: List<PgcMedia>?) {
-                if (gen != searchGen || !showingResults) return
-                items?.forEach { m -> if (collectedPgc.none { it.seasonId == m.seasonId }) collectedPgc.add(m) }
-                pendingPgc--
-                if (pendingPgc <= 0) bindPgcCards(collectedPgc)
-            }
-            BiliApi.searchPgc(keyword, "media_bangumi") { items, _ -> finishPgcBranch(items) }
-            BiliApi.searchPgc(keyword, "media_ft") { items, _ -> finishPgcBranch(items) }
-        }
+        if (!keepPgc || pgcPending) requestPgcResults(keyword)
 
         val minDurationSec = minDurationSeconds(filterDuration)
         BiliApi.search(keyword, page = 1, order = sortMode.orderParam, duration = 0) { list, error ->
-            if (gen != searchGen || !showingResults) return@search
+            if (!accepts(gen, expectedSession, keyword) || !showingResults) return@search
             searching = false
             VideoCardUi.toggleSkeleton(skeletonOverlay, false)
             if (error != null) {
+                pageError = true
                 stateView.text = "搜索失败：$error\n\n点这里重试"
                 stateView.visibility = View.VISIBLE
                 stateView.setOnClickListener { runSearch(keyword, keepPgc = false) }
@@ -658,8 +827,9 @@ internal class TabletSearchPageView(
             }
             val safeList = list.orEmpty()
             val filtered = filterByMinDuration(safeList, minDurationSec)
-            adapter.replace(filtered)
+            searchPage = 1
             endReached = safeList.size < 15
+            adapter.replace(filtered)
             if (filtered.isEmpty() && pgcHeader.visibility != View.VISIBLE) {
                 stateView.text = "没有找到与「$keyword」相关的内容"
                 stateView.visibility = View.VISIBLE
@@ -668,16 +838,136 @@ internal class TabletSearchPageView(
         }
     }
 
+    private fun requestPgcResults(keyword: String) {
+        if (scope != TabletSearchScope.PUBLIC || !active || keyword.isBlank()) return
+        val gen = searchGen
+        val expectedSession = session
+        bindPgcCards(emptyList())
+        pgcPending = true
+        val collected = ArrayList<PgcMedia>()
+        var remaining = 2
+        fun finish(items: List<PgcMedia>?) {
+            if (!accepts(gen, expectedSession, keyword) || !showingResults) return
+            items?.forEach { media -> if (collected.none { it.seasonId == media.seasonId }) collected.add(media) }
+            remaining--
+            if (remaining == 0) {
+                pgcPending = false
+                bindPgcCards(collected)
+                if (collected.isNotEmpty()) stateView.visibility = View.GONE
+            }
+        }
+        BiliApi.searchPgc(keyword, "media_bangumi") { list, _ -> finish(list) }
+        BiliApi.searchPgc(keyword, "media_ft") { list, _ -> finish(list) }
+    }
+
+    private fun startScopedSearch(keyword: String) {
+        if (!active || keyword.isBlank()) return
+        if (session != BiliSessionStore.cookie()) { setActive(true); return }
+        if (keyword == currentKeyword && searching) return
+        searchGen++
+        currentKeyword = keyword
+        showingResults = true
+        searchPage = 0
+        endReached = false
+        pageError = false
+        resumeFirst = false
+        resumeMore = false
+        searching = true
+        loadingMore = false
+        retryRow.visibility = View.GONE
+        stateView.visibility = View.GONE
+        stateView.setOnClickListener(null)
+        suggestionBox.visibility = View.GONE
+        idleScroll.visibility = View.GONE
+        filterRow.visibility = View.GONE
+        resultsHost.visibility = View.VISIBLE
+        pgcHeader.visibility = View.GONE
+        topButton.setShown(false, animate = false)
+        topScroller?.cancel()
+        adapter.replace(emptyList())
+        if (!BiliSessionStore.isLoggedIn(session)) {
+            searching = false
+            endReached = true
+            stateView.text = if (scope == TabletSearchScope.HISTORY) "请先登录后再搜索历史" else "请先登录后再搜索收藏"
+            stateView.visibility = View.VISIBLE
+            VideoCardUi.toggleSkeleton(skeletonOverlay, false)
+            return
+        }
+        VideoCardUi.toggleSkeleton(skeletonOverlay, true)
+        fetchScopedPage(1)
+    }
+
+    private fun fetchScopedPage(page: Int) {
+        if (!active || scope == TabletSearchScope.PUBLIC) return
+        if (session != BiliSessionStore.cookie()) { setActive(true); return }
+        val gen = searchGen
+        val expectedSession = session
+        val keyword = currentKeyword
+        val first = page == 1
+        if (first) searching = true else {
+            loadingMore = true
+            pagingSpinner.visibility = View.VISIBLE
+            pagingSpinner.startSpinning()
+        }
+        val deliver: (List<VideoItem>, String?, Boolean) -> Unit = callback@{ videos, error, ended ->
+            if (!accepts(gen, expectedSession, keyword) || !showingResults) return@callback
+            searching = false
+            loadingMore = false
+            pagingSpinner.visibility = View.GONE
+            VideoCardUi.toggleSkeleton(skeletonOverlay, false)
+            if (error != null) {
+                pageError = true
+                if (first) {
+                    stateView.text = "搜索失败：$error\n\n点这里重试"
+                    stateView.visibility = View.VISIBLE
+                    stateView.setOnClickListener { startScopedSearch(keyword) }
+                } else {
+                    retryRow.text = "加载失败，点此重试"
+                    retryRow.visibility = View.VISIBLE
+                }
+                return@callback
+            }
+            val rows = if (scope == TabletSearchScope.HISTORY) HistoryStore.withLocalProgress(activity, videos) else videos
+            searchPage = page
+            endReached = ended
+            pageError = false
+            retryRow.visibility = View.GONE
+            stateView.setOnClickListener(null)
+            val existing = if (first) emptySet() else adapter.snapshot().map { scope.rowKey(it) }.toSet()
+            val hasNewRows = rows.any { scope.rowKey(it) !in existing }
+            pageError = !ended && !hasNewRows
+            if (first) adapter.replace(rows) else adapter.append(rows)
+            if (pageError) {
+                retryRow.text = "继续加载搜索结果"
+                retryRow.visibility = View.VISIBLE
+            }
+            stateView.text = "没有找到与「$keyword」相关的${if (scope == TabletSearchScope.HISTORY) "历史" else "收藏"}"
+            stateView.visibility = if (adapter.itemCount() == 0 && ended) View.VISIBLE else View.GONE
+        }
+        when (scope) {
+            TabletSearchScope.HISTORY -> BiliApi.searchHistory(keyword, page, deliver)
+            TabletSearchScope.FAVORITES -> BiliApi.searchAllFavoriteVideos(keyword) { videos, error -> deliver(videos, error, true) }
+            TabletSearchScope.PUBLIC -> Unit
+        }
+    }
+
     private fun loadNextPage() {
-        if (loadingMore || endReached || currentKeyword.isBlank()) return
+        if (!active || searching || loadingMore || endReached || pageError || currentKeyword.isBlank()) return
+        if (session != BiliSessionStore.cookie()) { setActive(true); return }
+        if (scope != TabletSearchScope.PUBLIC) {
+            if (scope == TabletSearchScope.HISTORY) fetchScopedPage(searchPage + 1)
+            return
+        }
         loadingMore = true
         val gen = searchGen
+        val expectedSession = session
+        val keyword = currentKeyword
         val nextPage = searchPage + 1
         pagingSpinner.visibility = View.VISIBLE
         pagingSpinner.startSpinning()
         val minDurationSec = minDurationSeconds(filterDuration)
         BiliApi.search(currentKeyword, page = nextPage, order = sortMode.orderParam, duration = 0) { list, error ->
-            if (gen != searchGen) return@search
+            if (!accepts(gen, expectedSession, keyword)) return@search
             loadingMore = false
             pagingSpinner.visibility = View.GONE
             val safeList = list.orEmpty()
@@ -693,7 +983,19 @@ internal class TabletSearchPageView(
     }
 
     private fun resetToIdle() {
+        pendingSuggest?.let(mainHandler::removeCallbacks)
+        pendingSuggest = null
+        pendingScopedQuery = false
+        pgcPending = false
         searchGen++
+        currentKeyword = ""
+        resumeFirst = false
+        resumeMore = false
+        pageError = false
+        retryRow.visibility = View.GONE
+        stateView.setOnClickListener(null)
+        pagingSpinner.visibility = View.GONE
+        VideoCardUi.toggleSkeleton(skeletonOverlay, false)
         showingResults = false
         searching = false
         loadingMore = false
@@ -731,17 +1033,28 @@ internal class TabletSearchPageView(
         private val coverH = VideoCardUi.coverHeight(cardW)
         private val cardH = VideoCardUi.cardHeight(coverH, activity)
 
+        fun snapshot(): List<VideoItem> = videos.toList()
+        fun itemCount(): Int = videos.size
+
+        fun updateHistoryProgress() {
+            val updated = HistoryStore.withLocalProgress(activity, videos)
+            videos.clear()
+            seen.clear()
+            updated.forEach { if (seen.add(scope.rowKey(it))) videos.add(it) }
+            notifyDataSetChanged()
+        }
+
         fun replace(items: List<VideoItem>) {
             videos.clear()
             seen.clear()
-            items.forEach { if (seen.add(it.bvid)) videos.add(it) }
+            items.forEach { if (seen.add(scope.rowKey(it))) videos.add(it) }
             notifyDataSetChanged()
             resultsList.post { resultsList.setSelection(0) }
         }
 
         fun append(items: List<VideoItem>) {
             var added = false
-            items.forEach { if (seen.add(it.bvid)) { videos.add(it); added = true } }
+            items.forEach { if (seen.add(scope.rowKey(it))) { videos.add(it); added = true } }
             if (added) notifyDataSetChanged()
         }
 
@@ -762,7 +1075,8 @@ internal class TabletSearchPageView(
                     val card = VideoCardUi.createCard(activity, cardW, coverH, cardH).apply {
                         setOnClickListener {
                             (tag as? VideoCardUi.Holder)?.boundVideo?.let { v ->
-                                VideoDetailActivity.open(activity, v.bvid, v.aid, v.cid)
+                                if (scope == TabletSearchScope.HISTORY) VideoDetailActivity.openHistory(activity, v)
+                                else VideoDetailActivity.open(activity, v.bvid, v.aid, v.cid)
                             }
                         }
                     }
@@ -791,7 +1105,14 @@ internal class TabletSearchPageView(
                 } else {
                     card.visibility = View.VISIBLE
                     card.isClickable = true
-                    VideoCardUi.bind(card, holder, video, showPublishDate = true)
+                    VideoCardUi.bind(card, holder, if (scope == TabletSearchScope.HISTORY) video.copy(rcmdReason = "") else video, showPublishDate = true)
+                    holder.boundVideo = video
+                    if (scope == TabletSearchScope.HISTORY) {
+                        holder.duration.text = formatHistoryCoverBadge(video.watchProgressSec, video.duration)
+                        holder.viewsText.text = ""
+                        holder.viewsText.visibility = View.GONE
+                        (holder.viewsText.parent as? ViewGroup)?.getChildAt(0)?.visibility = View.GONE
+                    }
                 }
             }
             return row

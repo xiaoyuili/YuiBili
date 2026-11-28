@@ -67,11 +67,28 @@ internal object LayoutMode {
         return widthDp >= 600f
     }
 
-    /** 平板模式允许自由随重力旋转；手机模式由页面保持原逻辑。 */
-    fun applyTabletOrientationIfEnabled(activity: Activity) {
-        if (isTablet) {
-            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
-        }
+    enum class ScreenDirection(val key: String, val label: String, val orientation: Int) {
+        SYSTEM("system", "跟随系统", ActivityInfo.SCREEN_ORIENTATION_USER),
+        PORTRAIT("portrait", "锁定竖屏", ActivityInfo.SCREEN_ORIENTATION_PORTRAIT),
+        LANDSCAPE("landscape", "锁定横屏", ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+    }
+
+    fun screenDirection(context: Context): ScreenDirection {
+        val key = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("screen_direction", null)
+        return ScreenDirection.entries.firstOrNull { it.key == key } ?: ScreenDirection.SYSTEM
+    }
+
+    fun setScreenDirection(activity: Activity, direction: ScreenDirection) {
+        activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("screen_direction", direction.key).apply()
+        applyScreenOrientation(activity)
+    }
+
+    internal fun playbackOrientation(tablet: Boolean, fullscreen: Boolean, direction: ScreenDirection): Int =
+        if (!tablet && fullscreen) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else direction.orientation
+
+    fun applyScreenOrientation(activity: Activity, fullscreen: Boolean = false) {
+        val target = playbackOrientation(isTablet, fullscreen, screenDirection(activity))
+        if (activity.requestedOrientation != target) activity.requestedOrientation = target
     }
 
     /**
@@ -158,7 +175,7 @@ internal object LayoutMode {
         context: Context,
         anchor: View,
         onSelected: (Mode) -> Unit
-    ) {
+    ): PopupWindow {
         val c = Ds.colors
         val panel = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
@@ -217,6 +234,7 @@ internal object LayoutMode {
         }
         val xOff = anchor.width - context.dp(156)
         popup.showAsDropDown(anchor, xOff, context.dp(6))
+        return popup
     }
 
     /** 「外观适配」左侧设备图标（平板轮廓）与下拉小箭头，纯矢量绘制。 */

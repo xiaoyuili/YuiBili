@@ -44,22 +44,36 @@ class MainActivity : Activity() {
     private var resumed = false
     private var reducedMotion = false
     private var builtAsTablet = false
+    private var themeTransitionRunning = false
+    private var themeRevealAnimator: ValueAnimator? = null
+    private var themeRevealCleanup: (() -> Unit)? = null
+    private data class TabletState(val session: String, val searches: Map<Int, TabletSearchPageView.Snapshot>,
+        val favorites: TabletFavoritesPageView.Snapshot?, val history: TabletHistoryPageView.Snapshot?)
+    private var retainedTabletState: TabletState? = null
+    private val restoredSearches = HashMap<Int, TabletSearchPageView.Snapshot>()
+    private var restoredFavorites: TabletFavoritesPageView.Snapshot? = null
+    private var restoredHistory: TabletHistoryPageView.Snapshot? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         reducedMotion = MotionTokens.isReduced(this)
         Theme.init(this)
         builtAsTablet = LayoutMode.isTablet
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        LayoutMode.applyScreenOrientation(this)
         // Paint the window with the current theme colour BEFORE any content so
         // recreate() after night-mode toggle never flashes the light styles.xml
         // windowBackground (#FFFCFA) for one frame.
         window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(COLOR_BACKGROUND))
         // Suppress the default activity cross-fade that fights the circular reveal.
-        if (Theme.peekCircularTransition()) {
+        if (Theme.peekCircularTransition() || Theme.hasTabletFade()) {
             overridePendingTransition(0, 0)
         }
         BiliSessionStore.init(this)
+        (lastNonConfigurationInstance as? TabletState)?.takeIf { builtAsTablet && it.session == BiliSessionStore.cookie() }?.let {
+            restoredSearches.putAll(it.searches)
+            restoredFavorites = it.favorites
+            restoredHistory = it.history
+        }
         // A new task/activity entry refreshes the feeds; state restoration (such as
         // rotation or process recreation with saved state) keeps the visible feed.
         refreshOnEntry = savedInstanceState == null
@@ -76,7 +90,7 @@ class MainActivity : Activity() {
         }
 
         if (builtAsTablet) {
-            // 平板一体化工作台：左侧固定 Navigation Rail（首页/搜索/下载/收藏/历史/我的+夜间）+ 右侧纵向弹簧滚动舞台
+            // 搜索复用右侧舞台，侧栏只保留主要目的地和日夜切换。
             val shell = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 setBackgroundColor(COLOR_BACKGROUND)
@@ -84,7 +98,7 @@ class MainActivity : Activity() {
             val rail = TabletRailNav(
                 context = this,
                 onSelectDestination = { dest -> showTabletDestination(dest, animate = true) },
-                onToggleTheme = { anchor -> toggleDarkModeFromRail(anchor) }
+                onToggleTheme = { _, dark -> toggleDarkModeFromRail(dark) }
             )
             tabletRail = rail
             val stage = TabletVerticalStage(this)
@@ -200,6 +214,7 @@ class MainActivity : Activity() {
     }
 
     private fun showTabletDestination(dest: Int, animate: Boolean) {
+        themeRevealCleanup?.invoke()
         val stage = tabletStage ?: return
         currentTabletDest = dest.coerceIn(0, TabletRailNav.DEST_COUNT - 1)
         tabletRail?.setSelectedDestination(currentTabletDest)
@@ -208,40 +223,59 @@ class MainActivity : Activity() {
     }
 
     private fun createTabletPage(dest: Int): View = when (dest) {
-        TabletRailNav.DEST_HOME -> HomeFeedView(this, refreshOnEntry, restoredHomeState).also {
+        TabletRailNav.DEST_HOME -> HomeFeedView(this, refreshOnEntry, restoredHomeState,
+            onSearch = { showTabletDestination(TabletRailNav.DEST_SEARCH, animate = true) }).also {
             restoredHomeState = null
             pages[HOME] = it
         }
-        TabletRailNav.DEST_SEARCH -> TabletSearchPageView(this)
+        TabletRailNav.DEST_SEARCH, TabletRailNav.DEST_HISTORY_SEARCH, TabletRailNav.DEST_FAVORITES_SEARCH -> {
+            val scope = tabletSearchScope(dest)!!
+            TabletSearchPageView(this, scope, restoredSearches.remove(dest)) {
+                showTabletDestination(scope.parentDestination, animate = true)
+            }
+        }
         TabletRailNav.DEST_DOWNLOADS -> DownloadPageView(this, initialTab = DownloadPageView.TAB_VIDEO, onClose = null)
-        TabletRailNav.DEST_FAVORITES -> TabletFavoritesPageView(this)
-        TabletRailNav.DEST_HISTORY -> TabletHistoryPageView(this)
+        TabletRailNav.DEST_FAVORITES -> TabletFavoritesPageView(this, restoredFavorites.also { restoredFavorites = null }) {
+            showTabletDestination(TabletRailNav.DEST_FAVORITES_SEARCH, animate = true)
+        }
+        TabletRailNav.DEST_HISTORY -> TabletHistoryPageView(this, restoredHistory.also { restoredHistory = null }) {
+            showTabletDestination(TabletRailNav.DEST_HISTORY_SEARCH, animate = true)
+        }
         else -> AccountPageView(this).also { pages[PROFILE] = it }
     }
 
-    private fun toggleDarkModeFromRail(anchor: View) {
-        val next = !Theme.isDark
-        try {
-            val content = window.decorView.findViewById<View>(android.R.id.content) ?: window.decorView
-            val anchorLoc = IntArray(2)
-            val contentLoc = IntArray(2)
-            anchor.getLocationOnScreen(anchorLoc)
-            content.getLocationOnScreen(contentLoc)
-            val cx = anchorLoc[0] - contentLoc[0] + anchor.width / 2f
-            val cy = anchorLoc[1] - contentLoc[1] + anchor.height / 2f
-            val bmp = Bitmap.createBitmap(
-                content.width.coerceAtLeast(1),
-                content.height.coerceAtLeast(1),
-                Bitmap.Config.ARGB_8888
-            )
-            content.draw(Canvas(bmp))
-            Theme.prepareCircularTransition(bmp, cx, cy, expand = next)
-        } catch (_: Exception) {
+    private fun toggleDarkModeFromRail(next: Boolean) {
+        if (!resumed || isFinishing || isDestroyed || themeTransitionRunning || next == Theme.isDark) return
+        retainedTabletState = snapshotTabletState()
+        themeTransitionRunning = true
+        tabletRail?.setThemeTransitionLocked(true)
+        if (!MotionTokens.isReduced(this)) {
+            var snapshot: Bitmap? = null
+            try {
+                val content = window.decorView.findViewById<View>(android.R.id.content) ?: window.decorView
+                if (content.width > 0 && content.height > 0) {
+                    snapshot = Bitmap.createBitmap(content.width, content.height, Bitmap.Config.ARGB_8888)
+                    tabletRail?.setThemeSymbolsHidden(true)
+                    content.draw(Canvas(snapshot))
+                    Theme.prepareTabletFade(snapshot, Theme.isDark)
+                    snapshot = null
+                }
+            } catch (_: Exception) {
+            } catch (_: OutOfMemoryError) {
+            } finally {
+                snapshot?.recycle()
+                tabletRail?.setThemeSymbolsHidden(false)
+            }
         }
         Theme.setDark(this, next)
         @Suppress("DEPRECATION")
         overridePendingTransition(0, 0)
         recreate()
+    }
+
+    override fun dispatchTouchEvent(event: android.view.MotionEvent): Boolean {
+        if (builtAsTablet && event.actionMasked == android.view.MotionEvent.ACTION_DOWN) themeRevealCleanup?.invoke()
+        return super.dispatchTouchEvent(event)
     }
 
     override fun onResume() {
@@ -251,7 +285,9 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        if (builtAsTablet && (!themeTransitionRunning || themeRevealCleanup != null)) retainedTabletState = snapshotTabletState()
         resumed = false
+        themeRevealCleanup?.invoke()
         updateActivePage()
         super.onPause()
     }
@@ -275,7 +311,11 @@ class MainActivity : Activity() {
     override fun onBackPressed() {
         if (builtAsTablet) {
             val curView = tabletStage?.getPage(currentTabletDest)
-            if (curView is TabletSearchPageView && curView.handleBack()) return
+            if (curView is TabletSearchPageView) {
+                if (curView.handleBack()) return
+                showTabletDestination(tabletSearchScope(currentTabletDest)!!.parentDestination, animate = true)
+                return
+            }
             if (curView is DownloadPageView && curView.handleBack()) return
             if (currentTabletDest != TabletRailNav.DEST_HOME) {
                 showTabletDestination(TabletRailNav.DEST_HOME, animate = true)
@@ -286,7 +326,8 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        (tabletStage?.getPage(TabletRailNav.DEST_SEARCH) as? TabletSearchPageView)?.destroy()
+        themeRevealCleanup?.invoke()
+        for (dest in restoredSearchDestinations) (tabletStage?.getPage(dest) as? TabletSearchPageView)?.destroy()
         super.onDestroy()
     }
 
@@ -303,14 +344,15 @@ class MainActivity : Activity() {
                 ?.setActive(resumed && currentTabletDest == TabletRailNav.DEST_PROFILE)
             (tabletStage?.getPage(TabletRailNav.DEST_DOWNLOADS) as? DownloadPageView)
                 ?.setActive(resumed && currentTabletDest == TabletRailNav.DEST_DOWNLOADS)
+            (tabletStage?.getPage(TabletRailNav.DEST_HISTORY) as? TabletHistoryPageView)
+                ?.setActive(resumed && currentTabletDest == TabletRailNav.DEST_HISTORY)
+            for (dest in restoredSearchDestinations) {
+                (tabletStage?.getPage(dest) as? TabletSearchPageView)?.setActive(resumed && currentTabletDest == dest)
+            }
             if (resumed) {
                 when (currentTabletDest) {
-                    TabletRailNav.DEST_SEARCH ->
-                        (tabletStage?.getPage(TabletRailNav.DEST_SEARCH) as? TabletSearchPageView)?.onPageActivated()
                     TabletRailNav.DEST_FAVORITES ->
                         (tabletStage?.getPage(TabletRailNav.DEST_FAVORITES) as? TabletFavoritesPageView)?.onPageActivated()
-                    TabletRailNav.DEST_HISTORY ->
-                        (tabletStage?.getPage(TabletRailNav.DEST_HISTORY) as? TabletHistoryPageView)?.onPageActivated()
                 }
             }
             return
@@ -427,6 +469,16 @@ class MainActivity : Activity() {
         dialog.show()
     }
 
+    private fun snapshotTabletState(): TabletState = TabletState(BiliSessionStore.cookie(),
+        restoredSearches.toMutableMap().apply {
+            for (dest in restoredSearchDestinations) {
+                (tabletStage?.getPage(dest) as? TabletSearchPageView)?.let { put(dest, it.snapshot()) }
+            }
+        }, (tabletStage?.getPage(TabletRailNav.DEST_FAVORITES) as? TabletFavoritesPageView)?.snapshot() ?: restoredFavorites,
+        (tabletStage?.getPage(TabletRailNav.DEST_HISTORY) as? TabletHistoryPageView)?.snapshot() ?: restoredHistory)
+
+    override fun onRetainNonConfigurationInstance(): Any? = if (builtAsTablet) retainedTabletState ?: snapshotTabletState() else null
+
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putInt(STATE_CURRENT_PAGE, currentPage)
         outState.putInt(STATE_TABLET_DEST, currentTabletDest)
@@ -483,12 +535,18 @@ class MainActivity : Activity() {
      *   circle that collapses into the switch (night is sucked back in).
      */
     private fun playPendingThemeTransition(root: FrameLayout) {
+        Theme.consumeTabletFade()?.let { pending ->
+            if (builtAsTablet) playTabletThemeFade(root, pending) else pending.bitmap.recycle()
+            return
+        }
         val pending = Theme.consumeCircularTransition() ?: return
         val (bitmap, center, expand) = pending
         if (reducedMotion) {
             bitmap.recycle()
             return
         }
+        themeTransitionRunning = true
+        tabletRail?.setThemeTransitionLocked(true)
         val cx = center.first
         val cy = center.second
         // Smooth theme switch: subtle fade-out of the previous window snapshot
@@ -526,11 +584,32 @@ class MainActivity : Activity() {
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         )
+        var layoutListener: View.OnLayoutChangeListener? = null
+        var cleaned = false
+        fun cleanup() {
+            if (cleaned) return
+            cleaned = true
+            layoutListener?.let(overlay::removeOnLayoutChangeListener)
+            layoutListener = null
+            themeRevealAnimator?.let {
+                it.removeAllListeners()
+                it.removeAllUpdateListeners()
+                it.cancel()
+            }
+            themeRevealAnimator = null
+            root.removeView(overlay)
+            if (!bitmap.isRecycled) bitmap.recycle()
+            themeTransitionRunning = false
+            themeRevealCleanup = null
+            tabletRail?.setThemeTransitionLocked(false)
+        }
+        themeRevealCleanup = ::cleanup
         fun startAnim(maxR: Float) {
+            if (cleaned || isFinishing || isDestroyed) { cleanup(); return }
             val start = if (expand) 0f else maxR
             val end = if (expand) maxR else 0f
             overlay.radius = start
-            ValueAnimator.ofFloat(start, end).apply {
+            themeRevealAnimator = ValueAnimator.ofFloat(start, end).apply {
                 duration = 380L
                 interpolator = MotionTokens.easeOut
                 addUpdateListener {
@@ -538,30 +617,122 @@ class MainActivity : Activity() {
                     overlay.invalidate()
                 }
                 addListener(object : AnimatorListenerAdapter() {
-                    private fun cleanup() {
-                        root.removeView(overlay)
-                        if (!bitmap.isRecycled) bitmap.recycle()
-                    }
                     override fun onAnimationEnd(animation: Animator) = cleanup()
                     override fun onAnimationCancel(animation: Animator) = cleanup()
                 })
-                start()
             }
+            themeRevealAnimator?.start()
         }
         if (overlay.width > 0 && overlay.height > 0) {
             val maxR = maxRadius(cx, cy, overlay.width, overlay.height)
             startAnim(maxR)
         } else {
-            overlay.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+            layoutListener = object : View.OnLayoutChangeListener {
                 override fun onLayoutChange(
                     v: View, left: Int, top: Int, right: Int, bottom: Int,
                     oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int
                 ) {
                     overlay.removeOnLayoutChangeListener(this)
+                    layoutListener = null
                     startAnim(maxRadius(cx, cy, overlay.width, overlay.height))
                 }
-            })
+            }
+            overlay.addOnLayoutChangeListener(layoutListener)
         }
+    }
+
+    private fun playTabletThemeFade(root: FrameLayout, pending: Theme.TabletFade) {
+        val bitmap = pending.bitmap
+        if (reducedMotion) { bitmap.recycle(); return }
+        val rail = tabletRail ?: run { bitmap.recycle(); return }
+        val from = Ds.palette(pending.fromDark)
+        val to = Ds.colors
+        themeTransitionRunning = true
+        rail.setThemeTransitionLocked(true)
+        rail.setThemeSymbolsHidden(true)
+        val overlay = object : View(this) {
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+            var progress = 0f
+            override fun onDraw(canvas: Canvas) {
+                if (bitmap.isRecycled) return
+                paint.alpha = (255 * (1f - progress)).toInt()
+                canvas.drawBitmap(bitmap, 0f, 0f, paint)
+                rail.drawThemeTransition(canvas, root, pending.fromDark, progress)
+            }
+        }
+        root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
+        fun setBarForeground(dark: Boolean) {
+            @Suppress("DEPRECATION")
+            var flags = window.decorView.systemUiVisibility
+            @Suppress("DEPRECATION")
+            val status = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+            flags = if (dark) flags and status.inv() else flags or status
+            if (Build.VERSION.SDK_INT >= 26) {
+                flags = if (dark) flags and View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR.inv()
+                    else flags or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+            }
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = flags
+        }
+        var barDark = pending.fromDark
+        setBarForeground(barDark)
+        window.statusBarColor = from.bg
+        window.navigationBarColor = from.bg
+        var listener: View.OnLayoutChangeListener? = null
+        var cleaned = false
+        fun cleanup() {
+            if (cleaned) return
+            cleaned = true
+            listener?.let(root::removeOnLayoutChangeListener)
+            listener = null
+            themeRevealAnimator?.let {
+                it.removeAllListeners()
+                it.removeAllUpdateListeners()
+                it.cancel()
+            }
+            themeRevealAnimator = null
+            root.removeView(overlay)
+            if (!bitmap.isRecycled) bitmap.recycle()
+            rail.setThemeSymbolsHidden(false)
+            rail.setThemeTransitionLocked(false)
+            configureSystemBars()
+            themeTransitionRunning = false
+            themeRevealCleanup = null
+        }
+        themeRevealCleanup = ::cleanup
+        fun start() {
+            if (cleaned) return
+            if (isFinishing || isDestroyed || root.width != bitmap.width || root.height != bitmap.height) {
+                cleanup()
+                return
+            }
+            themeRevealAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 420L
+                interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+                addUpdateListener {
+                    val p = it.animatedValue as Float
+                    overlay.progress = p
+                    window.statusBarColor = themeBlendColor(from.bg, to.bg, p)
+                    window.navigationBarColor = themeBlendColor(from.bg, to.bg, p)
+                    val background = window.statusBarColor
+                    val dark = (Color.red(background) * .299f + Color.green(background) * .587f + Color.blue(background) * .114f) < 145f
+                    if (dark != barDark) { barDark = dark; setBarForeground(dark) }
+                    overlay.invalidate()
+                }
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) = cleanup()
+                    override fun onAnimationCancel(animation: Animator) = cleanup()
+                })
+            }
+            themeRevealAnimator?.start()
+        }
+        listener = View.OnLayoutChangeListener { _, l, t, r, b, _, _, _, _ ->
+            if (cleaned || r <= l || b <= t) return@OnLayoutChangeListener
+            if (r - l != bitmap.width || b - t != bitmap.height) cleanup()
+            else if (themeRevealAnimator == null) start()
+        }
+        root.addOnLayoutChangeListener(listener)
+        if (root.width > 0 && root.height > 0) start()
     }
 
     private fun maxRadius(cx: Float, cy: Float, w: Int, h: Int): Float {
@@ -590,5 +761,6 @@ class MainActivity : Activity() {
         const val STATE_HOME = "main_home_state"
         const val PREFS_NAME = "yuibili_settings"
         const val KEY_DISCLAIMER_ACCEPTED = "disclaimer_accepted"
+        val restoredSearchDestinations = intArrayOf(TabletRailNav.DEST_SEARCH, TabletRailNav.DEST_HISTORY_SEARCH, TabletRailNav.DEST_FAVORITES_SEARCH)
     }
 }

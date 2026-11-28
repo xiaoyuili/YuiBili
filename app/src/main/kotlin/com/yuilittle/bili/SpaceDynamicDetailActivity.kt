@@ -31,30 +31,12 @@ class SpaceDynamicDetailActivity : Activity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var detailRequest: BiliRequest? = null
-    private var commentRequest: BiliRequest? = null
 
     private lateinit var dynamicItem: SpaceDynamic
     private lateinit var snackHost: FrameLayout
     private lateinit var topBar: LinearLayout
-    private lateinit var scrollView: ScrollView
-    private lateinit var contentColumn: LinearLayout
     private lateinit var detailHost: LinearLayout
-    private var commentHeaderBar: CommentSectionUi.CommentHeaderBar? = null
-    private var commentPrefetchHandle: CoverLoader.PrefetchHandle? = null
-    private lateinit var commentHeaderTitle: TextView
-    private lateinit var commentSortBtn: TextView
-    private lateinit var commentContent: LinearLayout
-    private lateinit var commentState: TextView
-    private lateinit var commentMore: TextView
-
-    private var commentSort = 0
-    private var commentCursor = 1
-    private var commentsLoading = false
-    private var commentsLoaded = false
-    private var commentHasMore = false
-    private var commentLoginHintShown = false
-    private var commentGeneration = 0
-    private val seenCommentRpids = HashSet<Long>()
+    private lateinit var comments: CommentListView
 
     private var currentCommentOid: String = ""
     private var currentCommentType: Int = 17
@@ -62,8 +44,9 @@ class SpaceDynamicDetailActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Theme.init(this)
+        BiliSessionStore.init(this)
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        LayoutMode.applyScreenOrientation(this)
 
         val parsed = readDynamicFromIntent(intent)
         if (parsed == null) {
@@ -113,68 +96,21 @@ class SpaceDynamicDetailActivity : Activity() {
                 LinearLayout.LayoutParams(Ds.hairline(this), LinearLayout.LayoutParams.MATCH_PARENT)
             )
 
-            scrollView = ScrollView(this).apply {
-                isFillViewport = true
-                isVerticalScrollBarEnabled = false
-                setBackgroundColor(COLOR_BACKGROUND)
-                setOnScrollChangeListener { _, _, scrollY, _, _ ->
-                    if (contentColumn.height > 0 && scrollY + height >= contentColumn.height - dp(160)) {
-                        maybeLoadMoreComments()
-                    }
-                }
-            }
-            contentColumn = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundColor(COLOR_BACKGROUND)
-            }
-            contentColumn.addView(
-                buildCommentSection(),
-                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            )
-            scrollView.addView(
-                contentColumn,
-                FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT)
-            )
-            split.addView(scrollView, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+            comments = buildCommentSection()
+            split.addView(comments, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
             column.addView(split, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         } else {
-            scrollView = ScrollView(this).apply {
-                isFillViewport = true
-                isVerticalScrollBarEnabled = false
-                setBackgroundColor(COLOR_BACKGROUND)
-                setOnScrollChangeListener { _, _, scrollY, _, _ ->
-                    if (contentColumn.height > 0 && scrollY + height >= contentColumn.height - dp(160)) {
-                        maybeLoadMoreComments()
-                    }
-                }
-            }
-            contentColumn = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundColor(COLOR_BACKGROUND)
-            }
-
             detailHost = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 setBackgroundColor(COLOR_CARD)
             }
-            contentColumn.addView(
-                detailHost,
-                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            )
-            contentColumn.addView(
-                View(this).apply { setBackgroundColor(COLOR_SOFT_FILL) },
-                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(8))
-            )
-            contentColumn.addView(
-                buildCommentSection(),
-                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            )
-
-            scrollView.addView(
-                contentColumn,
-                FrameLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT)
-            )
-            column.addView(scrollView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+            val leading = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(detailHost, LinearLayout.LayoutParams(-1, -2))
+                addView(View(this@SpaceDynamicDetailActivity).apply { setBackgroundColor(COLOR_SOFT_FILL) }, LinearLayout.LayoutParams(-1, dp(8)))
+            }
+            comments = buildCommentSection(leading)
+            column.addView(comments, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         }
         root.addView(column, FrameLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
@@ -199,7 +135,9 @@ class SpaceDynamicDetailActivity : Activity() {
 
         renderDynamicBody(dynamicItem)
         refreshDynamicDetailIfNeeded()
-        loadComments(reset = true)
+        comments.restoreState(savedInstanceState?.getBundle("comments"))
+        comments.restoreRetainedState(lastNonConfigurationInstance as? CommentListView.RetainedState)
+        comments.bindTarget(currentCommentOid, currentCommentType, dynamicItem.authorMid ?: 0L)
     }
 
     private fun buildTopBar(): LinearLayout = LinearLayout(this).apply {
@@ -652,204 +590,17 @@ class SpaceDynamicDetailActivity : Activity() {
             if (nextOid.isNotBlank() && (nextOid != prevOid || nextType != prevType)) {
                 currentCommentOid = nextOid
                 currentCommentType = nextType
-                commentGeneration++
-                commentsLoading = false
-                loadComments(reset = true)
+                comments.bindTarget(nextOid, nextType, fresh.authorMid ?: 0L, start = true)
             }
         }
     }
 
-    private fun buildCommentSection(): LinearLayout {
-        val wrap = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(COLOR_BACKGROUND)
-        }
-        val headerBar = CommentSectionUi.CommentHeaderBar(this) { toggleCommentSort() }
-        commentHeaderBar = headerBar
-        commentHeaderTitle = headerBar.titleView
-        commentSortBtn = headerBar.sortLabel
-        wrap.addView(headerBar, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-
-        commentContent = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(2), dp(16), dp(28))
-        }
-        commentState = TextView(this).apply {
-            text = "正在加载评论…"
-            textSize = 14f
-            gravity = Gravity.CENTER
-            setTextColor(COLOR_MUTED)
-            setPadding(0, dp(24), 0, dp(24))
-        }
-        commentContent.addView(commentState, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-        commentMore = TextView(this).apply {
-            text = "加载更多评论"
-            textSize = 13f
-            gravity = Gravity.CENTER
-            setTextColor(COLOR_ROSE)
-            setPadding(0, dp(14), 0, dp(6))
-            visibility = View.GONE
-            isClickable = true
-            setOnClickListener { loadComments(reset = false) }
-        }
-        commentContent.addView(commentMore, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-        wrap.addView(commentContent, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-        return wrap
-    }
-
-    private fun toggleCommentSort() {
-        if (commentsLoading) return
-        commentSort = if (commentSort == 0) 1 else 0
-        commentHeaderBar?.applySort(commentSort)
-        loadComments(reset = true)
-    }
-
-    private fun loadComments(reset: Boolean) {
-        val oid = currentCommentOid
-        val type = currentCommentType
-        if (oid.isBlank() || type <= 0) {
-            commentState.text = "暂无评论"
-            commentState.visibility = View.VISIBLE
-            commentMore.visibility = View.GONE
-            return
-        }
-        if (commentsLoading) return
-        commentsLoading = true
-        if (reset) {
-            commentCursor = 1
-            commentsLoaded = false
-            commentHasMore = false
-            commentLoginHintShown = false
-            seenCommentRpids.clear()
-            commentContent.removeAllViews()
-            commentContent.addView(commentState, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-            commentState.text = "正在加载评论…"
-            commentState.visibility = View.VISIBLE
-            commentState.setOnClickListener(null)
-            commentMore.visibility = View.GONE
-        } else {
-            commentMore.text = "正在加载更多…"
-        }
-        val generation = commentGeneration
-        BiliApi.fetchCommentsForTarget(oid, type, commentCursor, commentSort) { list, next, error ->
-            if (isFinishing || isDestroyed || generation != commentGeneration) return@fetchCommentsForTarget
-            commentsLoading = false
-            commentState.visibility = View.GONE
-            if (error != null) {
-                if (!commentsLoaded) {
-                    if (commentState.parent == null) commentContent.addView(commentState, 0)
-                    commentState.text = "评论加载失败：$error\n\n点这里重试"
-                    commentState.visibility = View.VISIBLE
-                    commentState.isClickable = true
-                    commentState.setOnClickListener { loadComments(reset = true) }
-                } else {
-                    commentMore.text = "加载失败，点这里重试"
-                    commentMore.isClickable = true
-                }
-                return@fetchCommentsForTarget
-            }
-            commentsLoaded = true
-            commentHasMore = next >= 0
-            if (reset) commentContent.removeAllViews()
-            val ownerMid = dynamicItem.authorMid ?: 0L
-            val fresh = list.filter { seenCommentRpids.add(it.id) }
-            if (reset && fresh.isNotEmpty()) {
-                commentPrefetchHandle?.cancel()
-                commentPrefetchHandle = CommentSectionUi.prefetchCommentTopMedia(this, fresh)
-            }
-            fresh.forEachIndexed { index, comment ->
-                if (index > 0 || !reset) {
-                    commentContent.addView(CommentSectionUi.buildCommentDivider(this))
-                }
-                commentContent.addView(
-                    CommentSectionUi.buildUnifiedCommentItem(
-                        activity = this,
-                        comment = comment,
-                        ownerMid = ownerMid,
-                        targetOid = oid,
-                        commentType = type,
-                        isSheet = false,
-                        showRootTag = false,
-                        onOpenReplySheet = { root -> showReplySheet(root) },
-                        onFeedback = { msg -> showFeedback(msg) }
-                    )
-                )
-            }
-            commentCursor = next
-            if (commentHasMore) {
-                if (commentMore.parent == null) commentContent.addView(commentMore)
-                if (reset) {
-                    commentMore.text = "上滑加载更多"
-                    commentMore.visibility = View.VISIBLE
-                } else {
-                    commentMore.visibility = View.GONE
-                }
-            } else {
-                commentMore.visibility = View.GONE
-                if (list.isEmpty() && commentContent.childCount == 0) {
-                    if (commentState.parent == null) commentContent.addView(commentState)
-                    commentState.text = "暂无评论"
-                    commentState.visibility = View.VISIBLE
-                } else if (!BiliSessionStore.isLoggedIn() && !commentLoginHintShown) {
-                    commentLoginHintShown = true
-                    val hint = TextView(this).apply {
-                        text = "仅展示热门评论，登录后可查看全部回复 →"
-                        textSize = 12f
-                        setTextColor(COLOR_ROSE)
-                        gravity = Gravity.CENTER
-                        setPadding(0, dp(14), 0, dp(14))
-                        isClickable = true
-                        setOnClickListener {
-                            startActivity(Intent(this@SpaceDynamicDetailActivity, MainActivity::class.java).apply {
-                                flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                                putExtra(EXTRA_SWITCH_TO_ACCOUNT, true)
-                            })
-                        }
-                    }
-                    commentContent.addView(hint, LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT
-                    ))
-                }
-            }
-        }
-    }
-
-    private fun maybeLoadMoreComments() {
-        if (!commentsLoaded || commentsLoading || !commentHasMore) return
-        loadComments(reset = false)
-    }
-
-    private fun showReplySheet(root: VideoComment) {
-        if (root.id <= 0L || currentCommentOid.isBlank() || currentCommentType <= 0) return
-        CommentSectionUi.ReplySheetDialog(
-            activity = this,
-            root = root,
-            targetOid = currentCommentOid,
-            commentType = currentCommentType,
-            ownerMid = dynamicItem.authorMid ?: 0L,
-            anchorTopProvider = {
-                val loc = IntArray(2)
-                topBar.getLocationOnScreen(loc)
-                (loc[1] + topBar.height).coerceAtLeast(dp(56))
-            },
-            onFeedback = { msg -> showFeedback(msg) }
-        ).show()
-    }
+    private fun buildCommentSection(leadingHeader: View? = null): CommentListView =
+        CommentListView(this, { showFeedback(it) }, {
+            val location = IntArray(2)
+            topBar.getLocationOnScreen(location)
+            location[1] + topBar.height
+        }, leadingHeader)
 
     private fun showFeedback(message: String) {
         if (isFinishing || isDestroyed || message.isBlank()) return
@@ -893,11 +644,27 @@ class SpaceDynamicDetailActivity : Activity() {
         finishWithAnim()
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (::comments.isInitialized) comments.setPageActive(true)
+    }
+
+    override fun onPause() {
+        if (::comments.isInitialized) comments.setPageActive(false)
+        super.onPause()
+    }
+
+    override fun onRetainNonConfigurationInstance(): Any? =
+        if (::comments.isInitialized) comments.retainState() else null
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        if (::comments.isInitialized) outState.putBundle("comments", comments.saveState())
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroy() {
-        commentPrefetchHandle?.cancel()
-        commentPrefetchHandle = null
+        if (::comments.isInitialized) comments.dispose()
         detailRequest?.cancel()
-        commentRequest?.cancel()
         mainHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }

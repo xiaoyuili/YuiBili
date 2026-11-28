@@ -43,7 +43,7 @@ class InAppWebActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Ds.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        LayoutMode.applyScreenOrientation(this)
         window.setBackgroundDrawable(ColorDrawable(Ds.colors.bg))
 
         val target = intent.getStringExtra(EXTRA_URL).orEmpty()

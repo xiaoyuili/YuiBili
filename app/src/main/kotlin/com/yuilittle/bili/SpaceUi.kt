@@ -1234,13 +1234,17 @@ internal fun showAnchoredMenu(
     anchor: View,
     items: List<String>,
     selectedIndex: Int = -1,
+    playerStyle: Boolean = false,
     onPick: (Int) -> Unit
-) {
-    if (items.isEmpty()) return
+): PopupWindow? {
+    if (items.isEmpty()) return null
     val context = anchor.context
+    val accent = if (playerStyle) 0xFFF27D9E.toInt() else COLOR_ROSE
+    val selectedFill = if (playerStyle) 0x29F27D9E else COLOR_ROSE_SOFT
     val column = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
-        background = Ds.card(context, COLOR_CARD, Ds.colors.line, Ds.Radius.card)
+        background = if (playerStyle) Ds.plate(0xC414161B.toInt(), 0x2EFFFFFF, Ds.hairline(context), context.dp(18).toFloat())
+            else Ds.card(context, COLOR_CARD, Ds.colors.line, Ds.Radius.card)
         setPadding(context.dp(6), context.dp(6), context.dp(6), context.dp(6))
     }
     var width = context.dp(140)
@@ -1253,8 +1257,10 @@ internal fun showAnchoredMenu(
             setPadding(context.dp(12), context.dp(10), context.dp(12), context.dp(10))
             isClickable = true
             isFocusable = true
+            isSelected = selected
+            if (playerStyle) minimumHeight = context.dp(48)
             background = Ds.plate(
-                if (selected) COLOR_ROSE_SOFT else Color.TRANSPARENT,
+                if (selected) selectedFill else Color.TRANSPARENT,
                 null,
                 0,
                 context.dp(Ds.Radius.chip).toFloat()
@@ -1265,11 +1271,11 @@ internal fun showAnchoredMenu(
             text = label
             textSize = 13f
             typeface = Ds.body(bold = selected)
-            setTextColor(if (selected) COLOR_ROSE else COLOR_INK)
+            setTextColor(if (selected) accent else if (playerStyle) 0xE6FFFFFF.toInt() else COLOR_INK)
             includeFontPadding = false
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         if (selected) {
-            row.addView(Ds.checkIcon(context, COLOR_ROSE, 1.9f), LinearLayout.LayoutParams(
+            row.addView(Ds.checkIcon(context, accent, 1.9f), LinearLayout.LayoutParams(
                 context.dp(14), context.dp(14)
             ).apply { leftMargin = context.dp(8) })
         }
@@ -1285,7 +1291,28 @@ internal fun showAnchoredMenu(
         rows += row
     }
 
-    val popup = PopupWindow(column, width, LinearLayout.LayoutParams.WRAP_CONTENT, true)
+    val content: View = if (playerStyle) android.widget.ScrollView(context).apply {
+        isVerticalScrollBarEnabled = false
+        background = column.background
+        column.background = null
+        Ds.clipRounded(this, 18)
+        addView(column)
+    } else column
+    val popup = PopupWindow(content, width, LinearLayout.LayoutParams.WRAP_CONTENT, true)
+    if (playerStyle) {
+        val visible = android.graphics.Rect()
+        anchor.getWindowVisibleDisplayFrame(visible)
+        if (visible.isEmpty) return null
+        width = minOf(width, (visible.width() - context.dp(16)).coerceAtLeast(1))
+        popup.width = width
+        column.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
+            MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED))
+        val location = IntArray(2)
+        anchor.getLocationOnScreen(location)
+        val space = maxOf(location[1] - visible.top, visible.bottom - location[1] - anchor.height) - context.dp(12)
+        popup.height = minOf(column.measuredHeight, space.coerceAtLeast(1))
+        popup.inputMethodMode = PopupWindow.INPUT_METHOD_NOT_NEEDED
+    }
     rows.forEachIndexed { index, row ->
         row.setOnClickListener {
             popup.dismiss()
@@ -1298,6 +1325,7 @@ internal fun showAnchoredMenu(
     popup.elevation = context.dp(8).toFloat()
     val xOff = (anchor.width - width).coerceAtMost(0)
     popup.showAsDropDown(anchor, xOff, context.dp(6))
+    return popup
 }
 
 /** 轻量垃圾桶/清空图标（空间搜索历史清空按钮）。 */

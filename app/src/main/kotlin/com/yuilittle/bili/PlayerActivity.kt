@@ -23,6 +23,7 @@ class PlayerActivity : Activity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        LayoutMode.applyScreenOrientation(this)
         configureBars()
         val customUrl = intent.getStringExtra(EXTRA_URL)
         val bvid = intent.getStringExtra(EXTRA_BVID).orEmpty()
