@@ -25,6 +25,7 @@ import android.widget.CheckBox
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import kotlin.math.hypot
 import kotlin.math.max
 
@@ -44,6 +45,8 @@ class MainActivity : Activity() {
     private var resumed = false
     private var reducedMotion = false
     private var builtAsTablet = false
+    /** 本次进程只做一次自动更新检查，避免 onResume 反复触发。 */
+    private var updateCheckStarted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -262,6 +265,104 @@ class MainActivity : Activity() {
         PlayerSettingsStore.applyHomeOrientation(this)
         resumed = true
         updateActivePage()
+        maybeAutoCheckUpdate()
+    }
+
+    /**
+     * 启动时的静默更新检查：受「自动检查更新」开关控制，每天最多一次，
+     * 同一版本被忽略后不再弹窗。
+     */
+    private fun maybeAutoCheckUpdate() {
+        if (updateCheckStarted) return
+        if (!UpdateChecker.shouldAutoCheck(this)) return
+        updateCheckStarted = true
+        UpdateChecker.check(this) { release, error ->
+            if (isFinishing || isDestroyed) return@check
+            if (error != null || release == null) return@check
+            val current = UpdateChecker.currentVersionName(this)
+            if (!UpdateChecker.isNewer(release, current)) return@check
+            if (UpdateChecker.dismissedTag(this) == release.tag) return@check
+            showUpdatePrompt(release, current)
+        }
+    }
+
+    /** 自动检查发现新版本时的弹窗（可忽略该版本）。 */
+    private fun showUpdatePrompt(release: UpdateChecker.Release, currentVersion: String) {
+        val dialog = android.app.Dialog(this)
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        dialog.setCancelable(true)
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Ds.card(this@MainActivity, COLOR_SURFACE, Ds.colors.lineSoft, Ds.Radius.dialog)
+            setPadding(dp(22), dp(22), dp(22), dp(18))
+        }
+        panel.addView(TextView(this).apply {
+            text = "发现新版本 ${release.tag}"
+            textSize = 17f
+            typeface = Ds.display(bold = true)
+            setTextColor(COLOR_INK)
+        })
+        panel.addView(TextView(this).apply {
+            text = "当前版本 v$currentVersion，可前往网盘下载更新。"
+            textSize = 13f
+            typeface = Ds.body()
+            setTextColor(COLOR_MUTED)
+            setPadding(0, dp(6), 0, 0)
+        })
+        panel.addView(TextView(this).apply {
+            text = "前往网盘下载"
+            textSize = 14f
+            typeface = Ds.body(true)
+            gravity = Gravity.CENTER
+            setTextColor(COLOR_ON_ROSE)
+            background = Ds.pill(this@MainActivity, COLOR_ROSE)
+            setPadding(dp(20), dp(10), dp(20), dp(10))
+            Ds.bindPressFeedback(this, 0.96f)
+            setOnClickListener {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(UpdateChecker.PAN_URL)))
+                } catch (_: Exception) {
+                    Toast.makeText(this@MainActivity, "没有可用的浏览器", Toast.LENGTH_SHORT).show()
+                }
+                dialog.dismiss()
+            }
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(18) })
+        panel.addView(TextView(this).apply {
+            text = "网盘密码：${UpdateChecker.PAN_PASSWORD}（点击复制）"
+            textSize = 13f
+            typeface = Ds.body()
+            gravity = Gravity.CENTER
+            setTextColor(COLOR_ROSE)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setOnClickListener {
+                val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("YuiBili 网盘密码", UpdateChecker.PAN_PASSWORD))
+                Toast.makeText(this@MainActivity, "网盘密码已复制", Toast.LENGTH_SHORT).show()
+            }
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        panel.addView(TextView(this).apply {
+            text = "忽略此版本"
+            textSize = 13f
+            typeface = Ds.body()
+            gravity = Gravity.CENTER
+            setTextColor(COLOR_MUTED)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            setOnClickListener {
+                UpdateChecker.dismiss(this@MainActivity, release.tag)
+                dialog.dismiss()
+            }
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        dialog.setContentView(panel)
+        dialog.show()
+        LayoutMode.applyDialogWidth(dialog, this, maxTabletDp = 440)
     }
 
     override fun onPause() {

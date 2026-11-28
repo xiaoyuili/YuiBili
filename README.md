@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img alt="版本" src="https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v1.0.1beta5-ff8fb1?style=flat-square"/>
+  <img alt="版本" src="https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v1.0.1beta6-ff8fb1?style=flat-square"/>
   <img alt="架构" src="https://img.shields.io/badge/ABI-arm64--v8a-4c9aff?style=flat-square"/>
   <img alt="系统" src="https://img.shields.io/badge/Android-6.0%2B-6cc24a?style=flat-square"/>
 </p>
@@ -22,7 +22,7 @@
 
 ## 作者与项目来源
 
-- **改版作者**：[suqingan](https://github.com/suqingan)（本仓库维护者，beta1–beta5 的改版开发者）
+- **改版作者**：[suqingan](https://github.com/suqingan)（本仓库维护者，beta1–beta6 的改版开发者）
 - **原作者**：[xiaoyuili](https://github.com/xiaoyuili)
 - **上游项目**：[Yui-Little/YuiBili](https://github.com/Yui-Little/YuiBili) → [xiaoyuili/YuiBili](https://github.com/xiaoyuili/YuiBili)
 
@@ -60,6 +60,12 @@
 - 弹幕列表可正常关闭
 - 同步一批细节优化：平板消息页一级化、动态缩略图布局、设置开关样式、回复@精准定位等
 - 安装包开启 R8 压缩，体积约 3.4 MB
+
+### v1.0.1beta6
+- 关于页新增「检查更新」：可手动检查，也可在「自动检查更新」开关控制下每天检查一次
+- 发现新版本时默认引导到蓝奏云网盘下载（密码 4zzg，弹窗内可一键复制），同时保留 GitHub Releases 入口
+- 修复版本号解析在部分机型上无法匹配、导致一直提示「暂未获取到版本信息」的问题
+- 赞助页调整为左侧说明、右侧赞赏码，并标注原作者 xiaoyuili 与二改作者 suqingan
 
 ---
 

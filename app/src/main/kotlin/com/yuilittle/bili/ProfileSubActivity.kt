@@ -1806,7 +1806,7 @@ class ProfileSubActivity : Activity() {
                 true
             }
         }
-        qrFrame.addView(qrImage, FrameLayout.LayoutParams(dp(216), dp(216), Gravity.CENTER))
+        qrFrame.addView(qrImage, FrameLayout.LayoutParams(dp(160), dp(160), Gravity.CENTER))
 
         val saveBtn = TextView(this).apply {
             text = "保存收款码"
@@ -1842,13 +1842,21 @@ class ProfileSubActivity : Activity() {
                 setLineSpacing(dp(5).toFloat(), 1f)
                 setPadding(0, dp(10), 0, dp(22))
             })
+            leftCol.addView(TextView(this).apply {
+                text = "原作者 xiaoyuili · 二改作者 苏青安（suqingan）"
+                textSize = 12f
+                typeface = Ds.body()
+                setTextColor(Ds.colors.subtle)
+                setPadding(0, 0, 0, dp(16))
+            })
             leftCol.addView(saveBtn, LinearLayout.LayoutParams(dp(180), LinearLayout.LayoutParams.WRAP_CONTENT))
             leftCol.addView(TextView(this).apply {
-                text = "长按右侧微信赞赏码或点击按钮即可保存"
+                text = "长按右侧赞赏码或点击按钮即可保存"
                 textSize = 12f
                 setTextColor(Ds.colors.subtle)
                 setPadding(0, dp(12), 0, 0)
             })
+            qrImage.layoutParams = FrameLayout.LayoutParams(dp(216), dp(216), Gravity.CENTER)
             card.addView(leftCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 rightMargin = dp(32)
             })
@@ -1862,47 +1870,64 @@ class ProfileSubActivity : Activity() {
             return
         }
 
+        // 手机端：左侧说明与署名，右侧赞赏码
+        qrImage.layoutParams = FrameLayout.LayoutParams(dp(132), dp(132), Gravity.CENTER)
         val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             background = Ds.card(this@ProfileSubActivity, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card)
-            setPadding(dp(24), dp(28), dp(24), dp(24))
+            setPadding(dp(18), dp(20), dp(18), dp(20))
         }
-        card.addView(TextView(this).apply {
+        val leftCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        leftCol.addView(TextView(this).apply {
             text = "请开发者喝杯咖啡"
-            textSize = 18f
+            textSize = 16f
             typeface = Ds.display(bold = true)
             setTextColor(COLOR_INK)
-            gravity = Gravity.CENTER
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-        card.addView(TextView(this).apply {
-            text = "微信赞赏码"
-            textSize = 12.5f
+        })
+        leftCol.addView(TextView(this).apply {
+            text = "YuiBili 由个人独立维护，无广告、无商业化。\n您的支持将用于持续优化体验与功能迭代。"
+            textSize = 12f
             typeface = Ds.body()
             setTextColor(COLOR_MUTED)
-            gravity = Gravity.CENTER
-            setPadding(0, dp(6), 0, dp(20))
-        }, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-        card.addView(qrFrame, LinearLayout.LayoutParams(
+            setLineSpacing(dp(3).toFloat(), 1f)
+            setPadding(0, dp(8), 0, dp(10))
+        })
+        leftCol.addView(TextView(this).apply {
+            text = "原作者 xiaoyuili\n二改作者 苏青安（suqingan）"
+            textSize = 11.5f
+            typeface = Ds.body()
+            setTextColor(Ds.colors.subtle)
+            setLineSpacing(dp(2).toFloat(), 1f)
+            setPadding(0, 0, 0, dp(12))
+        })
+        leftCol.addView(saveBtn, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { gravity = Gravity.CENTER_HORIZONTAL })
-        card.addView(TextView(this).apply {
-            text = "长按图片或点击下方按钮保存到相册"
-            textSize = 12f
+        ))
+        card.addView(leftCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+            rightMargin = dp(10)
+        })
+
+        val qrCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        qrCol.addView(qrFrame, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        qrCol.addView(TextView(this).apply {
+            text = "苏青安的微信赞赏码"
+            textSize = 10.5f
             typeface = Ds.body()
             setTextColor(Ds.colors.subtle)
             gravity = Gravity.CENTER
-            setPadding(0, dp(16), 0, 0)
+            setPadding(0, dp(4), 0, 0)
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ))
-        card.addView(saveBtn, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(18) })
+        card.addView(qrCol, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
 
         listBox.addView(card, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
@@ -2096,11 +2121,61 @@ class ProfileSubActivity : Activity() {
             Toast.makeText(this, "已复制版本信息", Toast.LENGTH_SHORT).show()
         }
         infoDivider()
+        infoRow("检查更新", "点击检查", clickable = true) { checkUpdateManually() }
+        infoDivider()
         infoRow("作者", "xiaoyuili（二改作者 suqingan）")
         infoDivider()
         infoRow("隐私与存储", "凭证仅存本机")
         infoDivider()
         infoRow("免责声明", "查看", clickable = true) { showDisclaimerDialog() }
+
+        // 更新检查开关：独立卡片，默认开启；关闭后启动时不再自动请求
+        val updateCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Ds.card(this@ProfileSubActivity, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card)
+            setPadding(0, dp(4), 0, dp(4))
+        }
+        run {
+            val autoEnabled = UpdateChecker.isAutoCheckEnabled(this)
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), 0, dp(16), 0)
+                isClickable = true
+                isFocusable = true
+                Ds.bindPressFeedback(this, 0.985f)
+                addView(LinearLayout(this@ProfileSubActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(TextView(this@ProfileSubActivity).apply {
+                        text = "自动检查更新"
+                        textSize = 14.5f
+                        typeface = Ds.body(true)
+                        setTextColor(COLOR_INK)
+                    })
+                    addView(TextView(this@ProfileSubActivity).apply {
+                        text = "启动时每天最多检查一次新版本"
+                        textSize = 11.5f
+                        typeface = Ds.body()
+                        setTextColor(COLOR_MUTED)
+                        setPadding(0, dp(2), 0, 0)
+                    })
+                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            }
+            val toggle = PillSwitch(this, autoEnabled)
+            row.addView(toggle, LinearLayout.LayoutParams(dp(48), dp(28)))
+            row.setOnClickListener {
+                toggle.toggle()
+                UpdateChecker.setAutoCheckEnabled(this, toggle.isOn)
+                Toast.makeText(
+                    this,
+                    if (toggle.isOn) "已开启自动检查更新" else "已关闭自动检查更新",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            updateCard.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(64)
+            ))
+        }
 
         if (LayoutMode.isWideScreen(this)) {
             listBox.removeView(hero)
@@ -2115,9 +2190,15 @@ class ProfileSubActivity : Activity() {
             listBox.addView(LayoutMode.wrapCenteredForTablet(this, split, maxDp = 820), LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(20) })
+            listBox.addView(LayoutMode.wrapCenteredForTablet(this, updateCard, maxDp = 820), LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(14) })
             animateRowIn(split, 0)
         } else {
             listBox.addView(infoCard, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(12) })
+            listBox.addView(updateCard, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(12) })
             animateRowIn(infoCard, 1)
@@ -2420,6 +2501,164 @@ class ProfileSubActivity : Activity() {
 
         animateRowIn(orientationCard, 0)
         animateRowIn(globalCard, 1)
+    }
+
+    /** 用系统浏览器打开外部链接。 */
+    private fun openExternalUrl(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+        } catch (_: Exception) {
+            Toast.makeText(this, "没有可用的浏览器", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** 手动检查更新：成功且有新版就弹窗，否则提示已是最新。 */
+    private fun checkUpdateManually() {
+        Toast.makeText(this, "正在检查更新…", Toast.LENGTH_SHORT).show()
+        UpdateChecker.check(this) { release, error ->
+            if (isFinishing || isDestroyed) return@check
+            val current = UpdateChecker.currentVersionName(this)
+            if (error != null || release == null) {
+                Toast.makeText(this, "检查失败：${error ?: "未知错误"}", Toast.LENGTH_SHORT).show()
+                return@check
+            }
+            if (UpdateChecker.isNewer(release, current)) {
+                showUpdateDialog(release, current, allowDismiss = false)
+            } else {
+                Toast.makeText(this, "已是最新版本 v$current", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    /**
+     * 新版本弹窗：展示版本号与更新说明，可直接跳转下载页。
+     * allowDismiss 为 true 时（启动自动检查）提供「忽略此版本」，避免反复打扰。
+     */
+    private fun showUpdateDialog(
+        release: UpdateChecker.Release,
+        currentVersion: String,
+        allowDismiss: Boolean
+    ) {
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        dialog.setCancelable(true)
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(0x00000000))
+
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Ds.card(this@ProfileSubActivity, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.dialog)
+            setPadding(dp(22), dp(22), dp(22), dp(18))
+        }
+        panel.addView(TextView(this).apply {
+            text = "发现新版本 ${release.tag}"
+            textSize = 17f
+            typeface = Ds.display(bold = true)
+            setTextColor(COLOR_INK)
+        })
+        panel.addView(TextView(this).apply {
+            text = "当前版本 v$currentVersion"
+            textSize = 12.5f
+            typeface = Ds.body()
+            setTextColor(COLOR_MUTED)
+            setPadding(0, dp(4), 0, 0)
+        })
+
+        val notes = release.body
+            .replace(Regex("""^#{1,6}\s*""", RegexOption.MULTILINE), "")
+            .replace(Regex("""```[^`]*```"""), "")
+            .replace(Regex("""\n{3,}"""), "\n\n")
+            .trim()
+        if (notes.isNotBlank()) {
+            panel.addView(ScrollView(this).apply {
+                isVerticalScrollBarEnabled = false
+                isVerticalFadingEdgeEnabled = true
+                setFadingEdgeLength(dp(24))
+                addView(TextView(this@ProfileSubActivity).apply {
+                    text = notes.take(1600)
+                    textSize = 13f
+                    typeface = Ds.body()
+                    setTextColor(COLOR_MUTED)
+                    setLineSpacing(dp(4).toFloat(), 1f)
+                    setPadding(0, 0, 0, dp(10))
+                })
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(180)
+            ).apply { topMargin = dp(14) })
+        }
+
+        val primary = TextView(this).apply {
+            text = "前往网盘下载"
+            textSize = 14f
+            typeface = Ds.body(true)
+            gravity = Gravity.CENTER
+            setTextColor(COLOR_ON_ROSE)
+            background = Ds.pill(this@ProfileSubActivity, COLOR_ROSE)
+            setPadding(dp(20), dp(10), dp(20), dp(10))
+            Ds.bindPressFeedback(this, 0.96f)
+            setOnClickListener {
+                openExternalUrl(UpdateChecker.PAN_URL)
+                dialog.dismiss()
+            }
+        }
+        panel.addView(primary, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(18) })
+
+        // 网盘密码：点击复制，避免用户还要去记
+        panel.addView(TextView(this).apply {
+            text = "网盘密码：${UpdateChecker.PAN_PASSWORD}（点击复制）"
+            textSize = 13f
+            typeface = Ds.body()
+            gravity = Gravity.CENTER
+            setTextColor(COLOR_ROSE)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            Ds.bindPressFeedback(this, 0.96f)
+            setOnClickListener {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("YuiBili 网盘密码", UpdateChecker.PAN_PASSWORD))
+                Toast.makeText(this@ProfileSubActivity, "网盘密码已复制", Toast.LENGTH_SHORT).show()
+            }
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(4) })
+
+        panel.addView(TextView(this).apply {
+            text = "GitHub Releases"
+            textSize = 13f
+            typeface = Ds.body()
+            gravity = Gravity.CENTER
+            setTextColor(COLOR_MUTED)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            Ds.bindPressFeedback(this, 0.96f)
+            setOnClickListener {
+                openExternalUrl(release.pageUrl)
+                dialog.dismiss()
+            }
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+
+        val secondary = TextView(this).apply {
+            text = if (allowDismiss) "忽略此版本" else "稍后再说"
+            textSize = 13.5f
+            typeface = Ds.body()
+            gravity = Gravity.CENTER
+            setTextColor(COLOR_MUTED)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            Ds.bindPressFeedback(this, 0.96f)
+            setOnClickListener {
+                if (allowDismiss) UpdateChecker.dismiss(this@ProfileSubActivity, release.tag)
+                dialog.dismiss()
+            }
+        }
+        panel.addView(secondary, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(6) })
+
+        dialog.setContentView(panel)
+        dialog.show()
+        LayoutMode.applyDialogWidth(dialog, this, maxTabletDp = 460)
     }
 
     private fun showDisclaimerDialog() {

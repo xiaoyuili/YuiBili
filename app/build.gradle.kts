@@ -11,8 +11,8 @@ android {
         applicationId = "com.yuilittle.bili"
         minSdk = 23
         targetSdk = 34
-        versionCode = 10105
-        versionName = "1.0.1beta5"
+        versionCode = 10106
+        versionName = "1.0.1beta6"
         manifestPlaceholders["appLabel"] = "YuiBili"
         ndk {
             abiFilters += listOf("arm64-v8a")
