@@ -2,7 +2,6 @@ package com.yuilittle.bili
 
 import android.app.Activity
 import android.content.Context
-import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -52,7 +51,7 @@ class HistorySearchActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -311,9 +310,12 @@ class HistorySearchActivity : Activity() {
             isClickable = true
             isFocusable = true
             setOnClickListener {
-                startActivity(
-                    Intent(this@HistorySearchActivity, VideoDetailActivity::class.java)
-                        .putExtra(VideoDetailActivity.EXTRA_BVID, item.bvid)
+                VideoDetailActivity.open(
+                    this@HistorySearchActivity,
+                    item.bvid,
+                    item.aid,
+                    item.cid,
+                    historyResumeMs(item.watchProgressSec, item.duration)
                 )
             }
         }

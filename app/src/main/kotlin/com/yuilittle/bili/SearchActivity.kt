@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.Editable
+import android.text.TextUtils
 import android.text.TextWatcher
 import android.transition.ChangeBounds
 import android.transition.Fade
@@ -106,6 +107,24 @@ class SearchActivity : Activity() {
         LATEST("最新发布", "pubdate"),
     }
 
+    /** 搜索对象分类：视频沿用原有排序/时长筛选，直播与用户各有独立列表与分页。 */
+    private enum class SearchScope(val label: String) {
+        VIDEO("视频"),
+        LIVE("直播"),
+        USER("用户"),
+    }
+
+    private var searchScope = SearchScope.VIDEO
+    private lateinit var scopeBar: LinearLayout
+    private lateinit var scopeIndicator: View
+    private val scopeTabViews = ArrayList<TextView>()
+    private lateinit var altResults: ListView
+    private lateinit var altAdapter: ScopeSearchAdapter
+    private var altPage = 0
+    private var altLoadingNext = false
+    private var altEndReached = false
+    private var altGeneration = 0
+
     private val filterDurationOptions = listOf("全部时长", "5 分钟+", "10 分钟+", "30 分钟+", "1 小时+")
     private var lastSuggestionKeyword = ""
     private var cachedSuggestions: List<String> = emptyList()
@@ -122,7 +141,7 @@ class SearchActivity : Activity() {
         super.onCreate(savedInstanceState)
         configureTransitions()
         configureBars()
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(COLOR_BACKGROUND)
@@ -138,6 +157,13 @@ class SearchActivity : Activity() {
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(SEARCH_BOX_HEIGHT_DP)).apply {
                 leftMargin = dp(Ds.Space.xs)
                 rightMargin = dp(Ds.Space.xs)
+            }
+        )
+        scopeBar = createScopeStrip().apply { visibility = View.GONE }
+        root.addView(
+            scopeBar,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(38)).apply {
+                topMargin = dp(2)
             }
         )
         filterBar = createFilterStrip().apply { visibility = View.GONE }
@@ -208,6 +234,34 @@ class SearchActivity : Activity() {
             results,
             FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
         )
+
+        // 直播 / 用户结果列表：与视频网格互斥显示，共用 resultsHost 的定位与回顶按钮。
+        altAdapter = ScopeSearchAdapter()
+        altResults = ListView(this).apply {
+            divider = null
+            dividerHeight = 0
+            visibility = View.GONE
+            setPadding(dp(4), 0, dp(4), dp(32))
+            overScrollMode = View.OVER_SCROLL_NEVER
+            setVerticalScrollBarEnabled(false)
+            setSelector(android.R.color.transparent)
+            clipToPadding = false
+            adapter = altAdapter
+            setOnScrollListener(object : AbsListView.OnScrollListener {
+                override fun onScrollStateChanged(view: AbsListView?, scrollState: Int) = Unit
+                override fun onScroll(view: AbsListView?, firstVisible: Int, visibleCount: Int, totalCount: Int) {
+                    if (searchScope == SearchScope.VIDEO) return
+                    updateTopButton(firstVisible)
+                    if (totalCount > 0 && firstVisible + visibleCount >= totalCount - 2) {
+                        loadNextScopePage()
+                    }
+                }
+            })
+        }
+        resultsHost.addView(
+            altResults,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        )
         topScroller = AbsListSmoothTopScroller(results, nearPosition = 8)
 
         skeletonGrid = FrameLayout(this).apply {
@@ -244,7 +298,10 @@ class SearchActivity : Activity() {
                 bottomMargin = dp(18)
             }
         )
-        topButton = ScrollToTopButton(this) { topScroller?.scrollToTop() }
+        topButton = ScrollToTopButton(this) {
+            if (searchScope == SearchScope.VIDEO) topScroller?.scrollToTop()
+            else altResults.smoothScrollToPosition(0)
+        }
         resultsHost.addView(
             topButton,
             FrameLayout.LayoutParams(dp(44), dp(44), Gravity.BOTTOM or Gravity.END).apply {
@@ -581,6 +638,113 @@ class SearchActivity : Activity() {
     private fun hideState() {
         stateCard.visibility = View.GONE
         stateAction.setOnClickListener(null)
+    }
+
+    // ── 搜索类型栏（视频 / 直播 / 用户）：位于排序栏之上 ──
+
+    private fun createScopeStrip(): LinearLayout {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(Ds.Space.xs), 0, dp(Ds.Space.xs), 0)
+        }
+        val host = FrameLayout(this)
+        scopeIndicator = PillIndicatorView(this).apply { fillColor = Ds.colors.accentSoft }
+        host.addView(
+            scopeIndicator,
+            FrameLayout.LayoutParams(dp(SCOPE_TAB_WIDTH_DP), dp(28), Gravity.START or Gravity.CENTER_VERTICAL)
+        )
+        val strip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        scopeTabViews.clear()
+        SearchScope.values().forEach { scope ->
+            val tab = TextView(this).apply {
+                text = scope.label
+                textSize = 13.5f
+                typeface = Ds.body(scope == searchScope)
+                gravity = Gravity.CENTER
+                maxLines = 1
+                includeFontPadding = false
+                setTextColor(if (scope == searchScope) COLOR_ROSE else COLOR_MUTED)
+                isClickable = true
+                isFocusable = true
+                contentDescription = "搜索类型：${scope.label}"
+                setOnClickListener { selectSearchScope(scope) }
+            }
+            scopeTabViews += tab
+            strip.addView(tab, LinearLayout.LayoutParams(dp(SCOPE_TAB_WIDTH_DP), dp(30)))
+        }
+        host.addView(
+            strip,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        )
+        bar.addView(host, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT))
+        bar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        refreshScopeStripUi(animate = false)
+        return bar
+    }
+
+    private fun refreshScopeStripUi(animate: Boolean) {
+        if (!::scopeIndicator.isInitialized) return
+        SearchScope.values().forEachIndexed { index, scope ->
+            val tab = scopeTabViews.getOrNull(index) ?: return@forEachIndexed
+            val selected = scope == searchScope
+            tab.setTextColor(if (selected) COLOR_ROSE else COLOR_MUTED)
+            tab.typeface = Ds.body(selected)
+        }
+        val targetX = searchScope.ordinal * dp(SCOPE_TAB_WIDTH_DP).toFloat()
+        if (animate && !MotionTokens.isReduced(this)) {
+            DsSpring.animate(
+                scopeIndicator,
+                androidx.dynamicanimation.animation.DynamicAnimation.TRANSLATION_X,
+                targetX,
+                DsSpring.SETTLE_STIFFNESS,
+                DsSpring.SETTLE_DAMPING
+            )
+        } else {
+            (scopeIndicator.getTag(R.id.ds_spring_tx) as? androidx.dynamicanimation.animation.SpringAnimation)?.cancel()
+            scopeIndicator.translationX = targetX
+        }
+    }
+
+    private fun selectSearchScope(next: SearchScope) {
+        if (searchScope == next) return
+        searchScope = next
+        refreshScopeStripUi(animate = true)
+        applyScopeChrome()
+        if (showingResultPage && currentSearchKeyword.isNotBlank()) {
+            performSearch()
+        }
+    }
+
+    /** 按当前分类切换结果区：视频网格与直播/用户列表互斥，排序筛选只属于视频。 */
+    private fun applyScopeChrome() {
+        if (!::altResults.isInitialized) return
+        val video = searchScope == SearchScope.VIDEO
+        results.visibility = if (video) View.VISIBLE else View.GONE
+        altResults.visibility = if (!video && showingResultPage) View.VISIBLE else View.GONE
+        if (!video) {
+            filterBar.animate().cancel()
+            filterBar.visibility = View.GONE
+            hideFilterSheet()
+        }
+        // 视频模式的排序栏显隐交给 performSearch 的淡入动画，这里不强行改可见性。
+    }
+
+    private fun showScopeBar() {
+        if (scopeBar.visibility == View.VISIBLE) return
+        scopeBar.visibility = View.VISIBLE
+        scopeBar.alpha = 0f
+        scopeBar.animate().alpha(1f).setDuration(160L).start()
+    }
+
+    private fun hideScopeBar() {
+        if (!::scopeBar.isInitialized) return
+        scopeBar.animate().cancel()
+        scopeBar.visibility = View.GONE
+        scopeBar.alpha = 1f
     }
 
     // ── 重写后的筛选条（与首页推荐/热门同款胶囊指示器 + 右侧紧凑时长筛选胶囊） ──
@@ -1074,12 +1238,19 @@ class SearchActivity : Activity() {
         }
         if (showingResultPage) {
             showingResultPage = false
+            ++altGeneration
             hideFilterSheet()
             filterBar.animate().cancel()
             filterBar.visibility = View.GONE
+            hideScopeBar()
             resultAdapter.replace(emptyList(), animateNew = false)
+            altAdapter.submit(emptyList())
+            altResults.visibility = View.GONE
+            results.visibility = View.VISIBLE
+            VideoCardUi.toggleSkeleton(skeletonGrid, false)
+            pagingSpinner.visibility = View.GONE
             if (::pgcRow.isInitialized) clearPgcHeader()
-            showState("输入关键词，搜索公开视频")
+            showState(if (searchScope == SearchScope.VIDEO) "输入关键词，搜索公开视频" else "输入关键词开始搜索")
         }
         val keyword = raw.trim()
         if (keyword.isBlank()) {
@@ -1220,15 +1391,21 @@ class SearchActivity : Activity() {
         pulseSearchAction()
         val keyword = input.text.toString().trim()
         if (keyword.isBlank()) {
-            showState("先输入想找的视频关键词")
+            showState(
+                if (searchScope == SearchScope.VIDEO) "先输入想找的视频关键词" else "先输入关键词"
+            )
             hideSuggestions()
             return
         }
         SearchHistoryStore.record(this, keyword)
         ++searchGeneration
+        ++altGeneration
         currentSearchKeyword = keyword
         searchPage = 0
+        altPage = 0
         searchEndReached = false
+        altEndReached = false
+        altLoadingNext = false
         showingResultPage = true
         topScroller?.cancel()
         topButton.setShown(false, animate = false)
@@ -1240,9 +1417,20 @@ class SearchActivity : Activity() {
         hideFilterSheet()
         hideKeyboard()
         resultAdapter.replace(emptyList(), animateNew = false)
+        altAdapter.submit(emptyList())
         hideState()
         if (::pgcRow.isInitialized) clearPgcHeader()
         cancelFirstScreenGate()
+        VideoCardUi.toggleSkeleton(skeletonGrid, false)
+        showScopeBar()
+        applyScopeChrome()
+
+        if (searchScope != SearchScope.VIDEO) {
+            pagingSpinner.visibility = View.GONE
+            performScopeSearch(initial = true)
+            return
+        }
+
         VideoCardUi.toggleSkeleton(skeletonGrid, true)
         if (filterBar.visibility != View.VISIBLE) {
             filterBar.visibility = View.VISIBLE
@@ -1548,6 +1736,326 @@ class SearchActivity : Activity() {
 
     private class PgcCardHolder(val cover: android.widget.ImageView)
 
+    // ─────────────────────────────────────────────────
+    //  直播 / 用户搜索
+    // ─────────────────────────────────────────────────
+
+    private fun performScopeSearch(initial: Boolean) {
+        val keyword = currentSearchKeyword
+        if (keyword.isBlank() || searchScope == SearchScope.VIDEO) return
+        if (!initial && (altLoadingNext || altEndReached)) return
+        val generation = altGeneration
+        val page = if (initial) 1 else altPage + 1
+        val scope = searchScope
+
+        if (initial) {
+            showState(if (scope == SearchScope.LIVE) "正在搜索直播…" else "正在搜索用户…")
+        } else {
+            altLoadingNext = true
+            pagingSpinner.visibility = View.VISIBLE
+            pagingSpinner.startSpinning()
+        }
+
+        val deliver: (List<Any>?, String?) -> Unit = { items, error ->
+            handleScopeResult(scope, keyword, generation, page, initial, items, error)
+        }
+        when (scope) {
+            SearchScope.LIVE -> BiliApi.searchLive(keyword, page) { list, error ->
+                deliver(list?.map { it as Any }, error)
+            }
+            SearchScope.USER -> BiliApi.searchUsers(keyword, page) { list, error ->
+                deliver(list?.map { it as Any }, error)
+            }
+            SearchScope.VIDEO -> Unit
+        }
+    }
+
+    private fun handleScopeResult(
+        scope: SearchScope,
+        keyword: String,
+        generation: Int,
+        page: Int,
+        initial: Boolean,
+        items: List<Any>?,
+        error: String?
+    ) {
+        if (generation != altGeneration || !showingResultPage ||
+            currentSearchKeyword != keyword || searchScope != scope
+        ) return
+        if (!initial) {
+            altLoadingNext = false
+            pagingSpinner.visibility = View.GONE
+        } else {
+            searchInProgress = false
+            hideLoading()
+        }
+
+        if (items == null) {
+            if (initial) {
+                if (altAdapter.count == 0) {
+                    showState(
+                        message = "搜索暂不可用：${error ?: "网络异常"}",
+                        actionText = "在官方搜索页继续"
+                    ) { openOfficialSearch(keyword) }
+                }
+            }
+            return
+        }
+
+        if (initial) {
+            hideState()
+            altPage = page
+            altAdapter.submit(items)
+            altResults.setSelection(0)
+            topButton.setShown(false, animate = false)
+            if (items.isEmpty()) {
+                showState(
+                    if (scope == SearchScope.LIVE) "没有找到正在直播的房间" else "没有找到相关用户"
+                )
+            }
+            if (items.isEmpty()) altEndReached = true
+        } else {
+            if (items.isEmpty()) {
+                altEndReached = true
+                return
+            }
+            altPage = page
+            altAdapter.append(items)
+        }
+    }
+
+    private fun loadNextScopePage() {
+        if (searchScope == SearchScope.VIDEO) return
+        if (!showingResultPage || altLoadingNext || altEndReached || currentSearchKeyword.isBlank()) return
+        performScopeSearch(initial = false)
+    }
+
+    private fun openOfficialSearch(keyword: String) {
+        startActivity(
+            Intent(this@SearchActivity, PlayerActivity::class.java).putExtra(
+                PlayerActivity.EXTRA_URL,
+                "https://search.bilibili.com/all?keyword=${java.net.URLEncoder.encode(keyword, "UTF-8")}"
+            )
+        )
+    }
+
+    /** 直播 / 用户结果列表适配器：两种条目共用一个 ListView。 */
+    private inner class ScopeSearchAdapter : BaseAdapter() {
+        private val items = ArrayList<Any>()
+
+        fun submit(list: List<Any>) {
+            items.clear()
+            items.addAll(list)
+            notifyDataSetChanged()
+        }
+
+        fun append(list: List<Any>) {
+            items.addAll(list)
+            notifyDataSetChanged()
+        }
+
+        override fun getCount(): Int = items.size
+
+        override fun getItem(position: Int): Any = items[position]
+
+        override fun getItemId(position: Int): Long = position.toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+            return when (val item = items[position]) {
+                is LiveSearchItem -> liveSearchRow(item)
+                is UserSearchItem -> userSearchRow(item)
+                else -> View(this@SearchActivity)
+            }
+        }
+    }
+
+    private fun searchRowShell(content: View): View = FrameLayout(this).apply {
+        setPadding(dp(2), dp(3), dp(2), dp(3))
+        addView(content, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+    }
+
+    private fun liveSearchRow(item: LiveSearchItem): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = Ds.card(this@SearchActivity, COLOR_SURFACE, Ds.colors.lineSoft, Ds.Radius.card)
+            Ds.clipRounded(this, Ds.Radius.card)
+            setPadding(dp(8), dp(8), dp(10), dp(8))
+            isClickable = true
+            isFocusable = true
+            contentDescription = "直播：${item.title}，${item.owner}"
+            Ds.bindPressFeedback(this, 0.97f)
+            setOnClickListener {
+                if (!item.live) {
+                    android.widget.Toast.makeText(
+                        this@SearchActivity, "该直播间暂未开播", android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                    return@setOnClickListener
+                }
+                LiveRoomActivity.open(
+                    this@SearchActivity,
+                    LiveRoom(item.roomId, item.uid, item.title, item.owner, item.cover, item.face, item.area, item.online)
+                )
+            }
+        }
+
+        val coverFrame = FrameLayout(this).apply {
+            setBackgroundColor(Ds.colors.cover)
+            Ds.clipRounded(this, 8)
+        }
+        val cover = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+        coverFrame.addView(cover, FrameLayout.LayoutParams(dp(132), dp(74)))
+        if (item.live) {
+            coverFrame.addView(TextView(this).apply {
+                text = "直播中"
+                textSize = 9f
+                typeface = Ds.body(true)
+                setTextColor(Color.WHITE)
+                includeFontPadding = false
+                setPadding(dp(5), dp(2), dp(5), dp(2))
+                background = Ds.pill(this@SearchActivity, 0xE6F04A5E.toInt())
+            }, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.START
+            ).apply {
+                leftMargin = dp(5)
+                topMargin = dp(5)
+            })
+        }
+        card.addView(coverFrame, LinearLayout.LayoutParams(dp(132), dp(74)))
+        if (item.cover.isNotBlank()) CoverLoader.load(cover, item.cover, thumbEdge = 320)
+
+        val info = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), 0, 0, 0)
+        }
+        info.addView(TextView(this).apply {
+            text = item.title
+            textSize = 13.5f
+            typeface = Ds.body(true)
+            setTextColor(Ds.colors.text)
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            includeFontPadding = false
+            setLineSpacing(dp(2).toFloat(), 1f)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        val meta = buildString {
+            append(item.owner)
+            if (item.online > 0) append(" · ").append(formatScopeCount(item.online)).append("人气")
+            if (item.area.isNotBlank()) append(" · ").append(item.area)
+        }
+        info.addView(TextView(this).apply {
+            text = meta
+            textSize = 11f
+            typeface = Ds.body()
+            setTextColor(Ds.colors.muted)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            includeFontPadding = false
+            setPadding(0, dp(5), 0, 0)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        card.addView(info, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        return searchRowShell(card)
+    }
+
+    private fun userSearchRow(item: UserSearchItem): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = Ds.card(this@SearchActivity, COLOR_SURFACE, Ds.colors.lineSoft, Ds.Radius.card)
+            Ds.clipRounded(this, Ds.Radius.card)
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            isClickable = true
+            isFocusable = true
+            contentDescription = "用户：${item.name}"
+            Ds.bindPressFeedback(this, 0.97f)
+            setOnClickListener {
+                SpaceActivity.open(this@SearchActivity, item.mid, item.name, item.face)
+            }
+        }
+        val avatarFrame = FrameLayout(this).apply {
+            setBackgroundColor(Ds.colors.cover)
+            Ds.clipRounded(this, 24)
+        }
+        val avatar = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+        avatarFrame.addView(avatar, FrameLayout.LayoutParams(dp(48), dp(48)))
+        if (item.face.isNotBlank()) CoverLoader.load(avatar, item.face, thumbEdge = 160)
+        card.addView(avatarFrame, LinearLayout.LayoutParams(dp(48), dp(48)))
+
+        val info = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), 0, 0, 0)
+        }
+        val nameRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        nameRow.addView(TextView(this).apply {
+            text = item.name
+            textSize = 13.5f
+            typeface = Ds.body(true)
+            setTextColor(Ds.colors.text)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            includeFontPadding = false
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        if (item.live) {
+            nameRow.addView(TextView(this).apply {
+                text = "直播中"
+                textSize = 9f
+                typeface = Ds.body(true)
+                setTextColor(0xFFF04A5E.toInt())
+                background = Ds.pill(this@SearchActivity, 0x1FF04A5E)
+                setPadding(dp(6), dp(1), dp(6), dp(1))
+                includeFontPadding = false
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+        info.addView(nameRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        val meta = buildString {
+            append(formatScopeCount(item.fans)).append("粉丝")
+            if (item.videos > 0) append(" · ").append(item.videos).append(" 视频")
+            if (item.verify.isNotBlank()) append(" · ").append(item.verify)
+        }
+        info.addView(TextView(this).apply {
+            text = meta
+            textSize = 11f
+            typeface = Ds.body()
+            setTextColor(Ds.colors.muted)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            includeFontPadding = false
+            setPadding(0, dp(3), 0, 0)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        if (item.sign.isNotBlank()) {
+            info.addView(TextView(this).apply {
+                text = item.sign
+                textSize = 11f
+                typeface = Ds.body()
+                setTextColor(Ds.colors.subtle)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                includeFontPadding = false
+                setPadding(0, dp(2), 0, 0)
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+        card.addView(info, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        return searchRowShell(card)
+    }
+
+    private fun formatScopeCount(value: Long): String = when {
+        value >= 100_000_000L -> String.format("%.1f亿", value / 100_000_000.0)
+        value >= 10_000L -> String.format("%.1f万", value / 10_000.0)
+        else -> value.toString()
+    }
+
     private fun loadNextSearchPage() {
         if (!showingResultPage || searchInProgress || loadingNextPage || searchEndReached || currentSearchKeyword.isBlank()) return
         requestSearchPage(page = searchPage + 1, initial = false)
@@ -1693,12 +2201,16 @@ class SearchActivity : Activity() {
 
     private fun resetToSearchEntry() {
         searchGeneration += 1
+        altGeneration += 1
         pgcRequestGeneration += 1
         cancelFirstScreenGate()
         clearPgcHeader()
         searchInProgress = false
         loadingNextPage = false
         searchEndReached = false
+        altLoadingNext = false
+        altEndReached = false
+        altPage = 0
         currentSearchKeyword = ""
         searchPage = 0
         pagingSpinner.visibility = View.GONE
@@ -1708,10 +2220,14 @@ class SearchActivity : Activity() {
         hideFilterSheet()
         filterBar.animate().cancel()
         filterBar.visibility = View.GONE
+        hideScopeBar()
         hideLoading()
         VideoCardUi.toggleSkeleton(skeletonGrid, false)
         hideSuggestions()
         resultAdapter.replace(emptyList(), animateNew = false)
+        altAdapter.submit(emptyList())
+        results.visibility = View.VISIBLE
+        altResults.visibility = View.GONE
         showState("修改关键词后再次搜索")
         input.requestFocus()
         input.setSelection(input.text.length)
@@ -1980,6 +2496,8 @@ class SearchActivity : Activity() {
         const val PGC_FIRST_SCREEN_GRACE_MS = 260L
         const val SEARCH_CARD_ROW = "search_card_row"
         const val SEARCH_BOX_HEIGHT_DP = 40
+        /** 搜索类型栏（视频/直播/用户）每个标签的固定宽度，指示器按此平移。 */
+        const val SCOPE_TAB_WIDTH_DP = 58
         const val SEARCH_BOX_TEXT_SIZE_SP = 14f
         const val SEARCH_BOX_TRANSITION_NAME = "yui_search_box"
         const val SEARCH_TRANSITION_DURATION_MS = 220L

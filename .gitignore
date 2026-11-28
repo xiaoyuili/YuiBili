@@ -9,3 +9,6 @@ local.properties
 .idea/
 aapt2-launcher
 .aicode/
+gradlew-local.bat
+gradlew-local.ps1
+java-test.txt

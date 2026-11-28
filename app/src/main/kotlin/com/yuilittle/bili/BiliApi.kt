@@ -56,6 +56,16 @@ data class VideoItem(
     val watchProgressSec: Long = 0L
 )
 
+/**
+ * 历史接口的观看进度（秒）转换为播放页起始位置（毫秒）。
+ * -1（已看完）、0 以及大于等于总时长的位置都不续播，避免从结尾或非法位置起播。
+ */
+internal fun historyResumeMs(progressSec: Long, durationSec: Int): Long {
+    if (progressSec <= 0L) return 0L
+    if (durationSec > 0 && progressSec >= durationSec.toLong()) return 0L
+    return (progressSec * 1000L).coerceAtMost(24L * 60 * 60 * 1000)
+}
+
 /** 判断评论/回复作者是否为视频 UP 主（服务端标记优先，其次按 mid 匹配）。 */
 internal fun isCommentFromUp(comment: VideoComment, videoOwnerMid: Long): Boolean {
     if (comment.isUp) return true
@@ -154,6 +164,36 @@ data class PgcMedia(
     val epCount: Int = 0,
     val areas: String = "",
     val desc: String = ""
+)
+
+/**
+ * 直播搜索结果条目（search_type=live 的 result.live_room）。
+ * cover 是直播画面关键帧，face 是主播头像，online 是当前人气。
+ */
+data class LiveSearchItem(
+    val roomId: Long,
+    val uid: Long,
+    val title: String,
+    val owner: String,
+    val cover: String,
+    val face: String,
+    val area: String,
+    val online: Long,
+    val live: Boolean
+)
+
+/** 用户搜索结果条目（search_type=bili_user）；live 为真时 liveRoomId 可直达直播间。 */
+data class UserSearchItem(
+    val mid: Long,
+    val name: String,
+    val sign: String,
+    val face: String,
+    val fans: Long,
+    val videos: Int,
+    val level: Int,
+    val verify: String,
+    val liveRoomId: Long,
+    val live: Boolean
 )
 
 /** PGC 分集，来自 pgc/view/web/season 的 episodes[]；duration 单位是毫秒。 */
@@ -268,6 +308,7 @@ object BiliApi {
     private const val RECOMMEND_URL = "https://api.bilibili.com/x/web-interface/index/top/feed/rcmd?y_num=$PAGE_SIZE&fresh_type=3&feed_version=V8&ps=$PAGE_SIZE"
     private const val POPULAR_URL = "https://api.bilibili.com/x/web-interface/popular?ps=$PAGE_SIZE"
     private const val DETAIL_URL = "https://api.bilibili.com/x/web-interface/view?bvid="
+    private const val RELATED_URL = "https://api.bilibili.com/x/web-interface/archive/related?bvid="
     private const val SEARCH_URL = "https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword="
     private const val SUGGEST_URL = "https://s.search.bilibili.com/main/suggest?term="
     private const val FINGERPRINT_URL = "https://api.bilibili.com/x/frontend/finger/spi"
@@ -315,6 +356,49 @@ object BiliApi {
         return requestFeed("$RECOMMEND_URL&pn=$index&fresh_idx=$index&_=$token", callback) { root ->
             root.optJSONObject("data")?.optJSONArray("item")
         }
+    }
+
+    /**
+     * 播放页右侧「相关推荐」：B 站官方 related 接口，返回与当前视频相关的视频列表。
+     * 用 [BiliRequest] 便于切换视频时取消在途请求，避免旧列表覆盖新视频。
+     */
+    internal fun fetchRelated(bvid: String, callback: (List<VideoItem>?, String?) -> Unit): BiliRequest {
+        val request = BiliRequest()
+        if (bvid.isBlank()) {
+            mainHandler.post { callback(emptyList(), null) }
+            return request
+        }
+        val call = jsonCall(RELATED_URL + URLEncoder.encode(bvid, "UTF-8"))
+        if (!request.attach(call)) return request
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                request.detach(call)
+                mainHandler.post { if (!request.cancelled) callback(null, readableError(e)) }
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                val result = try {
+                    response.use {
+                        val root = BiliHttp.json(it)
+                        ensureSuccess(root)
+                        val array = root.optJSONArray("data") ?: error("未返回相关视频")
+                        val videos = ArrayList<VideoItem>(array.length())
+                        for (index in 0 until array.length()) {
+                            val entry = array.optJSONObject(index) ?: continue
+                            val video = videoFromJson(entry)
+                            if (video.bvid.isNotBlank()) videos.add(video)
+                        }
+                        videos
+                    }
+                } catch (error: Exception) {
+                    mainHandler.post { if (!request.cancelled) callback(null, readableError(error)) }
+                    return
+                }
+                request.detach(call)
+                mainHandler.post { if (!request.cancelled) callback(result, null) }
+            }
+        })
+        return request
     }
 
     fun fetchPopular(page: Int, token: Long, callback: (FeedPage?, String?) -> Unit): Call {
@@ -458,6 +542,112 @@ object BiliApi {
             }
         } catch (_: java.util.concurrent.RejectedExecutionException) {
             mainHandler.post { callback(null, "PGC 搜索排队已满") }
+        }
+    }
+
+    /**
+     * 直播搜索（search_type=live）：走与视频相同的匿名会话与限流通道。
+     * 结果在 result.live_room 里，只保留正在直播的房间。
+     */
+    fun searchLive(keyword: String, page: Int = 1, callback: (List<LiveSearchItem>?, String?) -> Unit) {
+        val encoded = URLEncoder.encode(keyword, "UTF-8")
+        val url = "https://api.bilibili.com/x/web-interface/search/type?search_type=live" +
+            "&keyword=$encoded&page=${page.coerceAtLeast(1)}"
+        executeSearch(onRejected = { mainHandler.post { callback(null, "操作过快，请稍后再试") } }) {
+            var lastError: Exception? = null
+            repeat(2) { attempt ->
+                try {
+                    val anon = ensureAnonymousSearchCookie()
+                    val root = searchJson(url, anon)
+                    ensureSuccess(root)
+                    val data = root.optJSONObject("data") ?: JSONObject()
+                    val array = data.optJSONObject("result")?.optJSONArray("live_room") ?: JSONArray()
+                    val list = ArrayList<LiveSearchItem>(array.length())
+                    for (i in 0 until array.length()) {
+                        val item = array.optJSONObject(i) ?: continue
+                        val roomId = item.optLong("roomid")
+                        if (roomId <= 0L) continue
+                        list += LiveSearchItem(
+                            roomId = roomId,
+                            uid = item.optLong("uid"),
+                            title = cleanHtml(item.optString("title")).ifBlank { "直播间 $roomId" },
+                            owner = cleanHtml(item.optString("uname")).ifBlank { "哔哩哔哩主播" },
+                            cover = normalizeUrl(
+                                item.optString("user_cover").ifBlank { item.optString("cover") }
+                            ),
+                            face = normalizeUrl(item.optString("uface")),
+                            area = cleanHtml(item.optString("cate_name")),
+                            online = item.optLong("online").coerceAtLeast(0L),
+                            live = item.optInt("live_status", 1) == 1
+                        )
+                    }
+                    mainHandler.post { callback(list, null) }
+                    return@executeSearch
+                } catch (error: Exception) {
+                    lastError = error
+                    if (attempt == 0 && isRequestBanned(error)) {
+                        anonymousSearchCookie = ""
+                        Thread.sleep(650L)
+                    } else {
+                        mainHandler.post { callback(null, readableError(error)) }
+                        return@executeSearch
+                    }
+                }
+            }
+            mainHandler.post { callback(null, readableError(lastError ?: IllegalStateException("搜索暂不可用"))) }
+        }
+    }
+
+    /**
+     * 用户 / UP 主搜索（search_type=bili_user）：result 是用户数组，
+     * res 里附带一条代表作，这里只用用户资料本身。
+     */
+    fun searchUsers(keyword: String, page: Int = 1, callback: (List<UserSearchItem>?, String?) -> Unit) {
+        val encoded = URLEncoder.encode(keyword, "UTF-8")
+        val url = "https://api.bilibili.com/x/web-interface/search/type?search_type=bili_user" +
+            "&keyword=$encoded&page=${page.coerceAtLeast(1)}"
+        executeSearch(onRejected = { mainHandler.post { callback(null, "操作过快，请稍后再试") } }) {
+            var lastError: Exception? = null
+            repeat(2) { attempt ->
+                try {
+                    val anon = ensureAnonymousSearchCookie()
+                    val root = searchJson(url, anon)
+                    ensureSuccess(root)
+                    val data = root.optJSONObject("data") ?: JSONObject()
+                    val array = data.optJSONArray("result") ?: JSONArray()
+                    val list = ArrayList<UserSearchItem>(array.length())
+                    for (i in 0 until array.length()) {
+                        val item = array.optJSONObject(i) ?: continue
+                        val mid = item.optLong("mid")
+                        if (mid <= 0L) continue
+                        val verify = item.optJSONObject("official_verify")?.optString("desc").orEmpty()
+                        list += UserSearchItem(
+                            mid = mid,
+                            name = cleanHtml(item.optString("uname")).ifBlank { "UID $mid" },
+                            sign = cleanHtml(item.optString("usign")),
+                            face = normalizeUrl(item.optString("upic")),
+                            fans = item.optLong("fans").coerceAtLeast(0L),
+                            videos = item.optInt("videos"),
+                            level = item.optInt("level"),
+                            verify = cleanHtml(verify),
+                            liveRoomId = item.optLong("room_id"),
+                            live = item.optInt("is_live") == 1
+                        )
+                    }
+                    mainHandler.post { callback(list, null) }
+                    return@executeSearch
+                } catch (error: Exception) {
+                    lastError = error
+                    if (attempt == 0 && isRequestBanned(error)) {
+                        anonymousSearchCookie = ""
+                        Thread.sleep(650L)
+                    } else {
+                        mainHandler.post { callback(null, readableError(error)) }
+                        return@executeSearch
+                    }
+                }
+            }
+            mainHandler.post { callback(null, readableError(lastError ?: IllegalStateException("搜索暂不可用"))) }
         }
     }
 

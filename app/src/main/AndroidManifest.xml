@@ -72,6 +72,15 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden" />
         <activity
+            android:name=".LiveRoomActivity"
+            android:theme="@style/PlayerActivityTheme"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden" />
+        <activity
+            android:name=".MessageCenterActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden" />
+        <activity
             android:name=".DownloadManagerActivity"
             android:exported="false" />
         <activity

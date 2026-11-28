@@ -45,6 +45,22 @@ internal class TabletSearchPageView(
         LATEST("最新发布", "pubdate")
     }
 
+    /** 搜索对象分类：视频沿用排序/时长，直播与用户走独立列表。 */
+    private enum class SearchScope(val label: String) {
+        VIDEO("视频"),
+        LIVE("直播"),
+        USER("用户")
+    }
+
+    private var searchScope = SearchScope.VIDEO
+    private lateinit var scopeRow: LinearLayout
+    private lateinit var scopeViews: List<TextView>
+    private lateinit var altList: ListView
+    private lateinit var altAdapter: ScopeAdapter
+    private var altPage = 0
+    private var altLoading = false
+    private var altEnd = false
+
     private val durationLabels = listOf("全部时长", "5分钟+", "10分钟+", "30分钟+", "1小时+")
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -204,7 +220,37 @@ internal class TabletSearchPageView(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ))
 
-        // ── 2. 筛选条（平板直接一排平铺：排序胶囊 | 时长筛选胶囊，无需手机端底部弹层） ──
+        // ── 2. 搜索类型栏（视频 / 直播 / 用户），位于排序栏之上 ──
+        scopeRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            setPadding(0, dp(12), 0, dp(2))
+        }
+        val scopeChips = ArrayList<TextView>()
+        SearchScope.entries.forEachIndexed { idx, scope ->
+            val tv = TextView(activity).apply {
+                text = scope.label
+                textSize = 12.5f
+                typeface = Ds.body(true)
+                gravity = Gravity.CENTER
+                setPadding(dp(18), dp(6), dp(18), dp(6))
+                isClickable = true
+                Ds.bindPressFeedback(this, 0.94f)
+                setOnClickListener { selectScope(scope) }
+            }
+            scopeChips += tv
+            scopeRow.addView(tv, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { if (idx > 0) leftMargin = dp(6) })
+        }
+        scopeViews = scopeChips
+        col.addView(scopeRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        updateScopeUi()
+
+        // ── 3. 筛选条（平板直接一排平铺：排序胶囊 | 时长筛选胶囊，无需手机端底部弹层） ──
         filterRow = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -384,6 +430,37 @@ internal class TabletSearchPageView(
         resultsHost.addView(resultsList, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         topScroller = AbsListSmoothTopScroller(resultsList, nearPosition = 6)
 
+        // 直播 / 用户结果列表：与视频网格互斥，共用同一结果舞台
+        altAdapter = ScopeAdapter()
+        altList = ListView(activity).apply {
+            divider = null
+            dividerHeight = 0
+            visibility = View.GONE
+            setSelector(android.R.color.transparent)
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            setPadding(0, dp(4), 0, dp(28))
+            clipToPadding = false
+            adapter = altAdapter
+            setOnScrollListener(object : AbsListView.OnScrollListener {
+                override fun onScrollStateChanged(view: AbsListView?, scrollState: Int) = Unit
+                override fun onScroll(view: AbsListView?, firstVisible: Int, visibleCount: Int, totalCount: Int) {
+                    if (searchScope == SearchScope.VIDEO) return
+                    if (::topButton.isInitialized) {
+                        val show = showingResults && !searching &&
+                            nextScrollTopVisible(topButton.visibility == View.VISIBLE, firstVisible, showAt = 3, hideAt = 1)
+                        topButton.setShown(show)
+                    }
+                    if (showingResults && !searching && !altLoading && !altEnd &&
+                        totalCount > 0 && firstVisible + visibleCount >= totalCount - 2
+                    ) {
+                        loadNextScopePage()
+                    }
+                }
+            })
+        }
+        resultsHost.addView(altList, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+
         skeletonOverlay = FrameLayout(activity).apply {
             visibility = View.GONE
             isClickable = false
@@ -405,7 +482,10 @@ internal class TabletSearchPageView(
             bottomMargin = dp(18)
         })
 
-        topButton = ScrollToTopButton(activity) { topScroller?.scrollToTop() }
+        topButton = ScrollToTopButton(activity) {
+            if (searchScope == SearchScope.VIDEO) topScroller?.scrollToTop()
+            else altList.smoothScrollToPosition(0)
+        }
         resultsHost.addView(topButton, LayoutParams(dp(44), dp(44), Gravity.BOTTOM or Gravity.END).apply {
             rightMargin = dp(12)
             bottomMargin = dp(20)
@@ -503,6 +583,322 @@ internal class TabletSearchPageView(
             ).apply { if (idx > 0) leftMargin = dp(10) })
         }
         pgcHeader.visibility = View.VISIBLE
+    }
+
+    // ─────────────────────────────────────────────────
+    //  搜索类型（视频 / 直播 / 用户）
+    // ─────────────────────────────────────────────────
+
+    private fun updateScopeUi() {
+        val c = Ds.colors
+        SearchScope.entries.forEachIndexed { idx, scope ->
+            val tv = scopeViews.getOrNull(idx) ?: return@forEachIndexed
+            val active = scope == searchScope
+            tv.setTextColor(if (active) c.accent else c.muted)
+            tv.background = Ds.pill(
+                activity,
+                fill = if (active) c.accentSoft else Color.TRANSPARENT,
+                border = if (active) (c.accent and 0x44FFFFFF) else Color.TRANSPARENT,
+                borderPx = Ds.hairline(activity)
+            )
+        }
+    }
+
+    private fun selectScope(next: SearchScope) {
+        if (searchScope == next) return
+        searchScope = next
+        updateScopeUi()
+        applyScopeChrome()
+        if (showingResults && currentKeyword.isNotBlank()) runSearch(currentKeyword, keepPgc = false)
+    }
+
+    private fun applyScopeChrome() {
+        if (!::altList.isInitialized) return
+        val video = searchScope == SearchScope.VIDEO
+        resultsList.visibility = if (video) View.VISIBLE else View.GONE
+        altList.visibility = if (!video && showingResults) View.VISIBLE else View.GONE
+        filterRow.visibility = if (video && showingResults) View.VISIBLE else View.GONE
+        if (!video) VideoCardUi.toggleSkeleton(skeletonOverlay, false)
+    }
+
+    private fun runScopeSearch(initial: Boolean) {
+        if (searchScope == SearchScope.VIDEO || currentKeyword.isBlank()) return
+        if (!initial && (altLoading || altEnd)) return
+        val keyword = currentKeyword
+        val gen = searchGen
+        val page = if (initial) 1 else altPage + 1
+        val scope = searchScope
+        if (initial) {
+            searching = true
+            stateView.text = if (scope == SearchScope.LIVE) "正在搜索直播…" else "正在搜索用户…"
+            stateView.visibility = View.VISIBLE
+            stateView.setOnClickListener(null)
+        } else {
+            altLoading = true
+            pagingSpinner.visibility = View.VISIBLE
+            pagingSpinner.startSpinning()
+        }
+        val deliver: (List<Any>?, String?) -> Unit = { items, error ->
+            onScopeResult(scope, gen, page, initial, items, error)
+        }
+        when (scope) {
+            SearchScope.LIVE -> BiliApi.searchLive(keyword, page) { list, error ->
+                deliver(list?.map { it as Any }, error)
+            }
+            SearchScope.USER -> BiliApi.searchUsers(keyword, page) { list, error ->
+                deliver(list?.map { it as Any }, error)
+            }
+            SearchScope.VIDEO -> Unit
+        }
+    }
+
+    private fun onScopeResult(
+        scope: SearchScope,
+        gen: Int,
+        page: Int,
+        initial: Boolean,
+        items: List<Any>?,
+        error: String?
+    ) {
+        if (gen != searchGen || !showingResults || searchScope != scope) return
+        if (!initial) {
+            altLoading = false
+            pagingSpinner.visibility = View.GONE
+        } else {
+            searching = false
+        }
+        if (items == null) {
+            if (initial && altAdapter.count == 0) {
+                stateView.text = "搜索失败：${error ?: "网络异常"}\n\n点这里重试"
+                stateView.visibility = View.VISIBLE
+                stateView.setOnClickListener { runScopeSearch(initial = true) }
+            }
+            return
+        }
+        if (initial) {
+            altPage = page
+            altAdapter.submit(items)
+            altList.setSelection(0)
+            stateView.visibility = View.GONE
+            if (items.isEmpty()) {
+                altEnd = true
+                stateView.text = if (scope == SearchScope.LIVE) {
+                    "没有找到正在直播的房间"
+                } else {
+                    "没有找到相关用户"
+                }
+                stateView.visibility = View.VISIBLE
+            }
+        } else {
+            if (items.isEmpty()) {
+                altEnd = true
+                return
+            }
+            altPage = page
+            altAdapter.append(items)
+            if (items.size < 15) altEnd = true
+        }
+    }
+
+    private fun loadNextScopePage() {
+        if (searchScope == SearchScope.VIDEO) return
+        if (!showingResults || searching || altLoading || altEnd || currentKeyword.isBlank()) return
+        runScopeSearch(initial = false)
+    }
+
+    private inner class ScopeAdapter : BaseAdapter() {
+        private val items = ArrayList<Any>()
+
+        fun submit(list: List<Any>) {
+            items.clear()
+            items.addAll(list)
+            notifyDataSetChanged()
+        }
+
+        fun append(list: List<Any>) {
+            items.addAll(list)
+            notifyDataSetChanged()
+        }
+
+        override fun getCount(): Int = items.size
+        override fun getItem(position: Int): Any = items[position]
+        override fun getItemId(position: Int): Long = position.toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+            return when (val item = items[position]) {
+                is LiveSearchItem -> liveRow(item)
+                is UserSearchItem -> userRow(item)
+                else -> View(activity)
+            }
+        }
+    }
+
+    private fun rowShell(content: View): View = FrameLayout(activity).apply {
+        setPadding(0, dp(3), 0, dp(3))
+        addView(content, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+    }
+
+    private fun liveRow(item: LiveSearchItem): View {
+        val c = Ds.colors
+        val card = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = Ds.card(activity, c.surface, c.lineSoft, Ds.Radius.card)
+            Ds.clipRounded(this, Ds.Radius.card)
+            setPadding(dp(10), dp(10), dp(14), dp(10))
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.97f)
+            setOnClickListener {
+                if (!item.live) return@setOnClickListener
+                LiveRoomActivity.open(
+                    activity,
+                    LiveRoom(item.roomId, item.uid, item.title, item.owner, item.cover, item.face, item.area, item.online)
+                )
+            }
+        }
+        val coverFrame = FrameLayout(activity).apply {
+            setBackgroundColor(c.cover)
+            Ds.clipRounded(this, 8)
+        }
+        val cover = ImageView(activity).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+        coverFrame.addView(cover, FrameLayout.LayoutParams(dp(152), dp(86)))
+        if (item.cover.isNotBlank()) CoverLoader.load(cover, item.cover, thumbEdge = 384)
+        if (item.live) {
+            coverFrame.addView(TextView(activity).apply {
+                text = "直播中"
+                textSize = 9f
+                typeface = Ds.body(true)
+                setTextColor(Color.WHITE)
+                includeFontPadding = false
+                setPadding(dp(5), dp(2), dp(5), dp(2))
+                background = Ds.pill(activity, 0xE6F04A5E.toInt())
+            }, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.START
+            ).apply {
+                leftMargin = dp(6)
+                topMargin = dp(6)
+            })
+        }
+        card.addView(coverFrame, LinearLayout.LayoutParams(dp(152), dp(86)))
+
+        val info = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), 0, 0, 0)
+        }
+        info.addView(TextView(activity).apply {
+            text = item.title
+            textSize = 14f
+            typeface = Ds.body(true)
+            setTextColor(c.text)
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        val meta = buildString {
+            append(item.owner)
+            if (item.online > 0) append(" · ").append(countLabel(item.online)).append("人气")
+            if (item.area.isNotBlank()) append(" · ").append(item.area)
+        }
+        info.addView(TextView(activity).apply {
+            text = meta
+            textSize = 11.5f
+            setTextColor(c.muted)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, dp(6), 0, 0)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        card.addView(info, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        return rowShell(card)
+    }
+
+    private fun userRow(item: UserSearchItem): View {
+        val c = Ds.colors
+        val card = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = Ds.card(activity, c.surface, c.lineSoft, Ds.Radius.card)
+            Ds.clipRounded(this, Ds.Radius.card)
+            setPadding(dp(12), dp(12), dp(14), dp(12))
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.97f)
+            setOnClickListener {
+                SpaceActivity.open(activity, item.mid, item.name, item.face)
+            }
+        }
+        val avatarFrame = FrameLayout(activity).apply {
+            setBackgroundColor(c.cover)
+            Ds.clipRounded(this, 26)
+        }
+        val avatar = ImageView(activity).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+        avatarFrame.addView(avatar, FrameLayout.LayoutParams(dp(52), dp(52)))
+        if (item.face.isNotBlank()) CoverLoader.load(avatar, item.face, thumbEdge = 160)
+        card.addView(avatarFrame, LinearLayout.LayoutParams(dp(52), dp(52)))
+
+        val info = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), 0, 0, 0)
+        }
+        val nameRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        nameRow.addView(TextView(activity).apply {
+            text = item.name
+            textSize = 14f
+            typeface = Ds.body(true)
+            setTextColor(c.text)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        if (item.live) {
+            nameRow.addView(TextView(activity).apply {
+                text = "直播中"
+                textSize = 9f
+                typeface = Ds.body(true)
+                setTextColor(0xFFF04A5E.toInt())
+                background = Ds.pill(activity, 0x1FF04A5E)
+                setPadding(dp(6), dp(1), dp(6), dp(1))
+                includeFontPadding = false
+            })
+        }
+        info.addView(nameRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        val meta = buildString {
+            append(countLabel(item.fans)).append("粉丝")
+            if (item.videos > 0) append(" · ").append(item.videos).append(" 视频")
+            if (item.verify.isNotBlank()) append(" · ").append(item.verify)
+        }
+        info.addView(TextView(activity).apply {
+            text = meta
+            textSize = 11.5f
+            setTextColor(c.muted)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, dp(4), 0, 0)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        if (item.sign.isNotBlank()) {
+            info.addView(TextView(activity).apply {
+                text = item.sign
+                textSize = 11.5f
+                setTextColor(c.subtle)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(0, dp(3), 0, 0)
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+        card.addView(info, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        return rowShell(card)
+    }
+
+    private fun countLabel(value: Long): String = when {
+        value >= 100_000_000L -> String.format("%.1f亿", value / 100_000_000.0)
+        value >= 10_000L -> String.format("%.1f万", value / 10_000.0)
+        else -> value.toString()
     }
 
     private fun updateFilterUi() {
@@ -619,17 +1015,31 @@ internal class TabletSearchPageView(
         searching = true
         loadingMore = false
         endReached = false
+        altLoading = false
+        altEnd = false
+        altPage = 0
         searchPage = 1
         val gen = ++searchGen
         suggestionBox.visibility = View.GONE
         idleScroll.visibility = View.GONE
-        filterRow.visibility = View.VISIBLE
+        scopeRow.visibility = View.VISIBLE
         resultsHost.visibility = View.VISIBLE
         stateView.visibility = View.GONE
+        stateView.setOnClickListener(null)
         topButton.setShown(false, animate = false)
         topScroller?.cancel()
         if (!keepPgc) pgcHeader.visibility = View.GONE
         adapter.replace(emptyList())
+        altAdapter.submit(emptyList())
+        applyScopeChrome()
+
+        if (searchScope != SearchScope.VIDEO) {
+            VideoCardUi.toggleSkeleton(skeletonOverlay, false)
+            runScopeSearch(initial = true)
+            return
+        }
+
+        filterRow.visibility = View.VISIBLE
         VideoCardUi.toggleSkeleton(skeletonOverlay, true)
 
         if (!keepPgc) {
@@ -669,6 +1079,10 @@ internal class TabletSearchPageView(
     }
 
     private fun loadNextPage() {
+        if (searchScope != SearchScope.VIDEO) {
+            loadNextScopePage()
+            return
+        }
         if (loadingMore || endReached || currentKeyword.isBlank()) return
         loadingMore = true
         val gen = searchGen
@@ -697,12 +1111,19 @@ internal class TabletSearchPageView(
         showingResults = false
         searching = false
         loadingMore = false
+        altLoading = false
+        altEnd = false
+        altPage = 0
         topButton.setShown(false, animate = false)
         topScroller?.cancel()
         filterRow.visibility = View.GONE
+        scopeRow.visibility = View.GONE
         resultsHost.visibility = View.GONE
         idleScroll.visibility = View.VISIBLE
         suggestionBox.visibility = View.GONE
+        resultsList.visibility = View.VISIBLE
+        altList.visibility = View.GONE
+        altAdapter.submit(emptyList())
         refreshHistory()
     }
 

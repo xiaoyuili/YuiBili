@@ -444,7 +444,13 @@ internal class TabletFavoritesPageView(
                     val card = VideoCardUi.createCard(activity, cardW, coverH, cardH).apply {
                         setOnClickListener {
                             (tag as? VideoCardUi.Holder)?.boundVideo?.let { v ->
-                                VideoDetailActivity.open(activity, v.bvid, v.aid, v.cid)
+                                VideoDetailActivity.open(
+                                    activity,
+                                    v.bvid,
+                                    v.aid,
+                                    v.cid,
+                                    historyResumeMs(v.watchProgressSec, v.duration)
+                                )
                             }
                         }
                     }
@@ -691,7 +697,13 @@ internal class TabletHistoryPageView(
                     val card = VideoCardUi.createCard(activity, cardW, coverH, cardH).apply {
                         setOnClickListener {
                             (tag as? VideoCardUi.Holder)?.boundVideo?.let { v ->
-                                VideoDetailActivity.open(activity, v.bvid, v.aid, v.cid)
+                                VideoDetailActivity.open(
+                                    activity,
+                                    v.bvid,
+                                    v.aid,
+                                    v.cid,
+                                    historyResumeMs(v.watchProgressSec, v.duration)
+                                )
                             }
                         }
                     }

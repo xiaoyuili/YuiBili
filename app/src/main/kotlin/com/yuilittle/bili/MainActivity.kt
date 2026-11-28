@@ -36,7 +36,7 @@ class MainActivity : Activity() {
     private var bottomNavigation: FrostedBottomNavigation? = null
     private var tabletRail: TabletRailNav? = null
     private var tabletStage: TabletVerticalStage? = null
-    private val pages = arrayOfNulls<View>(2)
+    private val pages = arrayOfNulls<View>(3)
     private var currentPage = HOME
     private var currentTabletDest = TabletRailNav.DEST_HOME
     private var refreshOnEntry = true
@@ -50,7 +50,7 @@ class MainActivity : Activity() {
         reducedMotion = MotionTokens.isReduced(this)
         Theme.init(this)
         builtAsTablet = LayoutMode.isTablet
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
         // Paint the window with the current theme colour BEFORE any content so
         // recreate() after night-mode toggle never flashes the light styles.xml
         // windowBackground (#FFFCFA) for one frame.
@@ -140,7 +140,10 @@ class MainActivity : Activity() {
             bottomNavigation?.setSelectedIndex(index)
         }
         pager.setOnPageRevealListener { index ->
-            if (index == HOME) (pages[HOME] as? HomeFeedView)?.prepareVisible()
+            when (index) {
+                HOME -> (pages[HOME] as? HomeFeedView)?.prepareVisible()
+                DYNAMIC -> (pages[DYNAMIC] as? FollowingDynamicPageView)?.prepareVisible()
+            }
         }
         pager.setOnPageScrollListener { progress ->
             bottomNavigation?.setScrollProgress(progress)
@@ -155,15 +158,20 @@ class MainActivity : Activity() {
 
         val dock = FrostedBottomNavigation(this).apply {
             setOnDestinationSelectedListener { destination -> showPage(destination) }
-            // 已在首页时再点「首页」：快速平滑回顶（不再切页）
+            // 已在首页/动态时再点对应项：快速回顶；动态页已在顶部则刷新
             setOnDestinationReselectedListener { destination ->
-                if (destination == HOME && currentPage == HOME) {
-                    (pages[HOME] as? HomeFeedView)?.scrollToTop()
+                when {
+                    destination == HOME && currentPage == HOME ->
+                        (pages[HOME] as? HomeFeedView)?.scrollToTop()
+                    destination == DYNAMIC && currentPage == DYNAMIC -> {
+                        val dynamicPage = pages[DYNAMIC] as? FollowingDynamicPageView
+                        if (dynamicPage?.scrollToTop() != true) dynamicPage?.refresh()
+                    }
                 }
             }
         }
         bottomNavigation = dock
-        val dockWidth = minOf(dp(208), resources.displayMetrics.widthPixels - dp(48))
+        val dockWidth = minOf(dp(248), resources.displayMetrics.widthPixels - dp(48))
         root.addView(
             dock,
             FrameLayout.LayoutParams(
@@ -213,9 +221,13 @@ class MainActivity : Activity() {
             pages[HOME] = it
         }
         TabletRailNav.DEST_SEARCH -> TabletSearchPageView(this)
+        TabletRailNav.DEST_DYNAMIC -> FollowingDynamicPageView(this).also {
+            pages[DYNAMIC] = it
+        }
         TabletRailNav.DEST_DOWNLOADS -> DownloadPageView(this, initialTab = DownloadPageView.TAB_VIDEO, onClose = null)
         TabletRailNav.DEST_FAVORITES -> TabletFavoritesPageView(this)
         TabletRailNav.DEST_HISTORY -> TabletHistoryPageView(this)
+        TabletRailNav.DEST_MESSAGE -> MessageCenterPageView(this, showBack = false)
         else -> AccountPageView(this).also { pages[PROFILE] = it }
     }
 
@@ -246,6 +258,8 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // 从设置页改完主页方向返回时重新应用
+        PlayerSettingsStore.applyHomeOrientation(this)
         resumed = true
         updateActivePage()
     }
@@ -287,6 +301,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         (tabletStage?.getPage(TabletRailNav.DEST_SEARCH) as? TabletSearchPageView)?.destroy()
+        (tabletStage?.getPage(TabletRailNav.DEST_MESSAGE) as? MessageCenterPageView)?.destroy()
         super.onDestroy()
     }
 
@@ -303,6 +318,8 @@ class MainActivity : Activity() {
                 ?.setActive(resumed && currentTabletDest == TabletRailNav.DEST_PROFILE)
             (tabletStage?.getPage(TabletRailNav.DEST_DOWNLOADS) as? DownloadPageView)
                 ?.setActive(resumed && currentTabletDest == TabletRailNav.DEST_DOWNLOADS)
+            (tabletStage?.getPage(TabletRailNav.DEST_DYNAMIC) as? FollowingDynamicPageView)
+                ?.setActive(resumed && currentTabletDest == TabletRailNav.DEST_DYNAMIC)
             if (resumed) {
                 when (currentTabletDest) {
                     TabletRailNav.DEST_SEARCH ->
@@ -311,11 +328,15 @@ class MainActivity : Activity() {
                         (tabletStage?.getPage(TabletRailNav.DEST_FAVORITES) as? TabletFavoritesPageView)?.onPageActivated()
                     TabletRailNav.DEST_HISTORY ->
                         (tabletStage?.getPage(TabletRailNav.DEST_HISTORY) as? TabletHistoryPageView)?.onPageActivated()
+                    TabletRailNav.DEST_MESSAGE ->
+                        (tabletStage?.getPage(TabletRailNav.DEST_MESSAGE) as? MessageCenterPageView)
+                            ?.setActive(true)
                 }
             }
             return
         }
         (pages[HOME] as? HomeFeedView)?.setActive(resumed && currentPage == HOME)
+        (pages[DYNAMIC] as? FollowingDynamicPageView)?.setActive(resumed && currentPage == DYNAMIC)
         (pages[PROFILE] as? AccountPageView)?.setActive(resumed && currentPage == PROFILE)
     }
 
@@ -448,6 +469,7 @@ class MainActivity : Activity() {
 
     private fun createRootPage(index: Int): View = when (index) {
         HOME -> HomeFeedView(this, refreshOnEntry, restoredHomeState).also { restoredHomeState = null }
+        DYNAMIC -> FollowingDynamicPageView(this)
         else -> AccountPageView(this)
     }
 
@@ -576,6 +598,7 @@ class MainActivity : Activity() {
 
     private fun pageDescription(index: Int): String = when (index) {
         HOME -> "首页"
+        DYNAMIC -> "关注动态"
         else -> "我的"
     }
 
@@ -584,7 +607,8 @@ class MainActivity : Activity() {
 
     private companion object {
         const val HOME = 0
-        const val PROFILE = 1
+        const val DYNAMIC = 1
+        const val PROFILE = 2
         const val STATE_CURRENT_PAGE = "main_current_page"
         const val STATE_TABLET_DEST = "main_tablet_dest"
         const val STATE_HOME = "main_home_state"

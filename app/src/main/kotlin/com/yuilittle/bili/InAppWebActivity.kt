@@ -17,6 +17,7 @@ import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
@@ -38,12 +39,16 @@ class InAppWebActivity : Activity() {
     private lateinit var progressBar: View
     private lateinit var errorLayer: LinearLayout
     private var currentUrl: String = ""
+    private var desktopUa = false
+    private var withBiliLogin = false
+    private var replyAnchor = ""
+    private val replyAnchorTask = Runnable { scrollToReplyAnchor() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Ds.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
         window.setBackgroundDrawable(ColorDrawable(Ds.colors.bg))
 
         val target = intent.getStringExtra(EXTRA_URL).orEmpty()
@@ -52,9 +57,45 @@ class InAppWebActivity : Activity() {
             finish()
             return
         }
+        desktopUa = intent.getBooleanExtra(EXTRA_DESKTOP_UA, false)
+        withBiliLogin = intent.getBooleanExtra(EXTRA_BILI_LOGIN, false)
+        replyAnchor = Regex("#reply(\\d+)").find(target)?.groupValues?.getOrNull(1).orEmpty()
         currentUrl = target
         setContentView(buildUi())
+        applyWebPreferences(target)
         webView.loadUrl(target)
+    }
+
+    /** 桌面 UA + 站内登录态：消息中心跳去网页版回复时使用。 */
+    private fun applyWebPreferences(url: String) {
+        if (desktopUa) {
+            webView.settings.userAgentString = DESKTOP_USER_AGENT
+        }
+        if (!withBiliLogin) return
+        val cookie = BiliSessionStore.cookie()
+        if (cookie.isBlank()) return
+        runCatching {
+            val manager = CookieManager.getInstance()
+            manager.setAcceptCookie(true)
+            manager.setAcceptThirdPartyCookies(webView, true)
+            val origin = Uri.parse(url).let { uri ->
+                if (uri.host.isNullOrBlank()) null else "${uri.scheme}://${uri.host}"
+            }
+            val hosts = if (origin != null) BILI_COOKIE_HOSTS + origin else BILI_COOKIE_HOSTS
+            // setCookie 只接受单个 Set-Cookie，逐条写入。
+            cookie.split(';')
+                .map { it.trim() }
+                .filter { it.contains('=') }
+                .forEach { pair ->
+                    // 网页端登录态的 cookie 是 Domain=.bilibili.com 的，必须按域下发，
+                    // 否则 api.vc.bilibili.com / api.bilibili.com 等接口域收不到 SESSDATA，
+                    // 消息中心就会「加载失败」。
+                    manager.setCookie(BILI_COOKIE_ANCHOR, "$pair; Domain=.bilibili.com; Path=/")
+                    // 域属性万一被旧内核忽略，再按主机逐条补一遍。
+                    hosts.forEach { manager.setCookie(it, pair) }
+                }
+            manager.flush()
+        }
     }
 
     private fun buildUi(): View {
@@ -152,6 +193,11 @@ class InAppWebActivity : Activity() {
                 override fun onPageFinished(view: WebView, url: String?) {
                     super.onPageFinished(view, url)
                     if (!url.isNullOrBlank()) updateUrl(url)
+                    if (replyAnchor.isNotBlank()) {
+                        webView.removeCallbacks(replyAnchorTask)
+                        // B 站评论区是异步渲染的，等 DOM 落地后再定位一次。
+                        webView.postDelayed(replyAnchorTask, 1200L)
+                    }
                 }
 
                 override fun onReceivedError(
@@ -224,6 +270,30 @@ class InAppWebActivity : Activity() {
         return root
     }
 
+    /** 评论锚点兜底：SPA 异步渲染时 #reply 未必自动滚到目标，用 JS 找到对应楼层并高亮。 */
+    private fun scrollToReplyAnchor() {
+        if (replyAnchor.isBlank()) return
+        val js = """
+            (function(){
+              var id='$replyAnchor';
+              if(!id) return false;
+              var nodes=document.querySelectorAll('[data-rpid="'+id+'"],[data-reply-id="'+id+'"],[id="reply-'+id+'"]');
+              for (var i=0;i<nodes.length;i++){
+                var n=nodes[i];
+                if(!n.getBoundingClientRect) continue;
+                n.scrollIntoView({block:'center'});
+                n.style.outline='2px solid #fb7299';
+                n.style.outlineOffset='2px';
+                return true;
+              }
+              var reply=document.getElementById('comment')||document.querySelector('.reply-area,.comment-area');
+              if(reply) reply.scrollIntoView({block:'start'});
+              return false;
+            })()
+        """.trimIndent()
+        runCatching { webView.evaluateJavascript(js, null) }
+    }
+
     private fun updateUrl(url: String) {
         currentUrl = url
         urlText.text = url
@@ -255,6 +325,7 @@ class InAppWebActivity : Activity() {
 
     override fun onDestroy() {
         (webView.parent as? ViewGroup)?.removeView(webView)
+        webView.removeCallbacks(replyAnchorTask)
         webView.stopLoading()
         webView.webChromeClient = null
         webView.webViewClient = WebViewClient()
@@ -350,11 +421,40 @@ class InAppWebActivity : Activity() {
 
     companion object {
         private const val EXTRA_URL = "in_app_web_url"
+        private const val EXTRA_DESKTOP_UA = "in_app_web_desktop_ua"
+        private const val EXTRA_BILI_LOGIN = "in_app_web_bili_login"
 
-        fun open(context: Context, url: String) {
+        private const val DESKTOP_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
+        private val BILI_COOKIE_HOSTS = listOf(
+            "https://www.bilibili.com",
+            "https://message.bilibili.com",
+            "https://space.bilibili.com",
+            "https://t.bilibili.com",
+            "https://live.bilibili.com",
+            "https://account.bilibili.com",
+            "https://search.bilibili.com",
+            "https://bilibili.com",
+            "https://api.bilibili.com",
+            "https://api.vc.bilibili.com"
+        )
+
+        /** 下发 Domain=.bilibili.com 的锚点域。 */
+        private const val BILI_COOKIE_ANCHOR = "https://www.bilibili.com"
+
+        fun open(
+            context: Context,
+            url: String,
+            desktopUa: Boolean = false,
+            withBiliLogin: Boolean = false
+        ) {
             if (!CommentLinkParser.isSafeUrl(url)) return
             context.startActivity(Intent(context, InAppWebActivity::class.java).apply {
                 putExtra(EXTRA_URL, url)
+                putExtra(EXTRA_DESKTOP_UA, desktopUa)
+                putExtra(EXTRA_BILI_LOGIN, withBiliLogin)
             })
         }
     }

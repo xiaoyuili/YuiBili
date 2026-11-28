@@ -1,5 +1,6 @@
 package com.yuilittle.bili
 
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.app.Dialog
 import android.content.ClipData
@@ -47,6 +48,7 @@ import java.util.Locale
  * - MODE_FAVORITES：我的收藏（限流预览并发队列 + 收藏夹列表 + 夹内分页列表 + 长按移出收藏）
  * - MODE_SPONSOR：赞助开发（简洁微信扫码卡片 + 保存/长按保存）
  * - MODE_ABOUT：关于软件（紧凑卡片化信息 + 版本复制 + 免责声明弹窗）
+ * - MODE_SETTINGS：播放设置（屏幕方向锁定 + 默认播放画质）
  */
 class ProfileSubActivity : Activity() {
 
@@ -118,7 +120,7 @@ class ProfileSubActivity : Activity() {
         Theme.init(this)
         mode = intent.getStringExtra(EXTRA_MODE) ?: MODE_HISTORY
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
         window.setBackgroundDrawable(ColorDrawable(COLOR_BACKGROUND))
 
         val root = FrameLayout(this).apply { setBackgroundColor(COLOR_BACKGROUND) }
@@ -284,6 +286,7 @@ class ProfileSubActivity : Activity() {
             MODE_FAVORITES -> loadFavorites()
             MODE_DOWNLOADS -> renderDownloads()
             MODE_SPONSOR -> renderSponsor()
+            MODE_SETTINGS -> renderSettings()
             else -> renderAbout()
         }
     }
@@ -299,6 +302,7 @@ class ProfileSubActivity : Activity() {
         MODE_DOWNLOADS -> "下载管理"
         MODE_SPONSOR -> "赞助开发"
         MODE_ABOUT -> "关于软件"
+        MODE_SETTINGS -> "播放设置"
         else -> "历史记录"
     }
 
@@ -405,11 +409,22 @@ class ProfileSubActivity : Activity() {
                     cover = item.cover,
                     durationSec = item.duration,
                     progressSec = item.watchProgressSec,
+                    aid = item.aid,
+                    cid = item.cid,
+                    resumeMs = historyResumeMs(item.watchProgressSec, item.duration),
                     onLongClick = {
                         showActionSheet(
                             title = item.title,
                             actions = listOf(
-                                "立即播放" to { openVideo(item.bvid) },
+                                "立即播放" to {
+                                    VideoDetailActivity.open(
+                                        this@ProfileSubActivity,
+                                        item.bvid,
+                                        item.aid,
+                                        item.cid,
+                                        historyResumeMs(item.watchProgressSec, item.duration)
+                                    )
+                                },
                                 "删除此条记录" to {
                                     deleteRemoteHistoryItem(item, rowRef)
                                 }
@@ -2081,7 +2096,7 @@ class ProfileSubActivity : Activity() {
             Toast.makeText(this, "已复制版本信息", Toast.LENGTH_SHORT).show()
         }
         infoDivider()
-        infoRow("作者", "xiaoyuili")
+        infoRow("作者", "xiaoyuili（二改作者 suqingan）")
         infoDivider()
         infoRow("隐私与存储", "凭证仅存本机")
         infoDivider()
@@ -2107,6 +2122,304 @@ class ProfileSubActivity : Activity() {
             ).apply { topMargin = dp(12) })
             animateRowIn(infoCard, 1)
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 5. 播放设置（屏幕方向 / 默认画质，立即写入本机偏好）
+    // ═══════════════════════════════════════════════════════════════
+
+    private fun renderSettings() {
+        listBox.removeAllViews()
+
+        fun sectionHeader(text: String, topSpace: Int): TextView = TextView(this).apply {
+            this.text = text
+            textSize = 11.5f
+            typeface = Ds.body(true)
+            letterSpacing = 0.08f
+            setTextColor(Ds.colors.subtle)
+            setPadding(dp(2), dp(topSpace), 0, dp(8))
+        }
+
+        fun hint(text: String): TextView = TextView(this).apply {
+            this.text = text
+            textSize = 12f
+            typeface = Ds.body()
+            setTextColor(COLOR_MUTED)
+            setPadding(dp(4), dp(8), dp(4), 0)
+        }
+
+        fun newCard(): LinearLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Ds.card(this@ProfileSubActivity, COLOR_CARD, Ds.colors.lineSoft, Ds.Radius.card)
+            setPadding(0, dp(4), 0, dp(4))
+        }
+
+        fun cardDivider(card: LinearLayout) {
+            card.addView(
+                View(this).apply { setBackgroundColor(Ds.colors.lineSoft) },
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)).apply {
+                    leftMargin = dp(16)
+                    rightMargin = dp(16)
+                }
+            )
+        }
+
+        fun choiceRow(
+            card: LinearLayout,
+            label: String,
+            value: String,
+            selected: Boolean,
+            description: String,
+            onClick: () -> Unit
+        ) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), 0, dp(16), 0)
+                isClickable = true
+                isFocusable = true
+                Ds.bindPressFeedback(this, 0.985f)
+                setOnClickListener { onClick() }
+                addView(LinearLayout(this@ProfileSubActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(TextView(this@ProfileSubActivity).apply {
+                        text = label
+                        textSize = 14.5f
+                        typeface = Ds.body(true)
+                        setTextColor(COLOR_INK)
+                    })
+                    addView(TextView(this@ProfileSubActivity).apply {
+                        text = description
+                        textSize = 11.5f
+                        typeface = Ds.body()
+                        setTextColor(COLOR_MUTED)
+                        setPadding(0, dp(2), 0, 0)
+                    })
+                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                addView(TextView(this@ProfileSubActivity).apply {
+                    text = value
+                    textSize = 13f
+                    typeface = Ds.body()
+                    setTextColor(if (selected) COLOR_ROSE else COLOR_MUTED)
+                })
+                addView(
+                    Ds.chevronRightIcon(this@ProfileSubActivity, Ds.colors.subtle, 1.7f),
+                    LinearLayout.LayoutParams(dp(14), dp(14)).apply { leftMargin = dp(6) }
+                )
+            }
+            card.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(64)
+            ))
+        }
+
+        // 开关栏：与「我的」页夜间模式使用同一款胶囊开关
+        fun switchRow(
+            card: LinearLayout,
+            label: String,
+            checked: Boolean,
+            description: String,
+            onToggle: (Boolean) -> Unit
+        ) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), 0, dp(16), 0)
+                isClickable = true
+                isFocusable = true
+                Ds.bindPressFeedback(this, 0.985f)
+                addView(LinearLayout(this@ProfileSubActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(TextView(this@ProfileSubActivity).apply {
+                        text = label
+                        textSize = 14.5f
+                        typeface = Ds.body(true)
+                        setTextColor(COLOR_INK)
+                    })
+                    addView(TextView(this@ProfileSubActivity).apply {
+                        text = description
+                        textSize = 11.5f
+                        typeface = Ds.body()
+                        setTextColor(COLOR_MUTED)
+                        setPadding(0, dp(2), 0, 0)
+                    })
+                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            }
+            val toggle = PillSwitch(this, checked)
+            row.addView(toggle, LinearLayout.LayoutParams(dp(48), dp(28)))
+            row.setOnClickListener {
+                toggle.toggle()
+                onToggle(toggle.isOn)
+            }
+            card.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(64)
+            ))
+        }
+
+        // 二级菜单：点击栏位后弹出单选列表
+        fun <T> showChoiceSheet(
+            title: String,
+            entries: List<Triple<T, String, String>>,
+            selected: T,
+            onPicked: (T) -> Unit
+        ) {
+            val dialog = Dialog(this)
+            // 二级菜单不要用系统默认的白色圆角背景，边缘透明、直角贴合。
+            dialog.window?.setBackgroundDrawable(ColorDrawable(0x00000000))
+            val panel = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = Ds.card(
+                    this@ProfileSubActivity, COLOR_CARD, null, 0
+                )
+                setPadding(dp(6), dp(6), dp(6), dp(6))
+            }
+            entries.forEach { (key, label, summary) ->
+                val isSelected = key == selected
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(12), 0, dp(12), 0)
+                    if (isSelected) {
+                        background = Ds.card(
+                            this@ProfileSubActivity, COLOR_ROSE_SOFT, null, 0, 0
+                        )
+                    }
+                    isClickable = true
+                    isFocusable = true
+                    Ds.bindPressFeedback(this, 0.97f)
+                    addView(LinearLayout(this@ProfileSubActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        addView(TextView(this@ProfileSubActivity).apply {
+                            text = label
+                            textSize = 14.5f
+                            typeface = Ds.body(isSelected)
+                            setTextColor(if (isSelected) COLOR_ROSE else COLOR_INK)
+                        })
+                        addView(TextView(this@ProfileSubActivity).apply {
+                            text = summary
+                            textSize = 11.5f
+                            typeface = Ds.body()
+                            setTextColor(COLOR_MUTED)
+                            setPadding(0, dp(2), 0, 0)
+                        })
+                    }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                    if (isSelected) {
+                        addView(
+                            Ds.checkIcon(this@ProfileSubActivity, COLOR_ROSE, 1.7f),
+                            LinearLayout.LayoutParams(dp(15), dp(15))
+                        )
+                    }
+                    setOnClickListener {
+                        onPicked(key)
+                        dialog.dismiss()
+                    }
+                }
+                panel.addView(row, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, dp(56)
+                ))
+            }
+            dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+            dialog.setContentView(ScrollView(this@ProfileSubActivity).apply {
+                addView(panel, FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT
+                ))
+            })
+            LayoutMode.applyDialogWidth(dialog, this, maxTabletDp = 420)
+            dialog.show()
+        }
+
+        // 一级栏位：点击进入二级菜单
+        val playbackOrientation = PlayerSettingsStore.orientation(this)
+        val homeOrientation = PlayerSettingsStore.homeOrientation(this)
+        val currentQuality = PlayerSettingsStore.defaultQuality(this)
+        val autoFullscreen = PlayerSettingsStore.landscapeAutoFullscreen(this)
+        val smartFullscreen = PlayerSettingsStore.smartFullscreenByVideoRatio(this)
+
+        val orientationCard = newCard()
+        choiceRow(
+            orientationCard,
+            "播放页屏幕方向",
+            playbackOrientation.label,
+            true,
+            "进入播放页后的横竖屏锁定"
+        ) {
+            showChoiceSheet(
+                "播放页屏幕方向",
+                PlayerSettingsStore.OrientationMode.entries.map { Triple(it, it.label, it.summary) },
+                playbackOrientation
+            ) { mode ->
+                PlayerSettingsStore.setOrientation(this, mode)
+                Toast.makeText(this, "播放页：${mode.label}", Toast.LENGTH_SHORT).show()
+                renderSettings()
+            }
+        }
+        cardDivider(orientationCard)
+        choiceRow(
+            orientationCard,
+            "默认播放画质",
+            PlayerSettingsStore.QUALITY_OPTIONS.firstOrNull { it.qn == currentQuality }?.label ?: "跟随上次选择",
+            true,
+            "新打开视频时使用的画质"
+        ) {
+            showChoiceSheet(
+                "默认播放画质",
+                PlayerSettingsStore.QUALITY_OPTIONS.map { Triple(it.qn, it.label, it.summary) },
+                currentQuality
+            ) { qn ->
+                PlayerSettingsStore.setDefaultQuality(this, qn)
+                val label = PlayerSettingsStore.QUALITY_OPTIONS.firstOrNull { it.qn == qn }?.label ?: "画质"
+                Toast.makeText(this, "默认画质：$label", Toast.LENGTH_SHORT).show()
+                renderSettings()
+            }
+        }
+        cardDivider(orientationCard)
+        switchRow(
+            orientationCard,
+            "按视频比例智能全屏",
+            smartFullscreen,
+            "竖屏视频全屏不旋转，横屏视频自动横屏全屏"
+        ) { next ->
+            PlayerSettingsStore.setSmartFullscreenByVideoRatio(this, next)
+            Toast.makeText(this, if (next) "已开启智能全屏" else "已关闭智能全屏", Toast.LENGTH_SHORT).show()
+        }
+        listBox.addView(sectionHeader("播放", 12))
+        listBox.addView(orientationCard)
+        listBox.addView(hint("播放页方向设置会覆盖系统方向；智能全屏仅在「跟随系统」且竖屏时按视频比例生效。"))
+
+        val globalCard = newCard()
+        choiceRow(
+            globalCard,
+            "主页（全局）屏幕方向",
+            homeOrientation.label,
+            true,
+            "主页与列表页的横竖屏锁定"
+        ) {
+            showChoiceSheet(
+                "主页（全局）屏幕方向",
+                PlayerSettingsStore.OrientationMode.entries.map { Triple(it, it.label, it.summary) },
+                homeOrientation
+            ) { mode ->
+                PlayerSettingsStore.setHomeOrientation(this, mode)
+                Toast.makeText(this, "主页：${mode.label}", Toast.LENGTH_SHORT).show()
+                renderSettings()
+            }
+        }
+        cardDivider(globalCard)
+        switchRow(
+            globalCard,
+            "横屏进入播放页自动全屏",
+            autoFullscreen,
+            "横屏打开视频时直接进入全屏播放"
+        ) { next ->
+            PlayerSettingsStore.setLandscapeAutoFullscreen(this, next)
+            Toast.makeText(this, if (next) "已开启横屏自动全屏" else "已关闭横屏自动全屏", Toast.LENGTH_SHORT).show()
+        }
+        listBox.addView(sectionHeader("主页与全局", 18))
+        listBox.addView(globalCard)
+        listBox.addView(hint("主页方向设置退出设置后生效；自动全屏仅对播放页横屏进入时生效。"))
+
+        animateRowIn(orientationCard, 0)
+        animateRowIn(globalCard, 1)
     }
 
     private fun showDisclaimerDialog() {
@@ -2305,7 +2618,10 @@ class ProfileSubActivity : Activity() {
         cover: String,
         durationSec: Int,
         progressSec: Long?,
-        onLongClick: () -> Unit
+        onLongClick: () -> Unit,
+        aid: Long = 0L,
+        cid: Long = 0L,
+        resumeMs: Long = 0L
     ): View {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -2315,7 +2631,9 @@ class ProfileSubActivity : Activity() {
             isClickable = true
             isFocusable = true
             isLongClickable = true
-            setOnClickListener { openVideo(bvid) }
+            setOnClickListener {
+                VideoDetailActivity.open(this@ProfileSubActivity, bvid, aid, cid, resumeMs)
+            }
             setOnLongClickListener {
                 onLongClick()
                 true
@@ -2650,6 +2968,7 @@ class ProfileSubActivity : Activity() {
         const val MODE_DOWNLOADS = "downloads"
         const val MODE_SPONSOR = "sponsor"
         const val MODE_ABOUT = "about"
+        const val MODE_SETTINGS = "settings"
         private const val REQUEST_CREATE_FOLDER = 4101
     }
 }
@@ -2747,4 +3066,71 @@ private fun formatWatchTime(seconds: Int): String {
     val m = (safe % 3600) / 60
     val s = safe % 60
     return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
+}
+
+/** 与「我的」页夜间模式一致的胶囊开关（自绘，避免系统 Switch 样式割裂）。 */
+private class PillSwitch(context: Context, initial: Boolean) : View(context) {
+    var isOn: Boolean = initial
+        private set
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val density: Float = resources.displayMetrics.density
+    private val dpf: (Float) -> Float = { it * density }
+    private var progress: Float = if (initial) 1f else 0f
+    private var animator: ValueAnimator? = null
+
+    init {
+        isClickable = false
+        isFocusable = false
+    }
+
+    fun toggle() {
+        val target = !isOn
+        isOn = target
+        animator?.cancel()
+        if (MotionTokens.isReduced(context)) {
+            progress = if (target) 1f else 0f
+            invalidate()
+            return
+        }
+        val start = progress
+        animator = ValueAnimator.ofFloat(start, if (target) 1f else 0f).apply {
+            duration = 220L
+            interpolator = PathInterpolator(0.2f, 0.8f, 0.2f, 1f)
+            addUpdateListener {
+                progress = it.animatedValue as Float
+                invalidate()
+            }
+            start()
+        }
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val h = height.toFloat()
+        val w = width.toFloat()
+        val c = Ds.colors
+        val r = h / 2f
+        paint.style = Paint.Style.FILL
+        paint.color = mixColor(c.line, c.accent, progress)
+        canvas.drawRoundRect(0f, 0f, w, h, r, r, paint)
+
+        val pad = dpf(3f)
+        val knobSize = h - pad * 2f
+        val knobX = pad + (w - knobSize - pad * 2f) * progress
+        paint.color = Color.WHITE
+        canvas.drawCircle(knobX + knobSize / 2f, h / 2f, knobSize / 2f, paint)
+    }
+
+    private fun mixColor(from: Int, to: Int, t: Float): Int {
+        val fr = (from shr 16) and 0xFF
+        val fg = (from shr 8) and 0xFF
+        val fb = from and 0xFF
+        val tr = (to shr 16) and 0xFF
+        val tg = (to shr 8) and 0xFF
+        val tb = to and 0xFF
+        return Color.rgb(
+            (fr + (tr - fr) * t).toInt(),
+            (fg + (tg - fg) * t).toInt(),
+            (fb + (tb - fb) * t).toInt()
+        )
+    }
 }

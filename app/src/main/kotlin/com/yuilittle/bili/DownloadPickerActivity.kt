@@ -84,7 +84,7 @@ class DownloadPickerActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Ds.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
         window.setBackgroundDrawable(ColorDrawable(Ds.colors.bg))
         DownloadManager.init(this)
 

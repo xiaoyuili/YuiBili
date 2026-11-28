@@ -317,6 +317,135 @@ internal object VideoCardUi {
         )
     }
 
+    // ─────────────────────────────────────────────────────────
+    //  单列横条卡片（播放页「相关推荐」用）：左封面 + 右标题/UP主
+    // ─────────────────────────────────────────────────────────
+
+    data class CompactHolder(
+        val cover: ImageView,
+        val duration: TextView,
+        val title: TextView,
+        val owner: TextView,
+        val views: TextView,
+        var boundVideo: VideoItem? = null,
+    )
+
+    /**
+     * 单列横条卡片：宽度 MATCH_PARENT，不依赖写死像素宽，
+     * 因此横竖屏切换、左右栏宽度变化都能自动重排，不会错位。
+     */
+    fun createCompactRow(context: Context): LinearLayout {
+        val borderPx = Ds.hairline(context)
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = Ds.card(
+                context,
+                COLOR_CARD,
+                if (Theme.isDark) Ds.colors.lineSoft else Ds.colors.line,
+                Ds.Radius.hairline
+            )
+            Ds.clipRounded(this, Ds.Radius.hairline)
+            setPadding(context.dp(7), context.dp(6), context.dp(7), context.dp(6))
+        }
+
+        // 左侧封面：固定 16:9 小缩略图，右下角叠时长
+        val coverW = context.dp(112)
+        val coverH = context.dp(63)
+        val coverFrame = FrameLayout(context).apply {
+            setBackgroundColor(COLOR_COVER)
+            Ds.clipRounded(this, 5)
+        }
+        val cover = ImageView(context).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundColor(COLOR_COVER)
+        }
+        coverFrame.addView(
+            cover,
+            FrameLayout.LayoutParams(MATCH_PARENT_VALUE, MATCH_PARENT_VALUE)
+        )
+        val duration = TextView(context).apply {
+            textSize = 10f
+            typeface = Ds.body(true)
+            setTextColor(0xF5FFFFFF.toInt())
+            includeFontPadding = false
+            background = rounded(0xB3000000.toInt(), context.dp(3))
+            setPadding(context.dp(4), context.dp(1), context.dp(4), context.dp(1))
+        }
+        coverFrame.addView(
+            duration,
+            FrameLayout.LayoutParams(WRAP_CONTENT_VALUE, WRAP_CONTENT_VALUE, Gravity.BOTTOM or Gravity.END).apply {
+                rightMargin = context.dp(3)
+                bottomMargin = context.dp(3)
+            }
+        )
+        row.addView(coverFrame, LinearLayout.LayoutParams(coverW, coverH).apply {
+            rightMargin = context.dp(9)
+        })
+
+        // 右侧：标题（最多两行）+ UP主 · 播放量
+        val info = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+        val title = TextView(context).apply {
+            textSize = 13f
+            typeface = Ds.body(true)
+            setTextColor(COLOR_INK)
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            includeFontPadding = false
+            setLineSpacing(context.dp(1).toFloat(), 1f)
+        }
+        info.addView(title, LinearLayout.LayoutParams(MATCH_PARENT_VALUE, WRAP_CONTENT_VALUE))
+        val metaRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val owner = TextView(context).apply {
+            textSize = 10.5f
+            typeface = Ds.body()
+            setTextColor(COLOR_MUTED)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            includeFontPadding = false
+        }
+        metaRow.addView(owner, LinearLayout.LayoutParams(0, WRAP_CONTENT_VALUE, 1f))
+        val views = TextView(context).apply {
+            textSize = 10.5f
+            typeface = Ds.body()
+            setTextColor(Ds.colors.subtle)
+            maxLines = 1
+            includeFontPadding = false
+            setPadding(context.dp(6), 0, 0, 0)
+        }
+        metaRow.addView(views, LinearLayout.LayoutParams(WRAP_CONTENT_VALUE, WRAP_CONTENT_VALUE))
+        info.addView(metaRow, LinearLayout.LayoutParams(MATCH_PARENT_VALUE, WRAP_CONTENT_VALUE).apply {
+            topMargin = context.dp(5)
+        })
+        row.addView(info, LinearLayout.LayoutParams(0, WRAP_CONTENT_VALUE, 1f))
+
+        row.tag = CompactHolder(cover, duration, title, owner, views)
+        Ds.bindPressFeedback(row, 0.97f)
+        return row
+    }
+
+    fun bindCompactRow(row: LinearLayout, holder: CompactHolder, video: VideoItem) {
+        if (holder.boundVideo !== video) {
+            holder.boundVideo = video
+            holder.title.text = video.title
+            holder.owner.text = video.owner.ifBlank { "未知UP主" }
+            holder.views.text = formatViews(video.views)
+            holder.duration.text = formatDuration(video.duration)
+            row.contentDescription = "${video.title}，${video.owner}，${formatViews(video.views)}播放"
+        }
+        CoverLoader.load(
+            holder.cover,
+            video.cover,
+            animate = !holder.cover.isAttachedToWindow || holder.cover.drawable == null
+        )
+    }
+
+    private const val MATCH_PARENT_VALUE = -1
+    private const val WRAP_CONTENT_VALUE = -2
+
     /** 搜索与首页通用的多列骨架屏，支持柔和呼吸动画。 */
     fun createSkeletonLayout(
         context: Context,

@@ -155,4 +155,5 @@ internal object DanmakuSettingsStore {
             else -> 1.00f
         }
     }
+
 }

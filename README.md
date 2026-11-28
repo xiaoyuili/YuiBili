@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="app/src/main/res/drawable-xxxhdpi/ic_logo.png" width="104" height="104" alt="YuiBili Logo"/>
+  <img src="https://github.com/suqingan/YuiBili/releases/download/v1.0.1beta5/ic_logo.png" width="104" height="104" alt="YuiBili Logo"/>
 </p>
 
 <h1 align="center">YuiBili</h1>
@@ -9,18 +9,57 @@
 </p>
 
 <p align="center">
-  <img alt="版本" src="https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v1.0.0-ff8fb1?style=flat-square"/>
+  <img alt="版本" src="https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v1.0.1beta5-ff8fb1?style=flat-square"/>
   <img alt="架构" src="https://img.shields.io/badge/ABI-arm64--v8a-4c9aff?style=flat-square"/>
   <img alt="系统" src="https://img.shields.io/badge/Android-6.0%2B-6cc24a?style=flat-square"/>
 </p>
 
+<p align="center">
+  <b>本仓库为二次修改（改版）版本，由改版作者 suqingan 维护与发布</b>
+</p>
+
 ---
 
-## 账号迁移说明
+## 作者与项目来源
 
-本项目原仓库为 [https://github.com/Yui-Little/YuiBili](https://github.com/Yui-Little/YuiBili)。
+- **改版作者**：[suqingan](https://github.com/suqingan)（本仓库维护者，beta1–beta5 的改版开发者）
+- **原作者**：[xiaoyuili](https://github.com/xiaoyuili)
+- **上游项目**：[Yui-Little/YuiBili](https://github.com/Yui-Little/YuiBili) → [xiaoyuili/YuiBili](https://github.com/xiaoyuili/YuiBili)
 
-**我是该项目的原作者。由于原账号绑定的邮箱已出售导致无法继续登录，现将项目完整迁移至本账号继续维护与发布，后续版本更新均以本仓库为准。**
+本项目最初由 xiaoyuili 开发。因原账号绑定的邮箱已出售、无法继续登录，项目后续迁移至 [xiaoyuili/YuiBili](https://github.com/xiaoyuili/YuiBili) 维护发布。
+
+本仓库是在原项目基础上进行的**二次修改版本**，由 suqingan 自 v1.0.1beta1 起独立迭代，新增了直播、关注动态、消息中心、平板适配等功能，并对播放器、弹幕、设置等做了大量修复与优化。感谢原作者 xiaoyuili 的开源贡献。
+
+---
+
+## 改版更新日志
+
+### v1.0.1beta1
+- 新增屏幕方向设置、默认画质选择
+- 修复播放进度记忆（续播）
+
+### v1.0.1beta2
+- 播放页新增「相关推荐」，原地刷新不叠加页面
+- 设置页改为栏位 + 二级菜单，新增主页全局方向锁与横屏自动全屏开关
+- 修复横屏全屏需点两次、二级页面不跟随方向锁、推荐横竖屏错位等问题，并压缩安装包体积
+
+### v1.0.1beta3
+- 新增「直播」：首页直播标签、房间列表、竖屏播放器 + 弹幕列表、实时弹幕、画质切换、横屏纯画面沉浸模式
+- 底栏新增「关注动态」，支持图片与转发动态
+- 搜索页新增「视频 / 直播 / 用户」分栏
+- 修复直播画质切换（改用 v2 接口）、智能全屏、全局方向覆盖二级页等问题
+
+### v1.0.1beta4
+- 新增「消息中心」：私信、回复与@、收到喜欢、新增粉丝
+- 直播间支持左右半屏滑动调亮度 / 音量；播放时不再自动熄屏
+- 空间页显示「直播中」标签并可直接进入直播间；关注动态里开播类型改为可点击卡片
+- 修复私信头像昵称、消息时间戳（1970 年问题），支持桌面 UA + cookie 网页回复
+
+### v1.0.1beta5
+- 修复直播列表首张卡片封面未加载时点击无响应的问题
+- 弹幕列表可正常关闭
+- 同步一批细节优化：平板消息页一级化、动态缩略图布局、设置开关样式、回复@精准定位等
+- 安装包开启 R8 压缩，体积约 3.4 MB
 
 ---
 
@@ -43,9 +82,18 @@ YuiBili 追求简单、安静、顺手的看视频体验：没有广告、没有
 - 支持屏幕弹幕显示，可自由调节字号、透明度、速度、显示区域和屏蔽选项
 - 支持多 P 分集、合集连续播放、收藏夹「播放全部」
 
+### 直播与动态
+- 首页直播标签与直播中房间列表，支持滚动续页
+- 直播间竖屏播放器 + 弹幕列表、横屏纯画面沉浸播放、实时弹幕、画质切换、弹幕设置
+- 关注动态支持图片与转发类型，开播动态可直接进入直播间
+
 ### 评论与个人主页
 - 评论支持按热度 / 按时间查看、点赞、楼中楼展开，支持表情与高清长图查看保存
 - 点击 UP 主可进入个人空间，浏览全部动态与投稿，并支持在空间内单独搜索动态或视频
+
+### 消息中心
+- 私信、回复与@、收到喜欢、新增粉丝四类消息
+- 补全头像与真实昵称，按时间倒序排列，支持点击跳转到对应消息
 
 ### 下载与音频听歌模式
 - 支持单视频、合集、收藏夹与番剧分集批量下载，支持断点续传与导出到相册
@@ -87,4 +135,4 @@ YuiBili 追求简单、安静、顺手的看视频体验：没有广告、没有
 
 ---
 
-<p align="center"><sub>Maintained by xiaoyuili</sub></p>
+<p align="center"><sub>原作者 xiaoyuili · 改版作者 suqingan</sub></p>

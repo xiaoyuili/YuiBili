@@ -36,7 +36,7 @@ class FrostedBottomNavigation @JvmOverloads constructor(
     private val path = Path()
 
     private var selectedIndex = 0
-    /** 连续高亮中心：0.5f = 首页，1.5f = 我的。 */
+    /** 连续高亮中心：0.5f = 首页，1.5f = 动态，2.5f = 我的。 */
     private var frameCenter = 0.5f
     private var pressScale = 1f
     private var frameAnimation: SpringAnimation? = null
@@ -79,7 +79,7 @@ class FrostedBottomNavigation @JvmOverloads constructor(
     }
 
     fun setSelectedIndex(index: Int) {
-        if (index !in 0..1) return
+        if (index !in 0 until ITEM_COUNT) return
         selectedIndex = index
         val target = index + 0.5f
         if (abs(frameCenter - target) < 0.002f && frameAnimation?.isRunning != true) {
@@ -105,9 +105,9 @@ class FrostedBottomNavigation @JvmOverloads constructor(
         }
     }
 
-    /** 跟随页面滑动进度（0f..1f）实时同步胶囊位置与高亮权重。 */
+    /** 跟随页面滑动进度（0f..ITEM_COUNT-1）实时同步胶囊位置与高亮权重。 */
     fun setScrollProgress(progress: Float) {
-        val target = progress.coerceIn(0f, 1f) + 0.5f
+        val target = progress.coerceIn(0f, (ITEM_COUNT - 1).toFloat()) + 0.5f
         if (frameAnimation?.isRunning == true) frameAnimation?.cancel()
         if (abs(frameCenter - target) < 0.001f) return
         frameCenter = target
@@ -147,13 +147,13 @@ class FrostedBottomNavigation @JvmOverloads constructor(
         val innerPad = dp(4f)
         val contentLeft = dockBounds.left + innerPad
         val contentWidth = (dockBounds.width() - innerPad * 2f).coerceAtLeast(1f)
-        val itemWidth = contentWidth / 2f
+        val itemWidth = contentWidth / ITEM_COUNT
         val cy = dockBounds.centerY()
 
         // 选中项柔粉胶囊指示器
         drawPillIndicator(canvas, contentLeft + itemWidth * frameCenter, itemWidth, dockBounds.height() - innerPad * 2f, cy)
 
-        for (item in 0..1) {
+        for (item in 0 until ITEM_COUNT) {
             val centerX = contentLeft + itemWidth * (item + 0.5f)
             val dist = abs(frameCenter - (item + 0.5f))
             val activeWeight = (1f - dist * 2f).coerceIn(0f, 1f)
@@ -202,7 +202,11 @@ class FrostedBottomNavigation @JvmOverloads constructor(
         iconPaint.strokeJoin = Paint.Join.ROUND
         iconPaint.strokeWidth = (1.6f + 0.35f * activeWeight) * density
         iconPaint.color = mixColor(c.muted, c.accent, activeWeight)
-        if (item == 0) drawHomeIcon(canvas, x, y) else drawProfileIcon(canvas, x, y)
+        when (item) {
+            0 -> drawHomeIcon(canvas, x, y)
+            1 -> drawDynamicIcon(canvas, x, y)
+            else -> drawProfileIcon(canvas, x, y)
+        }
     }
 
     private fun drawLabel(
@@ -219,7 +223,20 @@ class FrostedBottomNavigation @JvmOverloads constructor(
         labelPaint.textSize = 10f * resources.displayMetrics.scaledDensity
         labelPaint.typeface = Ds.body(active)
         labelPaint.color = mixColor(c.muted, c.accent, activeWeight)
-        canvas.drawText(if (item == 0) "首页" else "我的", x, y, labelPaint)
+        canvas.drawText(LABELS[item], x, y, labelPaint)
+    }
+
+    /** 动态：闪电轮廓，呼应「关注动态」的信息流语义。 */
+    private fun drawDynamicIcon(canvas: Canvas, x: Float, y: Float) {
+        path.rewind()
+        path.moveTo(x + dp(1.6f), y - dp(6.6f))
+        path.lineTo(x - dp(4.2f), y + dp(1.2f))
+        path.lineTo(x - dp(0.6f), y + dp(1.2f))
+        path.lineTo(x - dp(1.6f), y + dp(6.6f))
+        path.lineTo(x + dp(4.2f), y - dp(1.2f))
+        path.lineTo(x + dp(0.6f), y - dp(1.2f))
+        path.close()
+        canvas.drawPath(path, iconPaint)
     }
 
     private fun drawHomeIcon(canvas: Canvas, x: Float, y: Float) {
@@ -333,11 +350,11 @@ class FrostedBottomNavigation @JvmOverloads constructor(
     private fun itemAt(x: Float): Int {
         val contentLeft = dp(8f)
         val contentWidth = (width - contentLeft * 2f).coerceAtLeast(1f)
-        return (((x - contentLeft) / (contentWidth / 2f)).toInt()).coerceIn(0, 1)
+        return (((x - contentLeft) / (contentWidth / ITEM_COUNT)).toInt()).coerceIn(0, ITEM_COUNT - 1)
     }
 
     private fun selectDestination(destination: Int) {
-        if (destination !in 0..1 || destination == selectedIndex) return
+        if (destination !in 0 until ITEM_COUNT || destination == selectedIndex) return
         destinationListener?.invoke(destination) ?: setSelectedIndex(destination)
     }
 
@@ -367,6 +384,9 @@ class FrostedBottomNavigation @JvmOverloads constructor(
     private fun dp(value: Float): Float = value * density
 
     private companion object {
+        const val ITEM_COUNT = 3
+        val LABELS = arrayOf("首页", "动态", "我的")
+
         val FRAME_CENTER = object : androidx.dynamicanimation.animation.FloatPropertyCompat<FrostedBottomNavigation>("frameCenter") {
             override fun getValue(target: FrostedBottomNavigation): Float = target.frameCenter
             override fun setValue(target: FrostedBottomNavigation, value: Float) {

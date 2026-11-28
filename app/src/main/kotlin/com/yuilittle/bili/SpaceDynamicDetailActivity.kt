@@ -63,7 +63,7 @@ class SpaceDynamicDetailActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
 
         val parsed = readDynamicFromIntent(intent)
         if (parsed == null) {

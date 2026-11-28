@@ -18,7 +18,10 @@ import android.widget.GridView
 import android.widget.LinearLayout
 import android.widget.TextView
 import okhttp3.Call
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.drawable.GradientDrawable
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -26,15 +29,21 @@ import java.util.Locale
 import java.util.TimeZone
 
 class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bundle?) : LinearLayout(context) {
-    private val tabs = arrayOfNulls<TextView>(2)
+    private val tabs = arrayOfNulls<TextView>(3)
     private val panels = arrayOfNulls<FeedPanel>(2)
+    /** 直播 tab 独立面板：数据结构与视频 Feed 不同，不共用 FeedPanel。 */
+    private var livePanel: LiveFeedPanel? = null
     private lateinit var headerRow: View
     private lateinit var tabIndicator: View
     private var selectedTab = restoredState?.getInt(STATE_SELECTED_TAB, TAB_RECOMMEND)
-        ?.coerceIn(TAB_RECOMMEND, TAB_POPULAR) ?: TAB_RECOMMEND
+        ?.coerceIn(TAB_RECOMMEND, TAB_LIVE) ?: TAB_RECOMMEND
     private var active = false
     private var headerCollapsed = false
-    private val warmOtherTab = Runnable { if (active) panels[1 - selectedTab]?.warmTabInBackground() }
+    private val warmOtherTab = Runnable {
+        if (!active) return@Runnable
+        if (selectedTab == TAB_LIVE) livePanel?.prepareVisible()
+        else panels[1 - selectedTab]?.warmTabInBackground()
+    }
     private var entrancePlayed = false
 
     private val isTabletLayout = LayoutMode.isTablet
@@ -94,6 +103,7 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
                 panels[tab] = panel
                 pager.addPage(panel)
             }
+            livePanel = LiveFeedPanel(context).also { pager.addPage(it) }
             pager.showPage(selectedTab, animate = false)
             host.addView(pager, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -117,6 +127,13 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
                     FrameLayout.LayoutParams.MATCH_PARENT
                 ))
             }
+            livePanel = LiveFeedPanel(context).apply {
+                visibility = if (selectedTab == TAB_LIVE) View.VISIBLE else View.GONE
+            }
+            host.addView(livePanel, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ))
         }
         addView(host, LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
         selectTab(selectedTab)
@@ -129,19 +146,30 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
     }
 
     private fun syncTabletTabIndicatorProgress(progress: Float) {
-        val t0 = tabs[0] ?: return
-        val t1 = tabs[1] ?: return
-        val stripLeft = (t0.parent as? View)?.left ?: 0
-        val x0 = (stripLeft + t0.left + (t0.width - tabIndicator.width) / 2f).coerceAtLeast(0f)
-        val x1 = (stripLeft + t1.left + (t1.width - tabIndicator.width) / 2f).coerceAtLeast(0f)
+        val p = progress.coerceIn(0f, TAB_LIVE.toFloat())
+        val lower = kotlin.math.floor(p).toInt().coerceIn(TAB_RECOMMEND, TAB_LIVE)
+        val upper = (lower + 1).coerceAtMost(TAB_LIVE)
+        val fraction = if (upper == lower) 0f else p - lower
+        val x0 = tabCenterX(lower) ?: return
+        val x1 = tabCenterX(upper) ?: x0
         (tabIndicator.getTag(R.id.ds_spring_tx) as? androidx.dynamicanimation.animation.SpringAnimation)?.cancel()
-        tabIndicator.translationX = x0 + (x1 - x0) * progress.coerceIn(0f, 1f)
+        tabIndicator.translationX = x0 + (x1 - x0) * fraction
+    }
+
+    /** 指定 tab 的胶囊指示器中心 X（相对 tabIndicator 父容器）。 */
+    private fun tabCenterX(index: Int): Float? {
+        val tab = tabs[index] ?: return null
+        val stripLeft = (tab.parent as? View)?.left ?: 0
+        return (stripLeft + tab.left + (tab.width - tabIndicator.width) / 2f).coerceAtLeast(0f)
     }
 
     private fun syncTabletTopButton() {
         val btn = tabletTopButton ?: return
-        val panel = panels[selectedTab] ?: return
-        val firstVisible = panel.firstVisibleRowPosition()
+        val firstVisible = if (selectedTab == TAB_LIVE) {
+            livePanel?.firstVisibleRowPosition() ?: 0
+        } else {
+            panels[selectedTab]?.firstVisibleRowPosition() ?: return
+        }
         btn.setShown(nextScrollTopVisible(btn.visibility == View.VISIBLE, firstVisible, showAt = 4, hideAt = 1))
     }
 
@@ -153,6 +181,19 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
             rightMargin = dp(Ds.Space.md)
         })
         addView(createSearchBar(), LayoutParams(0, dp(SEARCH_BOX_HEIGHT_DP), 1f))
+        addView(createMessageEntry(), LayoutParams(dp(40), dp(40)).apply {
+            leftMargin = dp(6)
+        })
+    }
+
+    /** 右上角消息入口：信封图标，点击进入消息中心。 */
+    private fun createMessageEntry(): View = FrameLayout(context).apply {
+        isClickable = true
+        isFocusable = true
+        contentDescription = "消息"
+        Ds.bindPressFeedback(this, 0.92f)
+        addView(MessageEnvelopeIcon(context, COLOR_MUTED), FrameLayout.LayoutParams(dp(21), dp(21), Gravity.CENTER))
+        setOnClickListener { MessageCenterActivity.open(context) }
     }
 
     private fun createSearchBar(): View = LinearLayout(context).apply {
@@ -203,7 +244,7 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
             fillColor = Ds.colors.accentSoft
         }
         addView(tabIndicator, FrameLayout.LayoutParams(dp(74), dp(30), Gravity.CENTER_VERTICAL or Gravity.START))
-        listOf("推荐", "热门").forEachIndexed { index, label ->
+        listOf("推荐", "热门", "直播").forEachIndexed { index, label ->
             val tab = TextView(context).apply {
                 text = label
                 textSize = 15f
@@ -215,7 +256,7 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
             }
             tabs[index] = tab
             strip.addView(tab, LinearLayout.LayoutParams(dp(74), LinearLayout.LayoutParams.MATCH_PARENT).apply {
-                if (index == TAB_POPULAR) leftMargin = dp(Ds.Space.sm)
+                if (index > 0) leftMargin = dp(Ds.Space.sm)
             })
         }
         addView(strip, FrameLayout.LayoutParams(
@@ -238,23 +279,24 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
         if (active == value) return
         active = value
         if (value) {
-            panels[selectedTab]?.activate()
+            activatePanel(selectedTab)
             postDelayed(warmOtherTab, 350L)
         } else {
             removeCallbacks(warmOtherTab)
-            val panel = panels[selectedTab]
-            panel?.pauseRequests()
+            videoPanel(selectedTab)?.pauseRequests()
         }
     }
 
     /** 预热与恢复封面加载，避免首页作为相邻页被拖出/切回时出现空白或滞后。 */
     fun prepareVisible() {
-        panels[selectedTab]?.prepareVisible()
+        if (selectedTab == TAB_LIVE) livePanel?.prepareVisible()
+        else panels[selectedTab]?.prepareVisible()
     }
 
     /** 当前选中的首页 Tab 快速平滑回顶；已在顶部时返回 false（静默不响应）。 */
     fun scrollToTop(): Boolean {
         setHeaderCollapsed(false)
+        if (selectedTab == TAB_LIVE) return livePanel?.scrollToTop() == true
         return panels[selectedTab]?.scrollToTop() == true
     }
 
@@ -302,17 +344,17 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
     }
 
     private fun selectTab(tab: Int, fromPager: Boolean = false) {
-        if (tab !in 0..1) return
+        if (tab !in TAB_RECOMMEND..TAB_LIVE) return
         val previous = selectedTab
         val changed = previous != tab
         selectedTab = tab
         if (changed) {
-            panels[previous]?.cancelScrollToTop()
-            if (panels[tab]?.isAtTop() == true) {
+            videoPanel(previous)?.cancelScrollToTop()
+            if (videoPanel(tab)?.isAtTop() == true) {
                 setHeaderCollapsed(false)
             }
         }
-        for (index in 0..1) {
+        for (index in TAB_RECOMMEND..TAB_LIVE) {
             tabs[index]?.let { label ->
                 val selected = index == tab
                 label.setTextColor(if (selected) COLOR_ROSE else COLOR_MUTED)
@@ -331,18 +373,36 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
                 tabletFeedPager?.showPage(tab, animate = changed && !MotionTokens.isReduced(context))
             }
             moveTabIndicator(tab, animate = changed)
-            if (changed) panels[previous]?.pauseRequests()
-            if (active) panels[tab]?.activate()
+            if (changed) videoPanel(previous)?.pauseRequests()
+            if (active) activatePanel(tab)
             syncTabletTopButton()
             return
         }
         moveTabIndicator(tab, animate = changed)
         if (changed) {
-            panels[previous]?.pauseRequests()
-            animatePanelTransition(previous, tab)
-        } else panels[tab]?.visibility = View.VISIBLE
-        if (active) panels[tab]?.activate()
+            videoPanel(previous)?.pauseRequests()
+            if (previous == TAB_LIVE || tab == TAB_LIVE) {
+                // 直播面板是 GridView，参与位移动画会被裁出可视区，直接显隐更稳。
+                videoPanel(previous)?.visibility = View.GONE
+                videoPanel(tab)?.visibility = View.VISIBLE
+                livePanel?.visibility = if (tab == TAB_LIVE) View.VISIBLE else View.GONE
+            } else {
+                livePanel?.visibility = View.GONE
+                animatePanelTransition(previous, tab)
+            }
+        } else {
+            videoPanel(tab)?.visibility = View.VISIBLE
+            livePanel?.visibility = if (tab == TAB_LIVE) View.VISIBLE else View.GONE
+        }
+        if (active) activatePanel(tab)
     }
+
+    private fun activatePanel(tab: Int) {
+        if (tab == TAB_LIVE) livePanel?.activate() else videoPanel(tab)?.activate()
+    }
+
+    /** panels 只存视频 Feed（0/1），直播 tab 越界时安全返回 null。 */
+    private fun videoPanel(tab: Int): FeedPanel? = panels.getOrNull(tab)
 
     private fun moveTabIndicator(tab: Int, animate: Boolean) {
         val target = tabs[tab] ?: return
@@ -1268,6 +1328,7 @@ class HomeFeedView(context: Context, refreshOnEntry: Boolean, restoredState: Bun
     private companion object {
         const val TAB_RECOMMEND = 0
         const val TAB_POPULAR = 1
+        const val TAB_LIVE = 2
         const val CARD_SPACING_DP = 5
         const val CARD_SHADOW_INSET_DP = 2
         const val SEARCH_BOX_WIDTH_DP = 224
@@ -1453,4 +1514,44 @@ private val publishedDateFormat = object : ThreadLocal<SimpleDateFormat>() {
 internal fun formatPublishedDate(epochSeconds: Long): String {
     if (epochSeconds <= 0L) return "日期未知"
     return requireNotNull(publishedDateFormat.get()).format(Date(epochSeconds * 1_000L))
+}
+
+/** 顶栏消息入口的信封图标（描边风格，与侧栏图标保持同一套线条语言）。 */
+private class MessageEnvelopeIcon(context: Context, private val tint: Int) : View(context) {
+    private val d = resources.displayMetrics.density
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.7f * d
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val path = Path()
+
+    override fun onDraw(canvas: Canvas) {
+        paint.color = tint
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val l = 1.6f * d
+        val t = 3.2f * d
+        val r = w - 1.6f * d
+        val b = h - 3.2f * d
+        val rad = 2.4f * d
+        path.rewind()
+        path.moveTo(l + rad, t)
+        path.lineTo(r - rad, t)
+        path.quadTo(r, t, r, t + rad)
+        path.lineTo(r, b - rad)
+        path.quadTo(r, b, r - rad, b)
+        path.lineTo(l + rad, b)
+        path.quadTo(l, b, l, b - rad)
+        path.lineTo(l, t + rad)
+        path.quadTo(l, t, l + rad, t)
+        path.close()
+        canvas.drawPath(path, paint)
+        path.rewind()
+        path.moveTo(l + 0.9f * d, t + 0.9f * d)
+        path.lineTo(w * 0.5f, t + (b - t) * 0.62f)
+        path.lineTo(r - 0.9f * d, t + 0.9f * d)
+        canvas.drawPath(path, paint)
+    }
 }

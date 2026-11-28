@@ -19,7 +19,16 @@ import java.util.concurrent.atomic.AtomicInteger
 
 enum class FollowState { FOLLOWED, NOT_FOLLOWED, UNKNOWN, SELF }
 
-enum class DynamicKind { TEXT, IMAGE, VIDEO, UNKNOWN }
+enum class DynamicKind { TEXT, IMAGE, VIDEO, LIVE, UNKNOWN }
+
+/** 动态里的直播开播信息（MAJOR_TYPE_LIVE_RCMD / LIVE）。 */
+data class DynamicLive(
+    val roomId: Long,
+    val title: String,
+    val cover: String,
+    val areaName: String,
+    val onlineText: String
+)
 
 data class SpaceHeader(
     val mid: Long,
@@ -85,7 +94,9 @@ data class SpaceDynamic(
     val title: String? = null,
     val commentOid: String? = null,
     val commentType: Int? = null,
-    val supportsDetail: Boolean = false
+    val supportsDetail: Boolean = false,
+    /** 直播开播动态的直播间信息，kind == LIVE 时非空。 */
+    val live: DynamicLive? = null
 )
 
 data class DynamicSearchCheckpoint(
@@ -385,6 +396,56 @@ object BiliSpaceApi {
             }
         }
         return req
+    }
+
+    /** 拉取「关注」动态流（需登录）。游标 offset 由上一页返回，空串表示首页。 */
+    internal fun fetchFollowingDynamics(
+        offset: String = "",
+        callback: (CursorPage<SpaceDynamic>?, String?) -> Unit
+    ): BiliRequest {
+        val req = BiliRequest()
+        if (!BiliSessionStore.isLoggedIn()) {
+            mainHandler.post { if (!req.cancelled) callback(null, "登录后可查看关注动态") }
+            return req
+        }
+        checkRiskCooldown()?.let { msg ->
+            mainHandler.post { if (!req.cancelled) callback(null, msg) }
+            return req
+        }
+        val cleanOffset = offset.trim()
+        executeSpace(req, onRejected = { callback(null, "请求过于频繁，请稍后再试") }) {
+            try {
+                val page = fetchFollowingDynamicPageBlocking(cleanOffset, req)
+                if (req.cancelled) return@executeSpace
+                mainHandler.post { if (!req.cancelled) callback(page, null) }
+            } catch (error: Exception) {
+                if (!req.cancelled) {
+                    mainHandler.post { if (!req.cancelled) callback(null, readableSpaceError(error)) }
+                }
+            }
+        }
+        return req
+    }
+
+    private fun fetchFollowingDynamicPageBlocking(offset: String, req: BiliRequest): CursorPage<SpaceDynamic> {
+        val params = LinkedHashMap<String, String>().apply {
+            put("type", "all")
+            put("page", "1")
+            if (offset.isNotEmpty()) put("offset", offset)
+            put("timezone_offset", "-480")
+            put("platform", "web")
+            put("features", DYNAMIC_FEATURES)
+            put("web_location", "333.999")
+        }
+        // feed/all 对部分账号会校验 WBI；签名失败时退回普通查询，避免整页不可用。
+        val query = runCatching { BiliWbiSign.signParams(params) }.getOrElse { encodeQuery(params) }
+        val url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all?$query"
+        val root = getSpaceJson(url, "https://t.bilibili.com/", req)
+        val code = root.optInt("code", -1)
+        if (code != 0) {
+            throw BiliCodeException(code, readableBiliCode(code, root.optString("message")))
+        }
+        return parseDynamicFeedPage(root)
     }
 
     /** 拉取单条动态详情（/x/polymer/web-dynamic/v1/detail），用于详情页补齐全文、title 与 comment_id_str / comment_type。 */
@@ -1107,6 +1168,7 @@ object BiliSpaceApi {
         var video: SpaceVideo? = null
         var jumpUrl: String? = null
         var opusTitle: String? = null
+        var live: DynamicLive? = null
 
         val kind: DynamicKind
         when {
@@ -1182,6 +1244,14 @@ object BiliSpaceApi {
                 }
                 kind = if (video != null) DynamicKind.VIDEO else DynamicKind.UNKNOWN
             }
+            majorType == "MAJOR_TYPE_LIVE_RCMD" || majorType == "MAJOR_TYPE_LIVE" -> {
+                // 开播动态：解析直播间信息，卡片改为「xxx 开启了直播」并给一键进入直播间入口
+                live = major?.let { parseDynamicLive(it) }
+                kind = if (live != null) DynamicKind.LIVE else DynamicKind.UNKNOWN
+                if (live != null && text.isBlank()) {
+                    text = "${authorName ?: "TA"} 开启了直播"
+                }
+            }
             typeStr == "DYNAMIC_TYPE_WORD" || major == null -> {
                 kind = DynamicKind.TEXT
             }
@@ -1243,7 +1313,43 @@ object BiliSpaceApi {
             title = opusTitle,
             commentOid = resolvedCommentOid,
             commentType = resolvedCommentType,
-            supportsDetail = supportsDynamicDetail
+            supportsDetail = supportsDynamicDetail,
+            live = live
+        )
+    }
+
+    /** 解析开播动态里的直播间信息；兼容 live_rcmd 的 JSON 字符串与 live 对象两种下发。 */
+    private fun parseDynamicLive(major: JSONObject): DynamicLive? {
+        val holder = major.optJSONObject("live_rcmd") ?: major.optJSONObject("live")
+        val raw = holder?.optSafeString("content").orEmpty()
+        val payload = if (raw.startsWith("{")) {
+            runCatching { JSONObject(raw) }.getOrNull()
+        } else {
+            null
+        }
+        val info = payload?.optJSONObject("live_play_info") ?: payload ?: holder
+        val roomId = info?.optNullableLong("room_id")
+            ?: info?.optNullableLong("roomid")
+            ?: holder?.optNullableLong("room_id")
+            ?: 0L
+        if (roomId <= 0L) return null
+        val title = cleanHtml(info?.optSafeString("title").orEmpty())
+        val cover = normalizeUrl(
+            info?.optSafeString("cover").orEmpty().ifBlank {
+                info?.optSafeString("cover_from_user").orEmpty()
+            }
+        )
+        val area = cleanHtml(info?.optSafeString("area_name").orEmpty())
+        val watched = info?.optJSONObject("watched_show")
+        val online = watched?.optSafeString("text_large").orEmpty()
+            .ifBlank { watched?.optSafeString("text_small").orEmpty() }
+            .ifBlank { info?.optNullableLong("online")?.let(::formatNullableCount).orEmpty() }
+        return DynamicLive(
+            roomId = roomId,
+            title = title,
+            cover = cover,
+            areaName = area,
+            onlineText = online
         )
     }
 

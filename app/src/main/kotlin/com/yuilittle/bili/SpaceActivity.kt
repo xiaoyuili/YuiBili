@@ -35,6 +35,8 @@ class SpaceActivity : Activity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var headerRequest: BiliRequest? = null
+    private var liveStatusRequest: BiliRequest? = null
+    private var currentLiveStatus: LiveRoomStatus? = null
     private var dynamicRequest: BiliRequest? = null
     private var videoRequest: BiliRequest? = null
     private var followInFlight = false
@@ -98,7 +100,7 @@ class SpaceActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
         isTabletSplit = LayoutMode.isWideScreen(this)
 
         mid = intent.getLongExtra(EXTRA_MID, 0L)
@@ -138,6 +140,7 @@ class SpaceActivity : Activity() {
                 }
             }
             onFollowClick = { handleFollowTap() }
+            onLiveClick = { openLiveRoom() }
             onFeedback = { msg -> showFeedback(msg) }
         }
 
@@ -660,6 +663,7 @@ class SpaceActivity : Activity() {
         if (currentHeader == null || activeTab == 0) {
             loadHeader(forceRefresh = true)
         }
+        loadLiveStatus(force = true)
     }
 
     private fun updateTabSortChip() {
@@ -682,6 +686,8 @@ class SpaceActivity : Activity() {
                 bindHeader(header)
             } else if (error != null && currentHeader == null) {
                 showFeedback(error)
+                // 资料头失败时直播状态也不会有结果，避免按钮长期停在「查询中…」
+                heroCard.renderLiveState(live = false)
             }
         }
     }
@@ -694,6 +700,41 @@ class SpaceActivity : Activity() {
             CoverLoader.load(topBarAvatar, face, cropThumb = false, thumbEdge = 96, animate = false)
         }
         heroCard.bindHeader(header, initialFace)
+        // 直播状态与资料头分开请求：直播接口偶发失败不应影响资料展示。
+        if (currentLiveStatus == null) loadLiveStatus()
+    }
+
+    private fun loadLiveStatus(force: Boolean = false) {
+        if (mid <= 0L) return
+        if (!force && liveStatusRequest != null) return
+        liveStatusRequest?.cancel()
+        heroCard.renderLiveState(live = currentLiveStatus?.live == true, checking = currentLiveStatus == null)
+        liveStatusRequest = LiveApi.fetchRoomStatus(mid) { status, _ ->
+            if (isFinishing || isDestroyed) return@fetchRoomStatus
+            currentLiveStatus = status
+            heroCard.renderLiveState(live = status?.live == true)
+        }
+    }
+
+    private fun openLiveRoom() {
+        val status = currentLiveStatus
+        if (status == null || !status.live || status.roomId <= 0L) {
+            showFeedback("主播暂未开播")
+            return
+        }
+        LiveRoomActivity.open(
+            this,
+            LiveRoom(
+                roomId = status.roomId,
+                uid = mid,
+                title = status.title,
+                owner = currentHeader?.name.orEmpty(),
+                cover = status.cover,
+                face = currentHeader?.face.orEmpty(),
+                areaName = "",
+                online = status.online
+            )
+        )
     }
 
     private fun handleFollowTap() {
@@ -1022,6 +1063,7 @@ class SpaceActivity : Activity() {
 
     override fun onDestroy() {
         headerRequest?.cancel()
+        liveStatusRequest?.cancel()
         dynamicRequest?.cancel()
         videoRequest?.cancel()
         dynamicTopScroller?.cancel()

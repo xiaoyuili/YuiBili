@@ -440,10 +440,13 @@ internal class SpaceHeroCard(context: Context) : FrameLayout(context) {
 
     var onAvatarClick: (() -> Unit)? = null
     var onFollowClick: (() -> Unit)? = null
+    var onLiveClick: (() -> Unit)? = null
     var onFeedback: ((String) -> Unit)? = null
 
     private val avatar: ImageView
     private val nameView: TextView
+    private val liveTag: TextView
+    private val liveBtn: TextView
     private val levelBadge: TextView
     private val vipBadge: TextView
     private val uidChip: TextView
@@ -512,8 +515,33 @@ internal class SpaceHeroCard(context: Context) : FrameLayout(context) {
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             includeFontPadding = false
+            // 昵称后要紧跟「直播中」标签，限制最大宽度避免长昵称把标签挤出屏幕。
+            maxWidth = context.dp(176)
         }
-        identityCol.addView(nameView, LinearLayout.LayoutParams(
+        // 昵称行：昵称 + 开播标签（未开播时标签隐藏）
+        val nameRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        nameRow.addView(nameView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        liveTag = TextView(context).apply {
+            text = "直播中"
+            textSize = 10f
+            typeface = Ds.body(bold = true)
+            setTextColor(0xFFFFFFFF.toInt())
+            background = Ds.pill(context, COLOR_ROSE)
+            setPadding(context.dp(6), context.dp(2), context.dp(6), context.dp(2))
+            includeFontPadding = false
+            visibility = GONE
+        }
+        nameRow.addView(liveTag, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { leftMargin = context.dp(6) })
+        identityCol.addView(nameRow, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ))
@@ -578,6 +606,27 @@ internal class SpaceHeroCard(context: Context) : FrameLayout(context) {
         ).apply { topMargin = context.dp(7) })
 
         topRow.addView(identityCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        // 关注按钮左侧：进入直播间（仅主播开播时可点，未开播置灰提示）
+        liveBtn = TextView(context).apply {
+            text = "进入直播间"
+            textSize = 10.5f
+            typeface = Ds.body(bold = true)
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            setPadding(context.dp(8), context.dp(7), context.dp(8), context.dp(7))
+            isClickable = true
+            isFocusable = true
+            Ds.bindPressFeedback(this, 0.94f)
+            setOnClickListener {
+                if (isEnabled) onLiveClick?.invoke() else onFeedback?.invoke("主播暂未开播")
+            }
+        }
+        renderLiveState(live = false)
+        topRow.addView(liveBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { rightMargin = context.dp(8) })
 
         followBtn = TextView(context).apply {
             textSize = 12.5f
@@ -715,6 +764,23 @@ internal class SpaceHeroCard(context: Context) : FrameLayout(context) {
         )
     }
 
+    /**
+     * 直播状态渲染：开播时昵称后显示「直播中」，进入直播间按钮点亮；
+     * 未开播或查询失败时按钮置灰，点击只提示不跳转。
+     */
+    fun renderLiveState(live: Boolean, checking: Boolean = false) {
+        liveTag.visibility = if (live) VISIBLE else GONE
+        liveBtn.isEnabled = live
+        liveBtn.alpha = if (live) 1f else 0.6f
+        liveBtn.setTextColor(if (live) COLOR_ROSE else COLOR_MUTED)
+        liveBtn.background = if (live) {
+            Ds.pill(context, COLOR_ROSE_SOFT)
+        } else {
+            Ds.pill(context, COLOR_SOFT_FILL)
+        }
+        liveBtn.text = if (checking) "查询中…" else "进入直播间"
+    }
+
     fun bindPlaceholder(mid: Long, initialName: String, initialFace: String) {
         currentMid = mid
         nameView.text = initialName.ifBlank { "加载中…" }
@@ -723,6 +789,7 @@ internal class SpaceHeroCard(context: Context) : FrameLayout(context) {
             CoverLoader.load(avatar, initialFace, cropThumb = false, thumbEdge = 180, animate = false)
         }
         followBtn.visibility = GONE
+        renderLiveState(live = false, checking = true)
     }
 
     fun bindHeader(header: SpaceHeader, fallbackFace: String = "") {

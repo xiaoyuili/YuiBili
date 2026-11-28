@@ -28,11 +28,13 @@ internal class TabletRailNav(
         const val RAIL_WIDTH_DP = 78
         const val DEST_HOME = 0
         const val DEST_SEARCH = 1
-        const val DEST_DOWNLOADS = 2
-        const val DEST_FAVORITES = 3
-        const val DEST_HISTORY = 4
-        const val DEST_PROFILE = 5
-        const val DEST_COUNT = 6
+        const val DEST_DYNAMIC = 2
+        const val DEST_DOWNLOADS = 3
+        const val DEST_FAVORITES = 4
+        const val DEST_HISTORY = 5
+        const val DEST_MESSAGE = 6
+        const val DEST_PROFILE = 7
+        const val DEST_COUNT = 8
     }
 
     private var selectedDest = DEST_HOME
@@ -68,14 +70,16 @@ internal class TabletRailNav(
 
         addNavItem(DEST_HOME, RailItemView.KIND_HOME, "首页", topDp = 0)
         addNavItem(DEST_SEARCH, RailItemView.KIND_SEARCH, "搜索")
+        addNavItem(DEST_DYNAMIC, RailItemView.KIND_DYNAMIC, "动态")
         addNavItem(DEST_DOWNLOADS, RailItemView.KIND_DOWNLOAD, "下载")
         addNavItem(DEST_FAVORITES, RailItemView.KIND_FAVORITE, "收藏")
         addNavItem(DEST_HISTORY, RailItemView.KIND_HISTORY, "历史")
 
-        // 弹性留白：将「我的」置于「夜间模式」正上方
+        // 弹性留白：将「消息 / 我的」置于「夜间模式」正上方
         addView(View(context), LayoutParams(0, 0, 1f))
 
-        addNavItem(DEST_PROFILE, RailItemView.KIND_PROFILE, "我的", topDp = 0)
+        addNavItem(DEST_MESSAGE, RailItemView.KIND_MESSAGE, "消息", topDp = 0)
+        addNavItem(DEST_PROFILE, RailItemView.KIND_PROFILE, "我的")
 
         val themeBtn = FrameLayout(context).apply {
             background = Ds.card(context, c.surfaceRaised, c.lineSoft, Ds.Radius.control, Ds.hairline(context))
@@ -113,6 +117,8 @@ internal class TabletRailNav(
             const val KIND_FAVORITE = 3
             const val KIND_HISTORY = 4
             const val KIND_PROFILE = 5
+            const val KIND_DYNAMIC = 6
+            const val KIND_MESSAGE = 7
         }
 
         private val iconView: RailIconCanvas
@@ -243,6 +249,18 @@ internal class TabletRailNav(
                     path.lineTo(cx + 2.8f * d, cy + 1.8f * d)
                     canvas.drawPath(path, paint)
                 }
+                RailItemView.KIND_DYNAMIC -> {
+                    // 闪电轮廓：与手机底栏「动态」图标保持一致
+                    path.rewind()
+                    path.moveTo(cx + 1.6f * d, cy - 6.6f * d)
+                    path.lineTo(cx - 4.2f * d, cy + 1.2f * d)
+                    path.lineTo(cx - 0.6f * d, cy + 1.2f * d)
+                    path.lineTo(cx - 1.6f * d, cy + 6.6f * d)
+                    path.lineTo(cx + 4.2f * d, cy - 1.2f * d)
+                    path.lineTo(cx + 0.6f * d, cy - 1.2f * d)
+                    path.close()
+                    canvas.drawPath(path, paint)
+                }
                 RailItemView.KIND_PROFILE -> {
                     canvas.drawCircle(cx, cy - 3.4f * d, 3.0f * d, paint)
                     path.rewind()
@@ -252,6 +270,31 @@ internal class TabletRailNav(
                         cx + 5.4f * d, cy + 1.2f * d,
                         cx + 6.0f * d, cy + 6.2f * d
                     )
+                    canvas.drawPath(path, paint)
+                }
+                RailItemView.KIND_MESSAGE -> {
+                    // 信封轮廓 + 封口折线
+                    val left = cx - 6.4f * d
+                    val right = cx + 6.4f * d
+                    val top = cy - 4.6f * d
+                    val bottom = cy + 4.6f * d
+                    val corner = 1.4f * d
+                    path.rewind()
+                    path.moveTo(left + corner, top)
+                    path.lineTo(right - corner, top)
+                    path.quadTo(right, top, right, top + corner)
+                    path.lineTo(right, bottom - corner)
+                    path.quadTo(right, bottom, right - corner, bottom)
+                    path.lineTo(left + corner, bottom)
+                    path.quadTo(left, bottom, left, bottom - corner)
+                    path.lineTo(left, top + corner)
+                    path.quadTo(left, top, left + corner, top)
+                    path.close()
+                    canvas.drawPath(path, paint)
+                    path.rewind()
+                    path.moveTo(left + 0.4f * d, top + 0.9f * d)
+                    path.lineTo(cx, cy + 1.2f * d)
+                    path.lineTo(right - 0.4f * d, top + 0.9f * d)
                     canvas.drawPath(path, paint)
                 }
             }

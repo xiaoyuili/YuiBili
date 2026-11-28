@@ -12,7 +12,6 @@ import android.content.Context
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.BitmapShader
 import android.graphics.Canvas
@@ -141,6 +140,14 @@ class VideoDetailActivity : Activity() {
     private var currentCid = 0L
     private var detailRequest: BiliRequest? = null
     private var detailGeneration = 0
+    /** 播放页右侧「相关推荐」：在途请求 + 代号，切视频时作废旧回调，避免叠加/串数据。 */
+    private var relatedRequest: BiliRequest? = null
+    private var relatedGeneration = 0
+    /** 缓存最近一次推荐列表与容器，横竖屏切换后按新宽度重排，避免卡片错位。 */
+    private var lastRelatedVideos: List<VideoItem>? = null
+    private var relatedGridRef: LinearLayout? = null
+    /** 单 Activity 内的「上一个视频」导航栈：点相关推荐原地刷新，一次返回回到上层。 */
+    private val videoBackStack = ArrayDeque<Triple<String, Long, Long>>()
     private var detailResponse: Pair<VideoItem, List<VideoPart>>? = null
     private var detailSession = ""
     /** 本地下载文件播放模式：支持音视频播放、离线合集分集列表、4 种播放模式。 */
@@ -170,6 +177,8 @@ class VideoDetailActivity : Activity() {
     /** 切集请求进行中 currentDetail 会置空，用该缓存保证抽屉仍可展开。 */
     private var cachedSeason: UgcSeason? = null
     private var isFullscreen = false
+    /** 横屏进入自动全屏只在进入播放页时判断一次，避免旋转/退出后反复触发。 */
+    private var autoFullscreenEntryChecked = false
     private var currentStream: BiliPlayUrl.DashStream? = null
     private var streamSession = ""
     private var streamLoadedAt = 0L
@@ -178,6 +187,9 @@ class VideoDetailActivity : Activity() {
     private var segmentTimeline = PlaybackTimeline(emptyList())
     /** The single-track stream actually fed to ExoPlayer (after stable selection). */
     private var playingStream: BiliPlayUrl.DashStream? = null
+    /** ExoPlayer 实际解码出的画面尺寸，DASH track 缺宽高时作为竖屏视频判断的兜底。 */
+    @Volatile private var sampledVideoWidth = 0
+    @Volatile private var sampledVideoHeight = 0
     private val failedCodecTracks = HashSet<Pair<Int, String>>()
     private val qualityPrefs by lazy { getSharedPreferences("bili_player", MODE_PRIVATE) }
     private val localPlaybackPrefs by lazy { getSharedPreferences("bili_local_playback", MODE_PRIVATE) }
@@ -375,7 +387,9 @@ class VideoDetailActivity : Activity() {
         currentBvid = savedInstanceState?.getString(EXTRA_BVID) ?: intent.getStringExtra(EXTRA_BVID).orEmpty()
         currentAid = savedInstanceState?.getLong(EXTRA_AID) ?: intent.getLongExtra(EXTRA_AID, 0L)
         currentCid = savedInstanceState?.getLong(EXTRA_CID) ?: intent.getLongExtra(EXTRA_CID, 0L)
-        pendingResumePositionMs = savedInstanceState?.getLong(STATE_PLAY_POSITION) ?: 0L
+        // 旋转重建优先用已保存位置；从历史记录进入时用 intent 带过来的观看进度续播
+        pendingResumePositionMs = savedInstanceState?.getLong(STATE_PLAY_POSITION)
+            ?: intent.getLongExtra(EXTRA_RESUME_MS, 0L).coerceAtLeast(0L)
         resumeSegmentIndex = savedInstanceState?.getInt(STATE_SEGMENT_INDEX) ?: 0
         userWantsPlayback = savedInstanceState?.getBoolean(STATE_PLAY_WHEN_READY, true) ?: true
         restoreEndedState = savedInstanceState?.getBoolean(STATE_PLAY_ENDED) ?: false
@@ -417,12 +431,7 @@ class VideoDetailActivity : Activity() {
         }
         // 视频播放页顶部紧邻黑色视频窗口，状态栏固定纯黑配白色图标，底栏跟随主题色
         applyPlayerSystemBars()
-        if (LayoutMode.isTablet) {
-            LayoutMode.applyTabletOrientationIfEnabled(this)
-        } else {
-            // Detail page is portrait-designed; fullscreen switches to landscape temporarily.
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
+        PlayerSettingsStore.applyPlaybackOrientation(this)
 
         activityRoot = FrameLayout(this).apply { setBackgroundColor(COLOR_BACKGROUND) }
         page = LinearLayout(this).apply {
@@ -539,8 +548,41 @@ class VideoDetailActivity : Activity() {
             contentDescription = "返回"
             isClickable = true
             Ds.bindPressFeedback(this, 0.88f)
-            setOnClickListener { if (isFullscreen) toggleFullscreen() else finish() }
+            setOnClickListener { if (isFullscreen) toggleFullscreen() else navigateBackOnce() }
         }
+        // 左上角「主页」：直接回应用主界面，清掉其上所有播放页
+        val playerHome = object : View(this) {
+            private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE; style = Paint.Style.STROKE
+                strokeWidth = dpf(2f); strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+            }
+            private val path = Path()
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                val w = width; val h = height
+                val left = w * 0.24f; val right = w * 0.76f
+                val top = h * 0.44f; val bottom = h * 0.74f
+                val peakX = w * 0.5f; val peakY = h * 0.27f
+                path.rewind()
+                path.moveTo(left, top)
+                path.lineTo(peakX, peakY)
+                path.lineTo(right, top)
+                path.lineTo(right, bottom)
+                path.lineTo(left, bottom)
+                path.close()
+                canvas.drawPath(path, paint)
+                canvas.drawRect(w * 0.43f, h * 0.56f, w * 0.57f, bottom, paint)
+            }
+        }.apply {
+            contentDescription = "主页"
+            isClickable = true
+            Ds.bindPressFeedback(this, 0.88f)
+            setOnClickListener { goHome() }
+        }
+        topControlsBar.addView(playerHome, LinearLayout.LayoutParams(dp(38), dp(38)).apply {
+            leftMargin = dp(2)
+        })
+
         playerTopTitle = TextView(this).apply {
             textSize = 14.5f
             typeface = Ds.display(bold = true)
@@ -644,6 +686,7 @@ class VideoDetailActivity : Activity() {
             loadVideoAndPlayer()
             BiliSessionStore.refreshVipInfo()
         }
+        maybeAutoFullscreenOnEntry()
     }
 
     // ─────────────────────────────────────────────────
@@ -2695,6 +2738,184 @@ class VideoDetailActivity : Activity() {
         refreshSeasonDrawerSelection()
     }
 
+    // ─────────────────────────────────────────────────
+    //  相关推荐（播放页右侧信息区，单 Activity 内原地换视频）
+    // ─────────────────────────────────────────────────
+
+    /** 在简介卡片下方渲染「相关推荐」双列视频卡片，数据来自 B 站 related 接口。 */
+    private fun renderRelatedVideos(bvid: String) {
+        if (isFinishing || isDestroyed) return
+        val section = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(12), 0, dp(6))
+        }
+        infoContent.addView(section, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(6)
+        })
+        section.addView(View(this).apply { setBackgroundColor(COLOR_BORDER) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, Ds.hairline(this)))
+        val heading = TextView(this).apply {
+            text = "相关推荐"
+            textSize = 15f
+            typeface = Ds.display(bold = true)
+            setTextColor(COLOR_INK)
+            setPadding(0, dp(12), 0, dp(8))
+        }
+        section.addView(heading, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        section.addView(grid, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        val state = TextView(this).apply {
+            text = "正在加载相关视频…"
+            textSize = 13f
+            setTextColor(COLOR_MUTED)
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        grid.addView(state, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        if (bvid.isBlank()) {
+            state.text = "暂无相关推荐"
+            return
+        }
+        relatedRequest?.cancel()
+        val generation = ++relatedGeneration
+        relatedRequest = BiliApi.fetchRelated(bvid) { videos, error ->
+            if (isFinishing || isDestroyed || generation != relatedGeneration) return@fetchRelated
+            relatedRequest = null
+            grid.removeAllViews()
+            if (videos.isNullOrEmpty()) {
+                state.text = if (error != null) "相关推荐加载失败，点这里重试" else "暂无相关推荐"
+                if (error != null) {
+                    state.setOnClickListener {
+                        state.setOnClickListener(null)
+                        state.text = "正在加载相关视频…"
+                        renderRelatedVideosInto(bvid, grid, state, generation + 1)
+                    }
+                }
+                grid.addView(state, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                return@fetchRelated
+            }
+            bindRelatedGrid(grid, videos.take(20))
+        }
+    }
+
+    /** 失败重试：复用同一容器重新拉一次（代号自增保证旧请求作废）。 */
+    private fun renderRelatedVideosInto(
+        bvid: String, grid: LinearLayout, state: TextView, forcedGeneration: Int
+    ) {
+        relatedRequest?.cancel()
+        val generation = maxOf(forcedGeneration, ++relatedGeneration)
+        relatedGeneration = generation
+        relatedRequest = BiliApi.fetchRelated(bvid) { videos, _ ->
+            if (isFinishing || isDestroyed || generation != relatedGeneration) return@fetchRelated
+            relatedRequest = null
+            grid.removeAllViews()
+            if (videos.isNullOrEmpty()) {
+                state.text = "暂无相关推荐"
+                grid.addView(state, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            } else {
+                bindRelatedGrid(grid, videos.take(20))
+            }
+        }
+    }
+
+    /** 把相关视频按单列横条铺进列表；点击卡片在當前 Activity 内原地换视频，不新开页面。 */
+    private fun bindRelatedGrid(grid: LinearLayout, videos: List<VideoItem>) {
+        grid.removeAllViews()
+        relatedGridRef = grid
+        lastRelatedVideos = videos
+        videos.forEach { video ->
+            val row = VideoCardUi.createCompactRow(this)
+            val holder = row.tag as VideoCardUi.CompactHolder
+            VideoCardUi.bindCompactRow(row, holder, video)
+            row.setOnClickListener {
+                holder.boundVideo?.let(::playRecommendedVideo)
+            }
+            grid.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(VideoCardUi.CARD_SPACING_DP)
+            })
+        }
+    }
+
+    /** 横竖屏切换后重新按新宽度摆放已有推荐项（不重新请求网络）。 */
+    private fun reflowRelatedVideos() {
+        val grid = relatedGridRef ?: return
+        val videos = lastRelatedVideos ?: return
+        if (videos.isEmpty()) return
+        grid.post { bindRelatedGrid(grid, videos) }
+    }
+
+    /**
+     * 点击相关推荐：把当前视频压入导航栈，复用切分集骨架原地刷新左右两侧，
+     * 全程不 startActivity、不叠加 Activity，内存里始终只有一个播放页。
+     */
+    private fun playRecommendedVideo(video: VideoItem) {
+        if (isFinishing || isDestroyed) return
+        if (video.bvid.isBlank() && video.aid <= 0L) return
+        reportPlayHistory(status = 2)
+        if (currentBvid.isNotBlank() || currentAid > 0L) {
+            videoBackStack.addLast(Triple(currentBvid, currentAid, currentCid))
+        }
+        currentBvid = video.bvid
+        currentAid = video.aid
+        currentCid = video.cid
+        detailGeneration++
+        detailRequest?.cancel()
+        detailRequest = null
+        currentDetail = null
+        detailResponse = null
+        resetComments()
+        clearPlaybackForMediaChange()
+        infoContent.removeAllViews()
+        infoContent.addView(infoState)
+        infoState.text = "正在加载简介…"
+        if (currentTab != 0) selectTab(0)
+        pendingResumePositionMs = 0L
+        startupAtMs = SystemClock.elapsedRealtime()
+        loadVideoAndPlayer()
+    }
+
+    /** 一次返回：有站内导航记录就回上一个视频，否则结束播放页回到上层界面。 */
+    private fun navigateBackOnce() {
+        val previous = videoBackStack.removeLastOrNull()
+        if (previous == null) {
+            finish()
+            return
+        }
+        reportPlayHistory(status = 2)
+        currentBvid = previous.first
+        currentAid = previous.second
+        currentCid = previous.third
+        detailGeneration++
+        detailRequest?.cancel()
+        detailRequest = null
+        currentDetail = null
+        detailResponse = null
+        resetComments()
+        clearPlaybackForMediaChange()
+        infoContent.removeAllViews()
+        infoContent.addView(infoState)
+        infoState.text = "正在加载简介…"
+        if (currentTab != 0) selectTab(0)
+        pendingResumePositionMs = 0L
+        startupAtMs = SystemClock.elapsedRealtime()
+        loadVideoAndPlayer()
+    }
+
+    /** 直接回应用主页，清掉其上所有播放页，避免多次返回。 */
+    private fun goHome() {
+        startActivity(Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        })
+        finish()
+    }
+
     private fun selectEpisode(episode: UgcEpisode) {
         reportPlayHistory(status = 2)
         val sameVideo = episode.bvid.isNotBlank() && episode.bvid == currentBvid ||
@@ -3032,6 +3253,9 @@ class VideoDetailActivity : Activity() {
 
         // 合集/多 P：视频属于官方合集或同 BV 的 pages 多 P 时展示。
         renderSeasonSection(item)
+
+        // 相关推荐：仿 B 站播放页，在简介信息下方展示「接下来播放」列表。
+        renderRelatedVideos(item.bvid)
 
         // Measure heights: title width excludes the 30dp chevron+margin so multi-line
         // measurement matches actual laid-out height accurately!
@@ -4057,10 +4281,17 @@ class VideoDetailActivity : Activity() {
         showReplay(endedState)
         playerView.player = player
         playerView.setKeepContentOnPlayerReset(true)
-        val resume = if (segmentTimeline.durationMs > 0L) {
-            segmentTimeline.locate(pendingResumePositionMs)
+        val durationMs = segmentTimeline.durationMs
+        // 历史进度来自接口，可能与实际流时长略有出入；留出 1 秒余量，避免 seek 到结尾触发播放完成
+        val resumeMs = if (durationMs > 0L) {
+            pendingResumePositionMs.coerceAtMost((durationMs - 1_000L).coerceAtLeast(0L))
         } else {
-            PlaybackTimeline.Position(resumeSegmentIndex.coerceIn(0, sources.lastIndex), pendingResumePositionMs)
+            pendingResumePositionMs
+        }
+        val resume = if (durationMs > 0L) {
+            segmentTimeline.locate(resumeMs)
+        } else {
+            PlaybackTimeline.Position(resumeSegmentIndex.coerceIn(0, sources.lastIndex), resumeMs)
         }
         player.setMediaSources(sources, resume.index, resume.offsetMs)
         player.playbackParameters = PlaybackParameters(speeds[speedIndex])
@@ -4137,6 +4368,9 @@ class VideoDetailActivity : Activity() {
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (!canUsePlayback(generation) || player !== exoPlayer) return
+                // 播放期间保持屏幕常亮：跟随系统的息屏时间会让正在看的视频被灭屏。
+                // 暂停或缓冲结束时释放，交回系统息屏策略。
+                window.decorView.keepScreenOn = isPlaying
                 handler.removeCallbacks(historyTick)
                 if (isPlaying) {
                     if (!isLocalMode) {
@@ -4177,6 +4411,8 @@ class VideoDetailActivity : Activity() {
 
             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
                 if (canUsePlayback(generation) && player === exoPlayer && videoSize.width > 0) {
+                    sampledVideoWidth = videoSize.width
+                    sampledVideoHeight = videoSize.height
                     Log.i(
                         "YuiBiliPlayer",
                         "video-size ${videoSize.width}x${videoSize.height} playingQuality=${playingStream?.actualQuality}"
@@ -4250,7 +4486,8 @@ class VideoDetailActivity : Activity() {
 
     private fun loadQualityPreference(): Int {
         val stored = qualityPrefs.getInt(KEY_LAST_QUALITY, 0)
-        return if (stored in SUPPORTED_QUALITIES) stored else BiliPlayUrl.QUALITY_720
+        val fallback = if (stored in SUPPORTED_QUALITIES) stored else BiliPlayUrl.QUALITY_720
+        return PlayerSettingsStore.resolveQuality(this, fallback)
     }
 
     private fun saveQualityPreference(quality: Int) {
@@ -4827,9 +5064,13 @@ class VideoDetailActivity : Activity() {
     //  Landscape videos rotate to landscape; portrait videos stay portrait.
     // ─────────────────────────────────────────────────
 
+    /** 竖屏视频判断：优先用 DASH 元数据，缺失时回退到 ExoPlayer 实际解码尺寸。 */
     private fun isPortraitVideo(): Boolean {
-        val track = playingStream?.videoTracks?.firstOrNull() ?: return false
-        return track.width > 0 && track.height > 0 && track.height > track.width
+        val track = playingStream?.videoTracks?.firstOrNull()
+        if (track != null && track.width > 0 && track.height > 0) {
+            return track.height > track.width
+        }
+        return sampledVideoWidth > 0 && sampledVideoHeight > 0 && sampledVideoHeight > sampledVideoWidth
     }
 
     private fun toggleFullscreen() {
@@ -4868,10 +5109,13 @@ class VideoDetailActivity : Activity() {
         } else {
             page.orientation = LinearLayout.VERTICAL
             val raw16x9 = dm.widthPixels * 9 / 16
-            val playerHeight = if (LayoutMode.isTablet) {
-                minOf(raw16x9, (dm.heightPixels * 0.45f).toInt())
-            } else {
-                raw16x9
+            // 锁定横屏（或用户跟随系统旋到横屏）时，手机竖屏设计的播放器会占满高度；
+            // 限制为屏幕高度的一部分，给下方详情/评论留出可用空间。
+            val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+            val playerHeight = when {
+                LayoutMode.isTablet -> minOf(raw16x9, (dm.heightPixels * 0.45f).toInt())
+                landscape -> minOf(raw16x9, (dm.heightPixels * 0.52f).toInt())
+                else -> raw16x9
             }
             playerHost.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, playerHeight)
             tabletSplitDivider?.visibility = View.GONE
@@ -4879,6 +5123,18 @@ class VideoDetailActivity : Activity() {
             if (::danmakuView.isInitialized) danmakuView.setFullscreenMode(false)
         }
         page.requestLayout()
+    }
+
+    /** 横屏进入播放页自动全屏：只在首次进入时判断一次。 */
+    private fun maybeAutoFullscreenOnEntry() {
+        if (autoFullscreenEntryChecked || isFullscreen || fsTransitioning) return
+        if (!::fullscreenContainer.isInitialized || !::playerHost.isInitialized) return
+        if (!PlayerSettingsStore.landscapeAutoFullscreen(this)) return
+        if (resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) return
+        autoFullscreenEntryChecked = true
+        // 必须走 toggleFullscreen 统一入口：它会同步 isFullscreen、全屏按钮图标、弹幕模式，
+        // 否则进入时视觉全屏但状态仍是 false，退出需要点两次。
+        toggleFullscreen()
     }
 
     private fun enterFullscreen() {
@@ -4891,22 +5147,18 @@ class VideoDetailActivity : Activity() {
         page.visibility = View.GONE
         hideSystemBars()
         adjustIndicator.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
-        if (!LayoutMode.isTablet && !isPortraitVideo() &&
-            resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) {
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-        }
+        // 竖屏点全屏时按视频比例决定方向：竖屏视频保持竖屏全屏，横屏视频自动转横屏。
+        requestedOrientation = PlayerSettingsStore.resolveFullscreenOrientation(this, isPortraitVideo())
         applyControlSizing()
         showControls()
         fsTransitioning = false
     }
 
     private fun exitFullscreen() {
-        if (LayoutMode.isTablet || resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT) {
-            movePlayerBackToPage()
-        } else {
-            exitingFullscreen = true
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
+        // 锁定方向时旋转不会触发 onConfigurationChanged，必须直接把播放器移回页面
+        exitingFullscreen = false
+        movePlayerBackToPage()
+        PlayerSettingsStore.applyPlaybackOrientation(this)
     }
 
     private fun movePlayerBackToPage() {
@@ -4985,10 +5237,15 @@ class VideoDetailActivity : Activity() {
         super.onConfigurationChanged(newConfig)
         if (exitingFullscreen && newConfig.orientation == Configuration.ORIENTATION_PORTRAIT) {
             handler.post { if (exitingFullscreen) movePlayerBackToPage() }
-        } else if (LayoutMode.isTablet && !isFullscreen) {
+        } else if (isFullscreen) {
+            // 智能全屏会主动旋转屏幕，旋转后系统栏可能重新出现，补一次隐藏保证沉浸式。
+            handler.post { if (isFullscreen) hideSystemBars() }
+        } else {
             handler.post {
                 applyPageSplitLayout()
                 applyControlSizing()
+                reflowRelatedVideos()
+                maybeAutoFullscreenOnEntry()
             }
         }
         updateFullscreenStatusVisibility()
@@ -5990,7 +6247,7 @@ class VideoDetailActivity : Activity() {
             closeSeasonDrawer()
             return
         }
-        if (isFullscreen) toggleFullscreen() else super.onBackPressed()
+        if (isFullscreen) toggleFullscreen() else navigateBackOnce()
     }
 
     override fun onStart() {
@@ -6047,6 +6304,8 @@ class VideoDetailActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // 从设置页改完方向返回时，重新应用锁定设置
+        if (!isFullscreen) PlayerSettingsStore.applyPlaybackOrientation(this)
         activityResumed = true
         backgroundSwitchLocked = false
         updateBackgroundPlayVisibility()
@@ -6059,6 +6318,8 @@ class VideoDetailActivity : Activity() {
             commentLoginHintShown = false
             loadComments(reset = true)
         }
+        // 横屏锁定后 configuration 可能延迟更新，下一帧再判断是否自动全屏
+        handler.post { maybeAutoFullscreenOnEntry() }
     }
 
     override fun onPause() {
@@ -6068,6 +6329,7 @@ class VideoDetailActivity : Activity() {
         handler.removeCallbacks(progressUpdater)
         controlsHideRunnable?.let(handler::removeCallbacks)
         cancelLongPressBoost()
+        window.decorView.keepScreenOn = false
         unregisterStatusReceiver()
         closeSeasonDrawer(immediate = true)
         danmakuSettingsDrawer?.close(immediate = true)
@@ -6175,6 +6437,8 @@ class VideoDetailActivity : Activity() {
         const val EXTRA_BVID = "bvid"
         const val EXTRA_AID = "aid"
         const val EXTRA_CID = "cid"
+        /** 历史记录续播位置（毫秒），0 表示从头播放。 */
+        const val EXTRA_RESUME_MS = "resume_ms"
         const val EXTRA_LOCAL_TASK_ID = "local_task_id"
         const val EXTRA_LOCAL_SORT_ORDER = "local_sort_order"
         private const val STATE_PLAY_POSITION = "play_position"
@@ -6204,12 +6468,19 @@ class VideoDetailActivity : Activity() {
         const val KIND_FAVORITE = 1
         const val KIND_DOWNLOAD = 2
         const val KIND_SHARE = 3
-        fun open(context: Context, bvid: String, aid: Long = 0L, cid: Long = 0L) {
+        fun open(
+            context: Context,
+            bvid: String,
+            aid: Long = 0L,
+            cid: Long = 0L,
+            resumeMs: Long = 0L
+        ) {
             if (bvid.isBlank() && aid <= 0L) return
             context.startActivity(Intent(context, VideoDetailActivity::class.java)
                 .putExtra(EXTRA_BVID, bvid)
                 .putExtra(EXTRA_AID, aid)
-                .putExtra(EXTRA_CID, cid))
+                .putExtra(EXTRA_CID, cid)
+                .putExtra(EXTRA_RESUME_MS, resumeMs.coerceAtLeast(0L)))
         }
 
         /** 播放本地下载任务（复用同一播放器，本地模式只显示标题/大小/时长）。 */

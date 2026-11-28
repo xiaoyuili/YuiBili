@@ -102,7 +102,7 @@ class SpaceSearchActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
 
         mid = intent.getLongExtra(EXTRA_MID, 0L)
         upName = intent.getStringExtra(EXTRA_UP_NAME).orEmpty().trim()

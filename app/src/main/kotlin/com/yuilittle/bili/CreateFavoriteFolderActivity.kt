@@ -45,7 +45,7 @@ class CreateFavoriteFolderActivity : Activity() {
         super.onCreate(savedInstanceState)
         Theme.init(this)
         Theme.applySystemBars(this)
-        LayoutMode.applyTabletOrientationIfEnabled(this)
+        PlayerSettingsStore.applyHomeOrientation(this)
         window.setBackgroundDrawable(ColorDrawable(COLOR_BACKGROUND))
         editMediaId = intent.getLongExtra(EXTRA_EDIT_ID, 0L)
         isPublic = intent.getBooleanExtra(EXTRA_EDIT_PUBLIC, true)
